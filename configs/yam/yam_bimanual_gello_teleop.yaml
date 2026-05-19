@@ -9,8 +9,9 @@ nodes:
     name: gello_left
     agent_class: robots_realtime.agents.teleoperation.gello_leader_agent:GelloLeaderAgent
     agent_kwargs:
-      port: /dev/ttyACM0
+      port: /dev/leader-left
       robot_name: left
+      calibrate: false
       include_gripper: true
       joint_signs: [-1, -1, -1, -1, -1, -1]
     arm_key: left
@@ -20,8 +21,9 @@ nodes:
     name: gello_right
     agent_class: robots_realtime.agents.teleoperation.gello_leader_agent:GelloLeaderAgent
     agent_kwargs:
-      port: /dev/ttyACM1
+      port: /dev/leader-right
       robot_name: right
+      calibrate: false
       include_gripper: true
       joint_signs: [-1, -1, -1, -1, -1, -1]
     arm_key: right
