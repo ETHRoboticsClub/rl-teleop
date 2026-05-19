@@ -51,21 +51,21 @@ nodes:
 
   - type: CameraNode
     name: camera_top
-    driver: ZedCamera
-    device_id: "YOUR_SERIAL"
-    resolution: HD720
+    driver: RealSenseCamera
+    device_id: "203522250539"
+    resolution: VGA
     fps: 30
 
   - type: CameraNode
     name: camera_left
-    driver: ZedCamera
-    device_id: "YOUR_SERIAL"
-    resolution: HD720
+    driver: OpenCVCamera
+    device_path: /dev/video-left
+    resolution: [640, 480]
     fps: 30
 
   - type: CameraNode
     name: camera_right
-    driver: ZedCamera
-    device_id: "YOUR_SERIAL"
-    resolution: HD720
+    driver: OpenCVCamera
+    device_path: /dev/video-right
+    resolution: [640, 480]
     fps: 30

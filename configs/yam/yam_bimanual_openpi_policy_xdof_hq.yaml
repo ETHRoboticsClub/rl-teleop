@@ -138,7 +138,7 @@ nodes:
   - type: CameraNode
     name: camera_top
     driver: RealSenseCamera
-    device_id: "218622270376"
+    device_id: "203522250539"
     resolution: VGA
     fps: 30
     publish_resize: [224, 224]
