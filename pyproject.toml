@@ -16,6 +16,7 @@ dependencies = [
     "dm-env==1.6",
     "dm_control==1.0.30",
     "dotdict==0.1",
+    "dynamixel-sdk",
     "numpy",
     "opencv-python",
     "robot_descriptions",
@@ -155,6 +156,7 @@ omit = [
 
 [dependency-groups]
 dev = [
+    "pytest>=8.0.0",
     "ruff>=0.12.3",
 ]
 
