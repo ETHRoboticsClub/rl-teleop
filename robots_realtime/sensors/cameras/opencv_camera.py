@@ -28,9 +28,6 @@ class OpencvCamera(CameraDriver):
         return f"OpencvCamera(device_path={self.device_path!r}, name={self.name!r}, resolution={self.resolution}, fps={self.fps})"
 
     def __post_init__(self):
-        available_cameras = self.list_cameras()
-        logging.info(f"available_cameras: {available_cameras}")
-
         self.cap = cv2.VideoCapture(self.device_path)
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
@@ -40,26 +37,7 @@ class OpencvCamera(CameraDriver):
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
     def list_cameras(self) -> List[int]:
-        import os
-        import sys
-        
-        available_cameras = []
-        # Suppress V4L2 [ERROR] spam that trips the TUI's log scanner.
-        # cv2.VideoCapture on non-existent indices prints to stderr (not logging).
-        old_stderr_fd = os.dup(2)
-        try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, 2)
-            os.close(devnull)
-            for i in range(20):
-                cap = cv2.VideoCapture(i)
-                if cap.isOpened():
-                    available_cameras.append(i)
-                    cap.release()
-        finally:
-            os.dup2(old_stderr_fd, 2)
-            os.close(old_stderr_fd)
-        return available_cameras
+        return []
 
     def read(self) -> CameraData:
         try:

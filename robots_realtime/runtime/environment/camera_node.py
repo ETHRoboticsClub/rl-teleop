@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import importlib
 import time
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -32,7 +34,15 @@ _CAMERA_DRIVER_REGISTRY: dict[str, str] = {
     "RealSenseCamera":  "robots_realtime.sensors.cameras.realsense_camera:RealSenseCamera",
 }
 
-_NODE_ONLY_KEYS = {"name", "type", "poll_freq", "publish_resize", "publish_resize_mode"}
+_NODE_ONLY_KEYS = {
+    "name",
+    "type",
+    "poll_freq",
+    "publish_resize",
+    "publish_resize_mode",
+    "extrinsics",
+    "extrinsics_file",
+}
 
 
 def _center_crop_and_resize(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
@@ -81,6 +91,45 @@ def _instantiate_camera_driver(spec: dict) -> CameraDriver:
     return getattr(mod, cls_name)(**kwargs)
 
 
+def _extrinsics_from_spec(spec: dict[str, Any]) -> dict[str, np.ndarray]:
+    import viser.transforms as vtf  # noqa: PLC0415
+
+    position = np.asarray(spec["position"], dtype=np.float64)
+    if position.shape != (3,):
+        raise ValueError(f"camera extrinsics position must have shape (3,), got {position.shape}")
+
+    if "wxyz" in spec:
+        wxyz = np.asarray(spec["wxyz"], dtype=np.float64)
+    elif "rotation" in spec:
+        wxyz = np.asarray(spec["rotation"], dtype=np.float64)
+    elif "rpy_radians" in spec:
+        rpy = np.asarray(spec["rpy_radians"], dtype=np.float64)
+        if rpy.shape != (3,):
+            raise ValueError(f"camera extrinsics rpy_radians must have shape (3,), got {rpy.shape}")
+        wxyz = vtf.SO3.from_rpy_radians(*rpy).wxyz
+    else:
+        raise ValueError("camera extrinsics must define one of: wxyz, rotation, rpy_radians")
+
+    if wxyz.shape != (4,):
+        raise ValueError(f"camera extrinsics quaternion must have shape (4,), got {wxyz.shape}")
+
+    pose_mat = vtf.SE3(wxyz_xyz=np.concatenate([wxyz, position])).as_matrix()
+    return {"position": position, "wxyz": wxyz, "pose_mat": pose_mat}
+
+
+def _load_extrinsics_file(path_str: str) -> dict[str, np.ndarray]:
+    import yaml  # noqa: PLC0415
+
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"camera extrinsics file not found: {path}")
+    with path.open(encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"camera extrinsics file must contain a mapping: {path}")
+    return _extrinsics_from_spec(data)
+
+
 class CameraNode(Node):
     """Publish camera frames from any CameraDriver onto the bus.
 
@@ -112,12 +161,22 @@ class CameraNode(Node):
         _driver_spec: dict | None = None,
         publish_resize: tuple[int, int] | list[int] | None = None,
         publish_resize_mode: str = "center_crop",
+        extrinsics: dict[str, Any] | None = None,
+        extrinsics_file: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(name=name, writer=writer, **kwargs)
         self._driver = driver
         self._driver_spec = _driver_spec
         self.poll_freq = poll_freq
+        if extrinsics is not None and extrinsics_file is not None:
+            raise ValueError("CameraNode accepts either extrinsics or extrinsics_file, not both")
+        if extrinsics_file is not None:
+            self._extrinsics = _load_extrinsics_file(extrinsics_file)
+        elif extrinsics is not None:
+            self._extrinsics = _extrinsics_from_spec(extrinsics)
+        else:
+            self._extrinsics = None
 
         if publish_resize is not None:
             if publish_resize_mode not in _RESIZE_MODES:
@@ -141,7 +200,10 @@ class CameraNode(Node):
             self._driver = _instantiate_camera_driver(self._driver_spec)
 
     def step(self) -> None:
-        data: CameraData = self._driver.read()
+        if self._driver is None:
+            raise RuntimeError(f"[{self.name}] CameraNode.step() called before setup")
+        driver = self._driver
+        data: CameraData = driver.read()
 
         # Hardware timestamp from driver (ms) → seconds
         ts = data.timestamp / 1000.0 if data.timestamp else time.time()
@@ -150,23 +212,26 @@ class CameraNode(Node):
         # visualization code already expect (same shape as old CameraNode._get_latest_data).
         msg: dict = {"images": data.images, "timestamp": ts}
 
-        # Depth: support both other_sensors["depth"] (standard) and the
-        # dynamic depth_data attribute that ZedCamera sets directly.
-        depth = (data.other_sensors or {}).get("depth") or getattr(data, "depth_data", None)
+        depth = (data.other_sensors or {}).get("depth")
+        if depth is None:
+            depth = getattr(data, "depth_data", None)
         if depth is not None:
             msg["depth_data"] = depth
 
-        # Intrinsics and extrinsics from the driver if available.
-        intrinsics = getattr(self._driver, "intrinsic_data", None)
+        intrinsics = getattr(driver, "intrinsic_data", None)
+        if depth is not None and data.other_sensors is not None:
+            intrinsics = data.other_sensors.get("depth_intrinsics", intrinsics)
         if intrinsics is not None:
             msg["intrinsics"] = intrinsics
-        extrinsics = getattr(self._driver, "extrinsics", None)
+        extrinsics = self._extrinsics if self._extrinsics is not None else getattr(driver, "extrinsics", None)
         if extrinsics is not None:
             msg["extrinsics"] = extrinsics
 
         if self._publish_resize is None:
             self.publish("rgb", msg, ts=ts)
         else:
+            if self._publish_resize_fn is None:
+                raise RuntimeError(f"[{self.name}] publish resize function is not configured")
             # Bus payload: resized RGB only — depth and intrinsics would need
             # geometric rescaling to stay consistent with the new pixel grid,
             # so they're dropped from the bus version. The disk recording
@@ -190,8 +255,9 @@ class CameraNode(Node):
             }, ts=ts)
 
     def cleanup(self) -> None:
-        if hasattr(self._driver, "stop"):
-            self._driver.stop()
+        driver = self._driver
+        if driver is not None and hasattr(driver, "stop"):
+            driver.stop()
 
     @classmethod
     def build_kwargs(cls, params: dict) -> dict:
@@ -200,6 +266,8 @@ class CameraNode(Node):
             "poll_freq": params.get("poll_freq"),
             "publish_resize": params.get("publish_resize"),
             "publish_resize_mode": params.get("publish_resize_mode", "center_crop"),
+            "extrinsics": params.get("extrinsics"),
+            "extrinsics_file": params.get("extrinsics_file"),
         }
         if "driver" in params:
             driver_kwargs = {k: v for k, v in params.items() if k not in _NODE_ONLY_KEYS}

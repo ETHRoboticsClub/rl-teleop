@@ -102,12 +102,15 @@ def main() -> None:
 
     session.start()
 
-    if args.no_tui:
-        print(f"Session running. Ctrl-C to stop.  Recordings → {session.save_root}")
-        session.wait()
-    else:
-        from robots_realtime.runtime.tui import run_tui
-        run_tui(session)
+    try:
+        if args.no_tui:
+            print(f"Session running. Ctrl-C to stop.  Recordings → {session.save_root}")
+            session.wait()
+        else:
+            from robots_realtime.runtime.tui import run_tui
+            run_tui(session)
+    finally:
+        session.stop()
 
     os._exit(0)
 

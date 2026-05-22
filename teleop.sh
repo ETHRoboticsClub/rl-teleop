@@ -8,7 +8,9 @@ LEADER_LEFT="${LEADER_LEFT:-/dev/leader-left}"
 LEADER_RIGHT="${LEADER_RIGHT:-/dev/leader-right}"
 DRY_RUN_LEADERS=0
 NO_TUI=0
+RSUSB=0
 CONFIG="$DEFAULT_CONFIG"
+EXTRA_ARGS=()
 
 cd "$SCRIPT_DIR"
 
@@ -22,6 +24,10 @@ while [[ $# -gt 0 ]]; do
       NO_TUI=1
       shift
       ;;
+    --rsusb)
+      RSUSB=1
+      shift
+      ;;
     --config)
       if [[ $# -lt 2 ]]; then
         echo "ERROR: --config requires a path" >&2
@@ -30,9 +36,9 @@ while [[ $# -gt 0 ]]; do
       CONFIG="$2"
       shift 2
       ;;
-    -* )
-      echo "ERROR: unknown option: $1" >&2
-      exit 1
+    --*)
+      EXTRA_ARGS+=("$1")
+      shift
       ;;
     *)
       CONFIG="$1"
@@ -149,8 +155,16 @@ ip -brief link show dev can_follow_r
 echo "Leaders:"
 ls -l "$LEADER_LEFT" "$LEADER_RIGHT"
 
+CMD=(uv run rr-session "$CONFIG")
 if [[ "$NO_TUI" -eq 1 ]]; then
-  exec uv run rr-session "$CONFIG" --no-tui
+  CMD+=(--no-tui)
+fi
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  CMD+=("${EXTRA_ARGS[@]}")
 fi
 
-exec uv run rr-session "$CONFIG"
+if [[ "$RSUSB" -eq 1 ]]; then
+  export RS2_USE_RSUSB_BACKEND=true
+fi
+
+exec "${CMD[@]}"

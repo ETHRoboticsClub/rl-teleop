@@ -17,6 +17,7 @@ nodes:
       bilateral_kp: 0.05  # Bilateral control stiffness (0.0-1.0). Set to 0.0 to disable haptic feedback.
       warmup_steps: 5  # Number of steps to wait before enabling bilateral control
       start_enabled: true  # Start enabled immediately
+      profile: true  # Log YamLeaderAgent hot-path timing summaries.
     state_topics:
       yam_left: yam_left/joint_state  # Subscribe to follower state for bilateral control
     loop_mode: flat_out
@@ -33,6 +34,7 @@ nodes:
       bilateral_kp: 0.05  # Bilateral control stiffness (0.0-1.0). Set to 0.0 to disable haptic feedback.
       warmup_steps: 5  # Number of steps to wait before enabling bilateral control
       start_enabled: true  # Start enabled immediately
+      profile: true  # Log YamLeaderAgent hot-path timing summaries.
     state_topics:
       yam_right: yam_right/joint_state  # Subscribe to follower state for bilateral control
     loop_mode: flat_out
