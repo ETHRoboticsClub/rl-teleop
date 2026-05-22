@@ -110,3 +110,25 @@ nodes:
       top:   camera_top/rgb
       left:  camera_left/rgb
       right: camera_right/rgb
+
+  - type: CameraNode
+    name: camera_top
+    driver: RealSenseCamera
+    device_id: "203522250539"
+    resolution: VGA
+    fps: 30
+    enable_depth: true
+
+  - type: CameraNode
+    name: camera_left
+    driver: OpenCVCamera
+    device_path: /dev/video-left
+    resolution: [640, 480]
+    fps: 30
+
+  - type: CameraNode
+    name: camera_right
+    driver: OpenCVCamera
+    device_path: /dev/video-right
+    resolution: [640, 480]
+    fps: 30

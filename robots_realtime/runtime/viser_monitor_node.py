@@ -187,6 +187,7 @@ class ViserMonitorNode(Node):
         self._urdfs: dict[str, Any] = {}        # raw yourdfpy.URDF, for FK to drive grippers + chunks
         self._gripper_state: dict[str, dict] = {}
         self._image_handles: dict[str, Any] = {}
+        self._point_cloud_handles: dict[str, Any] = {}
         # chunk frame handles: arm_key -> list of viser frame handles (one per
         # downsampled chunk step). Pre-allocated in setup() so step() only has
         # to update positions/quats — no viser create/destroy per tick.

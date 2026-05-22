@@ -146,17 +146,20 @@ class YamLeaderAgent(Agent):
             logger.warning(f"No encoder chain configured for {robot_name}")
             self._encoder_failed = True
 
-        # Store original kp for bilateral control scaling
+        # Store original kp/kd for bilateral control scaling
         if self._bilateral_enabled and hasattr(self.robot, '_kp'):
             self._original_kp = self.robot._kp.copy()
+            self._kd = getattr(self.robot, '_kd', np.zeros(NUM_ARM_JOINTS)).copy()
         else:
             self._original_kp = None
+            self._kd = None
 
         logger.info(f"YamLeaderAgent initialized for {robot_name} (bilateral_kp={bilateral_kp})")
 
         # Track enable state
         self._enabled = start_enabled
         self._last_button_state = 0
+        self._feedback_gains_applied = False
 
         if start_enabled:
             logger.info(f"YamLeaderAgent {robot_name}: Starting ENABLED")
@@ -249,6 +252,26 @@ class YamLeaderAgent(Agent):
     # Bilateral control helpers
     # ------------------------------------------------------------------ #
 
+    def _apply_feedback_gains_once(self) -> None:
+        """Apply scaled feedback gains once when feedback first activates."""
+        if self._feedback_gains_applied:
+            return
+        if self._original_kp is None:
+            return
+        scaled_kp = self._original_kp * self.bilateral_kp
+        scaled_kd = np.zeros(NUM_ARM_JOINTS)
+        self.robot.update_kp_kd(kp=scaled_kp, kd=scaled_kd)
+        self._feedback_gains_applied = True
+
+    def _restore_feedback_gains_if_needed(self) -> None:
+        """Restore original gains if feedback gains were previously applied."""
+        if self._feedback_gains_applied and self._original_kp is not None:
+            self.robot.update_kp_kd(kp=self._original_kp, kd=self._kd)
+            self._feedback_gains_applied = False
+            return
+        self.robot.update_kp_kd(kp=self._original_kp, kd=self._kd)
+        self._feedback_gains_applied = False
+
     def _extract_follower_pos(self, obs: Dict[str, Any]) -> Optional[np.ndarray]:
         """Extract follower arm joint positions (radians) from observations."""
         robot_obs = obs.get(self.robot_name)
@@ -262,19 +285,10 @@ class YamLeaderAgent(Agent):
         The inverse coordinate transform is applied:
             leader_cmd = (follower_pos - offsets) * signs
 
-        The motors are commanded with scaled kp gains to generate restoring
-        torque proportional to: τ ∝ Kp × (q_follower − q_leader)
+        Feedback gains are applied once (after warmup), not every tick.
         """
-        # Inverse transform: remove offsets, then apply signs
         leader_cmd_rad = (follower_pos_rad - self.joint_offsets) * self.joint_signs
-
-        # Update kp/kd for bilateral control
-        if self._original_kp is not None:
-            scaled_kp = self._original_kp * self.bilateral_kp
-            scaled_kd = np.zeros(NUM_ARM_JOINTS)  # No damping for position mode
-            self.robot.update_kp_kd(kp=scaled_kp, kd=scaled_kd)
-
-        # Command the leader to follow the follower position
+        self._apply_feedback_gains_once()
         self.robot.command_joint_pos(leader_cmd_rad)
 
     # ------------------------------------------------------------------ #
@@ -283,6 +297,7 @@ class YamLeaderAgent(Agent):
 
     def close(self) -> None:
         """Close the robot connection."""
+        self._restore_feedback_gains_if_needed()
         if hasattr(self.robot, 'close'):
             self.robot.close()
         logger.info(f"YamLeaderAgent {self.robot_name} closed")
