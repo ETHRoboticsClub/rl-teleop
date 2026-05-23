@@ -111,6 +111,9 @@ class YamLeaderAgent(Agent):
         bilateral_kp: float = 0.0,
         warmup_steps: int = 5,
         start_enabled: bool = True,
+        profile: bool = False,
+        profile_log_interval: float = 5.0,
+        profile_slow_ms: float = 50.0,
     ) -> None:
         self.robot_name = robot_name
         self.joint_signs = np.array(joint_signs or [1] * NUM_ARM_JOINTS, dtype=np.float64)
@@ -126,6 +129,12 @@ class YamLeaderAgent(Agent):
         self._use_button = enable_button_index >= 0
         self._start_enabled = start_enabled
         self._encoder_failed = False  # Track if encoder setup failed
+        self._profile = profile
+        self._profile_log_interval = profile_log_interval
+        self._profile_slow_ms = profile_slow_ms
+        self._profile_accum: Dict[str, List[float]] = {}
+        self._profile_act_times: List[float] = []
+        self._profile_last_log = time.perf_counter()
 
         # Instantiate the i2rt MotorChainRobot from YAML config
         # The YAML config includes get_same_bus_device_driver which sets up the encoder chain
@@ -146,17 +155,20 @@ class YamLeaderAgent(Agent):
             logger.warning(f"No encoder chain configured for {robot_name}")
             self._encoder_failed = True
 
-        # Store original kp for bilateral control scaling
+        # Store original kp/kd for bilateral control scaling
         if self._bilateral_enabled and hasattr(self.robot, '_kp'):
             self._original_kp = self.robot._kp.copy()
+            self._kd = getattr(self.robot, '_kd', np.zeros(NUM_ARM_JOINTS)).copy()
         else:
             self._original_kp = None
+            self._kd = None
 
         logger.info(f"YamLeaderAgent initialized for {robot_name} (bilateral_kp={bilateral_kp})")
 
         # Track enable state
         self._enabled = start_enabled
         self._last_button_state = 0
+        self._feedback_gains_applied = False
 
         if start_enabled:
             logger.info(f"YamLeaderAgent {robot_name}: Starting ENABLED")
@@ -173,73 +185,104 @@ class YamLeaderAgent(Agent):
 
             Returns empty dict if not enabled by button press.
         """
-        # Get joint positions from the robot
-        robot_obs = self.robot.get_observations()
-        joint_pos = robot_obs["joint_pos"][:NUM_ARM_JOINTS]  # Only arm joints, not gripper
+        profile_start = time.perf_counter() if self._profile else 0.0
+        segments: Dict[str, float] = {}
 
-        # Apply transformations
+        t = time.perf_counter() if self._profile else 0.0
+        robot_obs = self.robot.get_observations()
+        self._record_profile_segment("get_observations", t, segments)
+        joint_pos = robot_obs["joint_pos"][:NUM_ARM_JOINTS]
+
         joint_pos = self.joint_signs * joint_pos + self.joint_offsets
 
-        # Get encoder state (teaching handle trigger and buttons)
-        # The motor chain thread reads encoder states and caches them in same_bus_device_states
+        t = time.perf_counter() if self._profile else 0.0
         encoder_states = self.robot.motor_chain.get_same_bus_device_states()
+        self._record_profile_segment("get_same_bus_device_states", t, segments)
 
         if encoder_states and len(encoder_states) > 0:
             encoder = encoder_states[0]
-            # encoder.position is the trigger position (0.0 = open, ~1.0 = closed)
             gripper_cmd = np.clip(encoder.position, self.gripper_open_pos, self.gripper_close_pos)
-            if self._step % 100 == 0:  # Log every 100 steps to avoid spam
+            if self._step % 100 == 0:
                 print(f"[{self.robot_name}] encoder position: {encoder.position:.3f}, gripper_cmd: {gripper_cmd:.3f}")
 
-            # Check button state for enable/disable toggle (if enabled)
             if self._use_button:
                 button_state = encoder.io_inputs[self.enable_button_index] if len(encoder.io_inputs) > self.enable_button_index else 0
-
-                # Detect button press (transition from 0 to 1)
                 if button_state > 0.5 and self._last_button_state < 0.5:
                     self._enabled = not self._enabled
                     state_str = 'ENABLED' if self._enabled else 'DISABLED'
                     logger.info(f"YamLeaderAgent {self.robot_name}: {state_str}")
-
                 self._last_button_state = button_state
         else:
-            # No encoder data available, use default
             gripper_cmd = self.gripper_open_pos
             if self._step % 100 == 0:
                 print(f"[{self.robot_name}] WARNING: No encoder data from teaching handle")
 
-        # Bilateral control: apply follower position to leader motors
         if self._bilateral_enabled and self._enabled and self._step >= self._warmup_steps:
+            t = time.perf_counter() if self._profile else 0.0
             follower_pos = self._extract_follower_pos(obs)
+            self._record_profile_segment("extract_follower_pos", t, segments)
             if follower_pos is not None:
+                t = time.perf_counter() if self._profile else 0.0
                 self._send_bilateral_feedback(follower_pos[:NUM_ARM_JOINTS])
+                self._record_profile_segment("send_bilateral_feedback", t, segments)
 
         self._step += 1
 
-        # If not enabled, return empty action (follower won't move)
         if not self._enabled:
+            self._finish_profile(profile_start, segments)
             return {}
 
-        # Build output action
         if self.include_gripper:
-            # Encoder: 0.0=open, 1.0=closed (trigger position)
-            # YAM gripper motor: expects normalized [0, 1] where 0=closed, 1=open
-            # (JointMapper will convert to raw joint space based on gripper_limits)
-
-            # Normalize encoder reading to [0, 1]
             encoder_normalized = (gripper_cmd - self.gripper_open_pos) / (self.gripper_close_pos - self.gripper_open_pos)
-
-            # Invert: encoder 0 (open trigger) → gripper 1 (open), encoder 1 (closed trigger) → gripper 0 (closed)
             gripper_pos_normalized = 1.0 - encoder_normalized
-
             pos = np.concatenate([joint_pos, [gripper_pos_normalized]])
-            if self._step % 100 == 0:  # Log every 100 steps to avoid spam
+            if self._step % 100 == 0:
                 print(f"[{self.robot_name}] encoder: {gripper_cmd:.3f}, encoder_norm: {encoder_normalized:.3f}, gripper_norm: {gripper_pos_normalized:.3f}")
         else:
             pos = joint_pos
 
-        # Return simple format for single-arm agent (AgentNode will publish to {name}/joint_pos)
+        self._finish_profile(profile_start, segments)
         return {"pos": pos.astype(np.float32)}
+
+    def _record_profile_segment(self, key: str, start: float, segments: Dict[str, float]) -> None:
+        if not self._profile:
+            return
+        elapsed_ms = (time.perf_counter() - start) * 1e3
+        segments[key] = elapsed_ms
+        self._profile_accum.setdefault(key, []).append(elapsed_ms)
+
+    def _finish_profile(self, start: float, segments: Dict[str, float]) -> None:
+        if not self._profile:
+            return
+        total_ms = (time.perf_counter() - start) * 1e3
+        self._profile_act_times.append(total_ms)
+        if total_ms >= self._profile_slow_ms:
+            detail = ", ".join(f"{key}={value:.2f}ms" for key, value in sorted(segments.items()))
+            logger.warning("[%s] slow YamLeaderAgent.act %.2fms (%s)", self.robot_name, total_ms, detail)
+        now = time.perf_counter()
+        if now - self._profile_last_log < self._profile_log_interval:
+            return
+        self._profile_last_log = now
+        lines = [f"[{self.robot_name}] YamLeaderAgent profile over {self._profile_log_interval:.1f}s"]
+        if self._profile_act_times:
+            lines.append(self._format_profile_line("act_total", self._profile_act_times))
+            self._profile_act_times.clear()
+        for key in sorted(self._profile_accum):
+            values = self._profile_accum[key]
+            if values:
+                lines.append(self._format_profile_line(key, values))
+                values.clear()
+        logger.info("\n".join(lines))
+
+    @staticmethod
+    def _format_profile_line(key: str, values: List[float]) -> str:
+        ordered = sorted(values)
+        return (
+            f"  {key:<30s}: n={len(values):4d} mean={sum(values) / len(values):7.2f}ms "
+            f"p50={ordered[len(ordered) // 2]:7.2f}ms "
+            f"p95={ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]:7.2f}ms "
+            f"max={ordered[-1]:7.2f}ms"
+        )
 
     def action_spec(self) -> Dict[str, Dict[str, Array]]:
         n = NUM_ARM_JOINTS + (1 if self.include_gripper else 0)
@@ -248,6 +291,23 @@ class YamLeaderAgent(Agent):
     # ------------------------------------------------------------------ #
     # Bilateral control helpers
     # ------------------------------------------------------------------ #
+
+    def _apply_feedback_gains_once(self) -> None:
+        """Apply scaled feedback gains once when feedback first activates."""
+        if self._feedback_gains_applied:
+            return
+        if self._original_kp is None:
+            return
+        scaled_kp = self._original_kp * self.bilateral_kp
+        scaled_kd = np.zeros(NUM_ARM_JOINTS)
+        self.robot.update_kp_kd(kp=scaled_kp, kd=scaled_kd)
+        self._feedback_gains_applied = True
+
+    def _restore_feedback_gains_if_needed(self) -> None:
+        """Restore original gains if feedback gains were previously applied."""
+        if self._feedback_gains_applied and self._original_kp is not None:
+            self.robot.update_kp_kd(kp=self._original_kp, kd=self._kd)
+            self._feedback_gains_applied = False
 
     def _extract_follower_pos(self, obs: Dict[str, Any]) -> Optional[np.ndarray]:
         """Extract follower arm joint positions (radians) from observations."""
@@ -262,19 +322,10 @@ class YamLeaderAgent(Agent):
         The inverse coordinate transform is applied:
             leader_cmd = (follower_pos - offsets) * signs
 
-        The motors are commanded with scaled kp gains to generate restoring
-        torque proportional to: τ ∝ Kp × (q_follower − q_leader)
+        Feedback gains are applied once (after warmup), not every tick.
         """
-        # Inverse transform: remove offsets, then apply signs
         leader_cmd_rad = (follower_pos_rad - self.joint_offsets) * self.joint_signs
-
-        # Update kp/kd for bilateral control
-        if self._original_kp is not None:
-            scaled_kp = self._original_kp * self.bilateral_kp
-            scaled_kd = np.zeros(NUM_ARM_JOINTS)  # No damping for position mode
-            self.robot.update_kp_kd(kp=scaled_kp, kd=scaled_kd)
-
-        # Command the leader to follow the follower position
+        self._apply_feedback_gains_once()
         self.robot.command_joint_pos(leader_cmd_rad)
 
     # ------------------------------------------------------------------ #
@@ -283,6 +334,7 @@ class YamLeaderAgent(Agent):
 
     def close(self) -> None:
         """Close the robot connection."""
+        self._restore_feedback_gains_if_needed()
         if hasattr(self.robot, 'close'):
             self.robot.close()
         logger.info(f"YamLeaderAgent {self.robot_name} closed")

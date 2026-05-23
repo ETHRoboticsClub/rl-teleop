@@ -460,7 +460,7 @@ class ProcessHost:
         self._ctrl.send(b"RESUME")
         self._ctrl.recv()
 
-    def stop(self, timeout: float = 3.0) -> None:
+    def stop(self, timeout: float = 8.0) -> None:
         if self._ctrl is not None:
             self._ctrl.setsockopt(zmq.RCVTIMEO, 2000)  # 2 s receive timeout
             self._ctrl.send(_CTRL_STOP)

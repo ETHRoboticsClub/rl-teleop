@@ -11,11 +11,11 @@ nodes:
       port: /dev/leader-left
       robot_name: left
       motor_ids: [1, 2, 3, 4, 5, 6, 7]
-      baudrate: 1000000
-      protocol_version: 2.0
-      present_position_addr: 132
-      present_position_len: 4
-      ticks_per_rev: 4096
+#      baudrate: 1000000
+#      protocol_version: 2.0
+#      present_position_addr: 132
+#      present_position_len: 4
+#      ticks_per_rev: 4096
       include_gripper: true
       joint_offsets_ticks: [4, -1934, -502, -976, 2091, -32]
       joint_scales: [1, 1, -1, 1, 1, -1]
@@ -35,11 +35,11 @@ nodes:
       port: /dev/leader-right
       robot_name: right
       motor_ids: [8, 9, 10, 11, 12, 13, 14]
-      baudrate: 1000000
-      protocol_version: 2.0
-      present_position_addr: 132
-      present_position_len: 4
-      ticks_per_rev: 4096
+#      baudrate: 1000000
+#      protocol_version: 2.0
+#      present_position_addr: 132
+#      present_position_len: 4
+#      ticks_per_rev: 4096
       include_gripper: true
       joint_offsets_ticks: [-394, -997, 688, 1008, 1005, -18]
       joint_scales: [1, 1, 1, -1, 1, 1]
@@ -110,3 +110,29 @@ nodes:
       top:   camera_top/rgb
       left:  camera_left/rgb
       right: camera_right/rgb
+
+  - type: CameraNode
+    name: camera_top
+    driver: RealSenseCamera
+    device_id: "203522250539"
+    resolution: [640, 360]
+    fps: 30
+    enable_depth: true
+    force_kill_stale_realsense_owners: true
+    extrinsics:
+      position: [0.0, 0.0, 0.4]
+      rpy_radians: [1.2, 3.1416, 1.2]
+
+#  - type: CameraNode
+#    name: camera_left
+#    driver: OpenCVCamera
+#    device_path: /dev/video-left
+#    resolution: [640, 480]
+#    fps: 30
+#
+#  - type: CameraNode
+#    name: camera_right
+#    driver: OpenCVCamera
+#    device_path: /dev/video-right
+#    resolution: [640, 480]
+#    fps: 30

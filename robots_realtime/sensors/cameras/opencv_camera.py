@@ -28,9 +28,6 @@ class OpencvCamera(CameraDriver):
         return f"OpencvCamera(device_path={self.device_path!r}, name={self.name!r}, resolution={self.resolution}, fps={self.fps})"
 
     def __post_init__(self):
-        available_cameras = self.list_cameras()
-        logging.info(f"available_cameras: {available_cameras}")
-
         self.cap = cv2.VideoCapture(self.device_path)
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
@@ -40,14 +37,7 @@ class OpencvCamera(CameraDriver):
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
     def list_cameras(self) -> List[int]:
-        available_cameras = []
-        for i in range(20):  # Check the first 20 device indices
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                available_cameras.append(i)
-                cap.release()
-
-        return available_cameras
+        return []
 
     def read(self) -> CameraData:
         try:

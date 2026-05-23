@@ -58,6 +58,7 @@ import numpy as np
 
 from robots_realtime.runtime.node import Node, NodeRole
 from robots_realtime.sensors.cameras.camera_utils import resize_with_pad
+from robots_realtime.utils.depth_utils import depth_color_to_pointcloud
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,7 @@ class ViserMonitorNode(Node):
         self._urdfs: dict[str, Any] = {}        # raw yourdfpy.URDF, for FK to drive grippers + chunks
         self._gripper_state: dict[str, dict] = {}
         self._image_handles: dict[str, Any] = {}
+        self._point_cloud_handles: dict[str, Any] = {}
         # chunk frame handles: arm_key -> list of viser frame handles (one per
         # downsampled chunk step). Pre-allocated in setup() so step() only has
         # to update positions/quats — no viser create/destroy per tick.
@@ -551,6 +553,7 @@ class ViserMonitorNode(Node):
             img = self._extract_rgb(msg)
             if img is None:
                 continue
+            rgb_for_cloud = img
             # resize_with_pad takes (image, height, width) — not (w, h). The
             # preview_size kwarg is (width, height) for ergonomic YAML config,
             # so we transpose here.
@@ -565,6 +568,7 @@ class ViserMonitorNode(Node):
                 self._image_handles[label] = self._server.gui.add_image(thumb, label=label)
             else:
                 self._image_handles[label].image = thumb
+            self._update_depth_cloud(label, msg, rgb_for_cloud)
 
     def cleanup(self) -> None:
         # Close the browser we spawned (best-effort).
@@ -608,6 +612,88 @@ class ViserMonitorNode(Node):
             arr = msg.get(key)
             if arr is not None:
                 return np.asarray(arr)
+        return None
+
+    def _update_depth_cloud(self, label: str, msg: dict, img: np.ndarray) -> None:
+        depth = msg.get("depth_data") if isinstance(msg, dict) else None
+        intrinsics = msg.get("intrinsics") if isinstance(msg, dict) else None
+        if depth is None or intrinsics is None:
+            return
+        K = self._intrinsics_matrix(intrinsics)
+        if K is None:
+            return
+        raw_depth = np.asarray(depth)
+        depth_arr = raw_depth.astype(np.float64)
+        if raw_depth.dtype.kind in ("u", "i"):
+            depth_arr *= 0.001
+        try:
+            points, colors = depth_color_to_pointcloud(
+                depth=depth_arr,
+                rgb_img=self._match_image_shape(np.asarray(img), depth_arr.shape),
+                intrinsics=K,
+                subsample_factor=1,
+                depth_clip_range=(0.015, 2.0),
+            )
+        except ValueError as exc:
+            logger.debug("[%s] depth cloud skipped for %s: %s", self.name, label, exc)
+            return
+        name = f"/camera_{label}/point_cloud"
+        extrinsics = msg.get("extrinsics") if isinstance(msg, dict) else None
+        position = (0.0, 0.0, 0.0)
+        wxyz = (1.0, 0.0, 0.0, 0.0)
+        if isinstance(extrinsics, dict):
+            if "position" in extrinsics:
+                position = np.asarray(extrinsics["position"], dtype=np.float32)
+            if "wxyz" in extrinsics:
+                wxyz = np.asarray(extrinsics["wxyz"], dtype=np.float32)
+        if label not in self._point_cloud_handles:
+            self._point_cloud_handles[label] = self._server.scene.add_point_cloud(
+                name=name,
+                points=points,
+                colors=colors,
+                point_size=0.003,
+                position=position,
+                wxyz=wxyz,
+            )
+        else:
+            handle = self._point_cloud_handles[label]
+            handle.points = points
+            handle.colors = colors
+            handle.position = position
+            handle.wxyz = wxyz
+
+    @staticmethod
+    def _match_image_shape(img: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+        target_h, target_w = target_shape
+        if img.shape[:2] == (target_h, target_w):
+            return img
+        y_idx = np.linspace(0, img.shape[0] - 1, target_h).astype(np.int64)
+        x_idx = np.linspace(0, img.shape[1] - 1, target_w).astype(np.int64)
+        return img[y_idx][:, x_idx]
+
+    @staticmethod
+    def _intrinsics_matrix(intrinsics: Any) -> np.ndarray | None:
+        if isinstance(intrinsics, np.ndarray):
+            arr = np.asarray(intrinsics, dtype=np.float64)
+            return arr if arr.shape == (3, 3) else None
+        if not isinstance(intrinsics, dict):
+            return None
+        matrix = intrinsics.get("intrinsics_matrix")
+        if matrix is not None:
+            arr = np.asarray(matrix, dtype=np.float64)
+            return arr if arr.shape == (3, 3) else None
+        required = ("fx", "fy", "cx", "cy")
+        if all(key in intrinsics for key in required):
+            return np.array(
+                [
+                    [float(intrinsics["fx"]), 0.0, float(intrinsics["cx"])],
+                    [0.0, float(intrinsics["fy"]), float(intrinsics["cy"])],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+        if "left" in intrinsics:
+            return ViserMonitorNode._intrinsics_matrix(intrinsics["left"])
         return None
 
     @staticmethod
