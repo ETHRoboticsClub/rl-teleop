@@ -51,44 +51,68 @@ class _DynamixelPositionReader:
             self._port_handler.closePort()
             raise RuntimeError(f"Failed to set Dynamixel baudrate {self._baudrate} on {port}")
 
-    def get_positions(self) -> np.ndarray:
-        positions = []
+        self._group_sync_read = dynamixel_sdk.GroupSyncRead(
+            self._port_handler,
+            self._packet_handler,
+            self._present_position_addr,
+            self._present_position_len,
+        )
         for motor_id in self._motor_ids:
-            success = False
-            last_comm_result = 0
-            last_dxl_error = 0
-            
-            for attempt in range(self._num_read_retries + 1):
-                value, comm_result, dxl_error = self._packet_handler.read4ByteTxRx(
-                    self._port_handler,
-                    int(motor_id),
-                    self._present_position_addr,
-                )
-                
-                if comm_result == 0 and dxl_error == 0:
-                    if value >= 2**31:
-                        value -= 2**32
-                    positions.append(value)
-                    success = True
-                    break
-                
-                last_comm_result = comm_result
-                last_dxl_error = dxl_error
-                
+            if not self._group_sync_read.addParam(int(motor_id)):
+                self._port_handler.closePort()
+                raise RuntimeError(f"Failed to add Dynamixel id={motor_id} to sync read group on {port}")
+
+    def get_positions(self) -> np.ndarray:
+        last_comm_result = 0
+        last_missing_id: Optional[int] = None
+
+        for attempt in range(self._num_read_retries + 1):
+            comm_result = self._group_sync_read.fastSyncRead()
+            last_comm_result = comm_result
+            if comm_result != dynamixel_sdk.COMM_SUCCESS:
                 if attempt < self._num_read_retries:
                     time.sleep(0.001)
                     continue
-                else:
+                break
+
+            positions: List[int] = []
+            missing_id: Optional[int] = None
+            for motor_id in self._motor_ids:
+                if not self._group_sync_read.isAvailable(
+                    int(motor_id),
+                    self._present_position_addr,
+                    self._present_position_len,
+                ):
+                    missing_id = int(motor_id)
                     break
-            
-            if not success:
-                raise RuntimeError(
-                    f"Dynamixel read failed for id={motor_id} after {self._num_read_retries + 1} attempts: "
-                    f"comm_result={last_comm_result}, error={last_dxl_error}"
+                value = self._group_sync_read.getData(
+                    int(motor_id),
+                    self._present_position_addr,
+                    self._present_position_len,
                 )
-                
-        self._last_read_time = time.time()
-        return np.array(positions, dtype=np.float64)
+                if value >= 2**31:
+                    value -= 2**32
+                positions.append(value)
+
+            if missing_id is None:
+                self._last_read_time = time.time()
+                return np.array(positions, dtype=np.float64)
+
+            last_missing_id = missing_id
+            if attempt < self._num_read_retries:
+                time.sleep(0.001)
+                continue
+            break
+
+        if last_missing_id is not None:
+            raise RuntimeError(
+                f"Dynamixel read failed for id={last_missing_id} after {self._num_read_retries + 1} attempts: "
+                f"comm_result={last_comm_result}, error=0"
+            )
+        raise RuntimeError(
+            f"Dynamixel sync read failed after {self._num_read_retries + 1} attempts: "
+            f"comm_result={last_comm_result}"
+        )
 
     def seconds_since_last_read(self) -> float:
         if self._last_read_time <= 0.0:
