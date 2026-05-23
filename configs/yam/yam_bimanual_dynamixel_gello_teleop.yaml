@@ -11,7 +11,7 @@ nodes:
       port: /dev/leader-left
       robot_name: left
       motor_ids: [1, 2, 3, 4, 5, 6, 7]
-#      baudrate: 1000000
+      baudrate: 1000000
 #      protocol_version: 2.0
 #      present_position_addr: 132
 #      present_position_len: 4
@@ -35,7 +35,7 @@ nodes:
       port: /dev/leader-right
       robot_name: right
       motor_ids: [8, 9, 10, 11, 12, 13, 14]
-#      baudrate: 1000000
+      baudrate: 1000000
 #      protocol_version: 2.0
 #      present_position_addr: 132
 #      present_position_len: 4
@@ -118,7 +118,6 @@ nodes:
     resolution: [640, 360]
     fps: 30
     enable_depth: true
-    force_kill_stale_realsense_owners: true
     extrinsics:
       position: [0.0, 0.0, 0.4]
       rpy_radians: [1.2, 3.1416, 1.2]

@@ -19,11 +19,9 @@ from __future__ import annotations
 import atexit
 import logging
 import os
-import signal
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -31,11 +29,6 @@ import numpy as np
 from robots_realtime.sensors.cameras.camera import CameraData, CameraDriver
 
 logger = logging.getLogger(__name__)
-
-_PROC_ROOT = Path("/proc")
-_SYS_USB_DEVICES = Path("/sys/bus/usb/devices")
-_DEV_ROOT = Path("/dev")
-
 
 RESOLUTION_PRESETS: Dict[str, Tuple[int, int]] = {
     "VGA": (640, 480),
@@ -60,89 +53,6 @@ def _resolve_resolution(resolution: Any) -> Tuple[int, int]:
     )
 
 
-def _read_text(path: Path) -> str:
-    try:
-        return path.read_text(errors="ignore").strip()
-    except OSError as exc:
-        logger.debug("Failed to read %s: %s", path, exc)
-        return ""
-
-
-def _pid_exists(pid: int) -> bool:
-    return (_PROC_ROOT / str(pid)).exists()
-
-
-def _usb_device_path_for_serial(serial: str) -> Path | None:
-    try:
-        candidates = list(_SYS_USB_DEVICES.iterdir())
-    except OSError as exc:
-        logger.debug("Failed to list %s: %s", _SYS_USB_DEVICES, exc)
-        return None
-
-    for usb_dir in candidates:
-        if _read_text(usb_dir / "serial") != serial:
-            continue
-        busnum = _read_text(usb_dir / "busnum")
-        devnum = _read_text(usb_dir / "devnum")
-        if not busnum or not devnum:
-            return None
-        return _DEV_ROOT / "bus" / "usb" / f"{int(busnum):03d}" / f"{int(devnum):03d}"
-    return None
-
-
-def _process_looks_like_robots_realtime(pid_dir: Path) -> bool:
-    cmdline = _read_text(pid_dir / "cmdline").replace("\x00", " ")
-    comm = _read_text(pid_dir / "comm")
-    cwd = ""
-    try:
-        cwd = str((pid_dir / "cwd").resolve())
-    except OSError:
-        pass
-    text = f"{cmdline} {comm} {cwd}"
-    return "robots_realtime" in text or "rr-session" in text or "Node-" in text
-
-
-def _process_holds_device(pid_dir: Path, device_path: Path) -> bool:
-    fd_dir = pid_dir / "fd"
-    try:
-        fds = list(fd_dir.iterdir())
-    except OSError as exc:
-        logger.debug("Failed to list %s: %s", fd_dir, exc)
-        return False
-
-    for fd in fds:
-        try:
-            if fd.resolve() == device_path:
-                return True
-        except OSError:
-            continue
-    return False
-
-
-def _find_stale_realsense_owner_pids(serial: str) -> list[int]:
-    device_path = _usb_device_path_for_serial(serial)
-    if device_path is None:
-        return []
-
-    current_pid = os.getpid()
-    pids: list[int] = []
-    try:
-        pid_dirs = list(_PROC_ROOT.iterdir())
-    except OSError as exc:
-        logger.debug("Failed to list %s: %s", _PROC_ROOT, exc)
-        return []
-
-    for pid_dir in pid_dirs:
-        if not pid_dir.name.isdigit():
-            continue
-        pid = int(pid_dir.name)
-        if pid == current_pid:
-            continue
-        if _process_looks_like_robots_realtime(pid_dir) and _process_holds_device(pid_dir, device_path):
-            pids.append(pid)
-    return pids
-
-
 @dataclass
 class RealSenseCamera(CameraDriver):
     """Intel RealSense camera driver indexed by serial number.
@@ -162,9 +72,6 @@ class RealSenseCamera(CameraDriver):
             locks the color temperature. ``None`` keeps auto WB.
         enable_depth: Also stream the depth channel. Emitted under
             ``CameraData.other_sensors["depth"]`` when available.
-        force_kill_stale_realsense_owners: Escalate stale robots_realtime
-            owner takeover from SIGTERM to SIGKILL when a busy RealSense device
-            is still held after the graceful grace period.
     """
 
     device_id: Optional[str] = None
@@ -177,8 +84,6 @@ class RealSenseCamera(CameraDriver):
     enable_depth: bool = False
     depth_resolution: Any = None
     align_depth: bool = False
-    force_kill_stale_realsense_owners: bool = False
-    stale_owner_grace_s: float = 2.0
 
     # Populated in __post_init__; callers should not set these directly.
     intrinsic_data: dict = field(default_factory=dict)
@@ -203,19 +108,23 @@ class RealSenseCamera(CameraDriver):
         self._depth_intrinsic_data: dict = {}
         self._use_infrared: bool = False
         self._lock = threading.Lock()
+        self._stopped = False
 
         self._open_with_retries()
-        self._configure_exposure()
-        self.intrinsic_data = self._read_intrinsics()
+        atexit.register(self._atexit_cleanup)
 
+        rsusb = os.environ.get("RS2_USE_RSUSB_BACKEND", "")
+        rs_version = getattr(self._rs, "__version__", "unknown")
         logger.info(
-            "RealSenseCamera opened: serial=%s, %dx%d@%dfps, infrared=%s, depth=%s",
+            "RealSenseCamera opened: serial=%s, %dx%d@%dfps, infrared=%s, depth=%s, rsusb=%s, version=%s",
             self.device_id or "auto",
             self._width,
             self._height,
             self.fps,
             self._use_infrared,
             self.enable_depth,
+            bool(rsusb),
+            rs_version,
         )
 
     # ------------------------------------------------------------------ #
@@ -235,27 +144,9 @@ class RealSenseCamera(CameraDriver):
                 logger.debug("RealSenseCamera serial read failed: %s", exc)
         return None
 
-    def _hardware_reset_target_device(self, reason: str) -> bool:
-        dev = self._find_target_device()
-        if dev is None:
-            logger.warning(
-                "RealSense device %s still busy after retries, but target is not identifiable; skipping hardware reset",
-                self.device_id or "auto",
-            )
-            return False
-        try:
-            logger.warning("RealSense device %s hardware_reset after %s", self.device_id or "auto", reason)
-            dev.hardware_reset()
-            time.sleep(5.0)
-            return True
-        except Exception as exc:
-            logger.warning("RealSenseCamera hardware_reset failed: %s", exc)
-            return False
-
     def _open_with_retries(self, max_retries: int = 5) -> None:
         """Open the pipeline; retry on transient 'device busy' errors."""
         last_exc: Exception | None = None
-        takeover_attempted = False
         for attempt in range(max_retries):
             try:
                 self._start_pipeline_once()
@@ -263,9 +154,6 @@ class RealSenseCamera(CameraDriver):
             except RuntimeError as exc:
                 last_exc = exc
                 if self._is_busy_error(exc):
-                    if not takeover_attempted:
-                        takeover_attempted = True
-                        self._take_over_stale_realsense_owners()
                     if attempt >= max_retries - 1:
                         break
                     wait_s = 0.5 * (attempt + 1)
@@ -280,13 +168,6 @@ class RealSenseCamera(CameraDriver):
                 else:
                     raise
 
-        if last_exc is not None and self._is_busy_error(last_exc):
-            if self._hardware_reset_target_device("device busy"):
-                try:
-                    self._open_with_retries(max_retries=3)
-                    return
-                except RuntimeError as exc:
-                    last_exc = exc
         if last_exc is not None:
             raise last_exc
 
@@ -296,8 +177,6 @@ class RealSenseCamera(CameraDriver):
 
     def _start_pipeline_once(self) -> None:
         rs = self._rs
-        # Detect whether the target device has a dedicated color sensor.
-        # D405 does not — its stereo module exposes rgb8 infrared only.
         has_color = self._device_has_color_sensor()
 
         pipe = rs.pipeline()
@@ -333,51 +212,7 @@ class RealSenseCamera(CameraDriver):
         self._pipeline = pipe
         self._use_infrared = not has_color
 
-    def _take_over_stale_realsense_owners(self) -> bool:
-        if self.device_id is None:
-            return False
-        pids = _find_stale_realsense_owner_pids(self.device_id)
-        if not pids:
-            return False
-
-        logger.warning("Taking over busy RealSense %s from stale owner PID(s): %s", self.device_id, pids)
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                continue
-            except PermissionError as exc:
-                logger.warning("No permission to terminate stale RealSense owner PID %s: %s", pid, exc)
-
-        deadline = time.monotonic() + max(0.0, self.stale_owner_grace_s)
-        while time.monotonic() < deadline:
-            if not any(_pid_exists(pid) for pid in pids):
-                return True
-            time.sleep(0.1)
-
-        if self.force_kill_stale_realsense_owners:
-            for pid in pids:
-                if not _pid_exists(pid):
-                    continue
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    continue
-                except PermissionError as exc:
-                    logger.warning("No permission to kill stale RealSense owner PID %s: %s", pid, exc)
-        return True
-
     def _device_has_color_sensor(self) -> bool:
-        """Whether the target device exposes ``rs.stream.color``.
-
-        Checks the actual stream profiles published by every sensor on the
-        device, not the sensor *name*. Required for the D405: that camera has
-        a single ``'Stereo Module'`` sensor that hosts BOTH ``stream.infrared``
-        AND ``stream.color`` profiles, so a name keyword check ("RGB" /
-        "Color") falsely returns False and the driver falls back to streaming
-        a monochrome IR frame as 3-channel — which is wildly off-distribution
-        from the color RGB feed used during training.
-        """
         rs = self._rs
         ctx = rs.context()
         for dev in ctx.query_devices():
@@ -390,7 +225,6 @@ class RealSenseCamera(CameraDriver):
                         except Exception:
                             continue
                 return False
-        # Device not (yet) enumerable — assume color and let pipeline.start() surface a real error.
         return True
 
     def _configure_exposure(self) -> None:
@@ -404,8 +238,6 @@ class RealSenseCamera(CameraDriver):
             except Exception:
                 continue
             if "stereo" in name.lower() or "rgb" in name.lower():
-                # Auto-exposure first; some sensors require AE off before
-                # accepting an explicit exposure value.
                 try:
                     sensor.set_option(rs.option.enable_auto_exposure, bool(self.auto_exposure))
                 except Exception as exc:
@@ -498,9 +330,8 @@ class RealSenseCamera(CameraDriver):
             raise RuntimeError("RealSenseCamera: no color/infrared frame in pipeline output")
 
         rgb = np.asanyarray(color_frame.get_data())
-        # Infrared RGB8 from D405 returns a 3-channel frame already; no conversion needed.
 
-        ts_ms = float(frames.get_timestamp())  # camera-side timestamp in ms
+        ts_ms = float(frames.get_timestamp())
 
         other: dict = {}
         if self.enable_depth:
@@ -529,13 +360,24 @@ class RealSenseCamera(CameraDriver):
             "infrared_fallback": self._use_infrared,
         }
 
+    def _atexit_cleanup(self) -> None:
+        try:
+            self.stop()
+        except Exception as exc:
+            logger.warning("RealSenseCamera atexit cleanup failed: %s", exc)
+
     def stop(self) -> None:
         with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+
             if self._pipeline is not None:
                 try:
                     self._pipeline.stop()
                 except Exception as exc:
                     logger.debug("RealSenseCamera.stop() failed: %s", exc)
+
                 self._pipeline = None
                 self._profile = None
                 self._align = None
@@ -547,7 +389,6 @@ class RealSenseCamera(CameraDriver):
 
 
 def discover_realsense_cameras() -> list[dict[str, str]]:
-    """Enumerate connected RealSense devices. Returns [] if pyrealsense2 missing."""
     try:
         import pyrealsense2 as rs  # noqa: PLC0415
     except ImportError:

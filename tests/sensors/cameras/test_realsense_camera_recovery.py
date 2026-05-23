@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import signal
-from pathlib import Path
+import threading
+import time as _time_mod
+from typing import Dict
 
 import pytest
 
-from robots_realtime.sensors.cameras import realsense_camera
 from robots_realtime.sensors.cameras.realsense_camera import RealSenseCamera
 
 
@@ -25,10 +25,10 @@ class FakeFormat:
 
 
 class FakeProfile:
-    def __init__(self, device: FakeDevice | None = None) -> None:
+    def __init__(self, device: "FakeDevice | None" = None) -> None:
         self._device = device
 
-    def get_device(self) -> FakeDevice | None:
+    def get_device(self) -> "FakeDevice | None":
         return self._device
 
 
@@ -41,7 +41,7 @@ class FakeConfig:
 
 
 class FakeFrames:
-    def __init__(self, state: dict[str, int | bool]) -> None:
+    def __init__(self, state: Dict[str, int | bool]) -> None:
         self._state = state
 
     def get_color_frame(self):
@@ -52,9 +52,10 @@ class FakeFrames:
 
 
 class FakePipeline:
-    def __init__(self, state: dict[str, int | bool], device: FakeDevice | None = None) -> None:
+    def __init__(self, state: Dict[str, int | bool], device: "FakeDevice | None" = None) -> None:
         self._state = state
         self._device = device
+        self._stopped = False
 
     def start(self, _cfg: FakeConfig) -> FakeProfile:
         self._state["attempts"] = int(self._state["attempts"]) + 1
@@ -62,6 +63,10 @@ class FakePipeline:
             raise RuntimeError("Device or resource busy")
         self._state["started"] = True
         return FakeProfile(self._device)
+
+    def stop(self) -> None:
+        self._stopped = True
+        self._state["started"] = False
 
     def wait_for_frames(self, timeout_ms: int = 5000) -> FakeFrames:
         if not self._state.get("started"):
@@ -97,7 +102,7 @@ class FakeRs:
     format = FakeFormat
     stream = FakeStream
 
-    def __init__(self, devices: list[FakeDevice], state: dict[str, int | bool]) -> None:
+    def __init__(self, devices: list[FakeDevice], state: Dict[str, int | bool]) -> None:
         self._devices = devices
         self._state = state
 
@@ -108,83 +113,26 @@ class FakeRs:
         return FakePipeline(self._state, self._devices[0] if self._devices else None)
 
 
-def _camera_for_recovery(*, force: bool = False, serial: str = "123") -> RealSenseCamera:
+def _camera_for_recovery(*, serial: str = "123") -> RealSenseCamera:
     camera = object.__new__(RealSenseCamera)
     camera.device_id = serial
-    camera.force_kill_stale_realsense_owners = force
-    camera.stale_owner_grace_s = 0.0
+    camera._lock = threading.Lock()
+    camera._stopped = False
+    camera.intrinsic_data = {}
     return camera
 
 
-def _write_proc_owner(proc_root: Path, pid: int, device_path: Path, *, cmdline: str = "rr-session") -> None:
-    proc_dir = proc_root / str(pid)
-    fd_dir = proc_dir / "fd"
-    fd_dir.mkdir(parents=True)
-    (proc_dir / "cmdline").write_text(cmdline.replace(" ", "\0"))
-    (proc_dir / "comm").write_text("python")
-    fd_path = fd_dir / "7"
-    fd_path.symlink_to(device_path)
+# ------------------------------------------------------------------ #
+# Kernel UVC busy behavior — no process killing
+# ------------------------------------------------------------------ #
 
 
-def _write_usb_device(sys_root: Path, dev_root: Path, serial: str = "123") -> Path:
-    usb_dir = sys_root / "1-1"
-    usb_dir.mkdir(parents=True)
-    (usb_dir / "serial").write_text(serial)
-    (usb_dir / "busnum").write_text("1")
-    (usb_dir / "devnum").write_text("2")
-    device_path = dev_root / "bus" / "usb" / "001" / "002"
-    device_path.parent.mkdir(parents=True)
-    device_path.touch()
-    return device_path
-
-
-def test_stale_realsense_owner_takeover_is_graceful_by_default(
-    tmp_path: Path,
+def test_busy_open_retries_without_killing_processes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    proc_root = tmp_path / "proc"
-    sys_root = tmp_path / "sys" / "bus" / "usb" / "devices"
-    dev_root = tmp_path / "dev"
-    device_path = _write_usb_device(sys_root, dev_root)
-    _write_proc_owner(proc_root, 42, device_path)
-
-    kills: list[tuple[int, int]] = []
-    monkeypatch.setattr(realsense_camera, "_PROC_ROOT", proc_root)
-    monkeypatch.setattr(realsense_camera, "_SYS_USB_DEVICES", sys_root)
-    monkeypatch.setattr(realsense_camera, "_DEV_ROOT", dev_root)
-    monkeypatch.setattr(realsense_camera.os, "getpid", lambda: 999)
-    monkeypatch.setattr(realsense_camera.os, "kill", lambda pid, sig: kills.append((pid, sig)))
-    monkeypatch.setattr(realsense_camera.time, "sleep", lambda _seconds: None)
-
-    assert _camera_for_recovery()._take_over_stale_realsense_owners()
-    assert kills == [(42, signal.SIGTERM)]
-
-
-def test_force_kill_flag_escalates_after_graceful_takeover_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    proc_root = tmp_path / "proc"
-    sys_root = tmp_path / "sys" / "bus" / "usb" / "devices"
-    dev_root = tmp_path / "dev"
-    device_path = _write_usb_device(sys_root, dev_root)
-    _write_proc_owner(proc_root, 42, device_path)
-
-    kills: list[tuple[int, int]] = []
-    monkeypatch.setattr(realsense_camera, "_PROC_ROOT", proc_root)
-    monkeypatch.setattr(realsense_camera, "_SYS_USB_DEVICES", sys_root)
-    monkeypatch.setattr(realsense_camera, "_DEV_ROOT", dev_root)
-    monkeypatch.setattr(realsense_camera.os, "getpid", lambda: 999)
-    monkeypatch.setattr(realsense_camera.os, "kill", lambda pid, sig: kills.append((pid, sig)))
-    monkeypatch.setattr(realsense_camera.time, "sleep", lambda _seconds: None)
-
-    assert _camera_for_recovery(force=True)._take_over_stale_realsense_owners()
-    assert kills == [(42, signal.SIGTERM), (42, signal.SIGKILL)]
-
-
-def test_busy_open_resets_identified_device_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Busy errors should only retry with backoff, never kill PIDs."""
     device = FakeDevice("123")
-    state: dict[str, int | bool] = {"attempts": 0, "failures": 2, "started": False}
+    state: Dict[str, int | bool] = {"attempts": 0, "failures": 99, "started": False}
     camera = _camera_for_recovery(serial="123")
     camera._rs = FakeRs([device], state)
     camera._width = 640
@@ -201,24 +149,25 @@ def test_busy_open_resets_identified_device_after_retries(monkeypatch: pytest.Mo
     camera.fps = 30
 
     monkeypatch.setattr(camera, "_device_has_color_sensor", lambda: True)
-    monkeypatch.setattr(camera, "_take_over_stale_realsense_owners", lambda: False)
-    monkeypatch.setattr(realsense_camera.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(camera, "_is_busy_error", lambda exc: True)
 
-    camera._open_with_retries(max_retries=2)
+    monkeypatch.setattr(_time_mod, "sleep", lambda _seconds: None)
 
-    assert device.reset_count == 1
-    assert state["started"] is True
-    assert camera._pipeline is not None
+    with pytest.raises(RuntimeError, match="busy"):
+        camera._open_with_retries(max_retries=3)
+
+    assert state["attempts"] == 3
+    assert device.reset_count == 0
 
 
-def test_busy_open_skips_reset_when_auto_device_target_is_ambiguous(
+def test_busy_open_succeeds_after_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    devices = [FakeDevice("123"), FakeDevice("456")]
-    state: dict[str, int | bool] = {"attempts": 0, "failures": 99, "started": False}
-    camera = _camera_for_recovery(serial=None)  # type: ignore[arg-type]
-    camera.device_id = None
-    camera._rs = FakeRs(devices, state)
+    """Busy errors should succeed once the device becomes available."""
+    device = FakeDevice("123")
+    state: Dict[str, int | bool] = {"attempts": 0, "failures": 1, "started": False}
+    camera = _camera_for_recovery(serial="123")
+    camera._rs = FakeRs([device], state)
     camera._width = 640
     camera._height = 480
     camera._depth_width = 640
@@ -233,10 +182,133 @@ def test_busy_open_skips_reset_when_auto_device_target_is_ambiguous(
     camera.fps = 30
 
     monkeypatch.setattr(camera, "_device_has_color_sensor", lambda: True)
-    monkeypatch.setattr(camera, "_take_over_stale_realsense_owners", lambda: False)
-    monkeypatch.setattr(realsense_camera.time, "sleep", lambda _seconds: None)
 
-    with pytest.raises(RuntimeError, match="busy"):
-        camera._open_with_retries(max_retries=1)
+    monkeypatch.setattr(_time_mod, "sleep", lambda _seconds: None)
 
-    assert [device.reset_count for device in devices] == [0, 0]
+    camera._open_with_retries(max_retries=3)
+
+    assert state["started"] is True
+    assert camera._pipeline is not None
+    assert device.reset_count == 0
+
+
+# ------------------------------------------------------------------ #
+# Conservative cleanup — no default hardware_reset
+# ------------------------------------------------------------------ #
+
+
+def test_stop_clears_refs_even_if_pipeline_stop_raises() -> None:
+    """stop() must clear internal references even when pipeline.stop() fails."""
+    state: Dict[str, int | bool] = {"attempts": 1, "failures": 0, "started": True}
+    device = FakeDevice("123")
+    camera = _camera_for_recovery(serial="123")
+    camera._rs = FakeRs([device], state)
+    camera._pipeline = FakePipeline(state, device)
+    camera._profile = FakeProfile(device)
+    camera._align = "align_obj"
+    camera._stopped = False
+
+    def failing_stop():
+        raise RuntimeError("pipeline stop failed")
+
+    camera._pipeline.stop = failing_stop  # type: ignore[method-assign]
+
+    camera.stop()
+
+    assert camera._pipeline is None
+    assert camera._profile is None
+    assert camera._align is None
+    assert camera._stopped is True
+    assert device.reset_count == 0
+
+
+def test_stop_does_not_call_hardware_reset_by_default() -> None:
+    """stop() must not call hardware_reset() unless explicitly configured."""
+    state: Dict[str, int | bool] = {"attempts": 1, "failures": 0, "started": True}
+    device = FakeDevice("123")
+    camera = _camera_for_recovery(serial="123")
+    camera._rs = FakeRs([device], state)
+    camera._pipeline = FakePipeline(state, device)
+    camera._profile = FakeProfile(device)
+    camera._align = None
+    camera._stopped = False
+
+    def failing_stop():
+        raise RuntimeError("pipeline stop failed")
+
+    camera._pipeline.stop = failing_stop  # type: ignore[method-assign]
+
+    camera.stop()
+
+    assert device.reset_count == 0
+    assert camera._stopped is True
+
+
+def test_stop_is_idempotent() -> None:
+    """Calling stop() twice must not crash or double-release."""
+    state: Dict[str, int | bool] = {"attempts": 1, "failures": 0, "started": True}
+    device = FakeDevice("123")
+    camera = _camera_for_recovery(serial="123")
+    camera._rs = FakeRs([device], state)
+    camera._pipeline = FakePipeline(state, device)
+    camera._profile = FakeProfile(device)
+    camera._align = None
+    camera._stopped = False
+
+    stop_calls = []
+    original_stop = camera._pipeline.stop
+
+    def tracking_stop():
+        stop_calls.append(1)
+        return original_stop()
+
+    camera._pipeline.stop = tracking_stop  # type: ignore[method-assign]
+
+    camera.stop()
+    camera.stop()
+
+    assert len(stop_calls) == 1
+    assert camera._stopped is True
+
+
+# ------------------------------------------------------------------ #
+# atexit cleanup
+# ------------------------------------------------------------------ #
+
+
+def test_atexit_cleanup_calls_stop() -> None:
+    """atexit handler calls stop() without raising."""
+    state: Dict[str, int | bool] = {"attempts": 1, "failures": 0, "started": True}
+    device = FakeDevice("123")
+    camera = _camera_for_recovery(serial="123")
+    camera._rs = FakeRs([device], state)
+    camera._pipeline = FakePipeline(state, device)
+    camera._profile = FakeProfile(device)
+    camera._align = None
+    camera._stopped = False
+
+    stop_called = []
+    original_stop = camera.stop
+
+    def tracking_stop():
+        stop_called.append(1)
+        return original_stop()
+
+    camera.stop = tracking_stop  # type: ignore[method-assign]
+
+    camera._atexit_cleanup()
+    assert len(stop_called) == 1
+    assert camera._stopped is True
+
+
+def test_atexit_cleanup_suppresses_exception() -> None:
+    """atexit handler must never raise, even if stop() fails."""
+    camera = _camera_for_recovery(serial="123")
+    camera._stopped = False
+
+    def raising_stop():
+        raise RuntimeError("device gone")
+
+    camera.stop = raising_stop  # type: ignore[method-assign]
+
+    camera._atexit_cleanup()

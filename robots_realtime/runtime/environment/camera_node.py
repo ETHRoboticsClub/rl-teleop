@@ -18,6 +18,7 @@ and ``pad`` (resize-with-pad / letterbox).
 from __future__ import annotations
 
 import importlib
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ import numpy as np
 from robots_realtime.runtime.node import Node, NodeRole
 from robots_realtime.sensors.cameras.camera import CameraData, CameraDriver
 
+_logger = logging.getLogger(__name__)
 
 _CAMERA_DRIVER_REGISTRY: dict[str, str] = {
     "ZedCamera":        "robots_realtime.sensors.cameras.zed_camera:ZedCamera",
@@ -203,7 +205,13 @@ class CameraNode(Node):
         if self._driver is None:
             raise RuntimeError(f"[{self.name}] CameraNode.step() called before setup")
         driver = self._driver
-        data: CameraData = driver.read()
+        try:
+            data: CameraData = driver.read()
+        except Exception as exc:
+            _logger.error("[%s] camera read failed: %s", self.name, exc)
+            if hasattr(driver, "stop"):
+                driver.stop()
+            raise
 
         # Hardware timestamp from driver (ms) → seconds
         ts = data.timestamp / 1000.0 if data.timestamp else time.time()
