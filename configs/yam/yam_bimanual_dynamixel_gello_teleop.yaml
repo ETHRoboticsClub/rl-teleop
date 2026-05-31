@@ -18,10 +18,10 @@ nodes:
 #      ticks_per_rev: 4096
       include_gripper: true
       joint_offsets_ticks: [4, -1934, -502, -976, 2091, -32]
-      joint_scales: [1, 1, -1, 1, 1, -1]
+      joint_scales: [1, 1, -1, 1, 1, 1]
       joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-      gripper_open_ticks: 1670
-      gripper_closed_ticks: 2280
+      gripper_open_ticks: 1730
+      gripper_closed_ticks: 2100
       gripper_scale: 1.0
       stale_timeout_s: 1.0
       max_delta_rad: 3.14
