@@ -145,7 +145,7 @@ class RealSenseCamera(CameraDriver):
         return None
 
     def _open_with_retries(self, max_retries: int = 5) -> None:
-        """Open the pipeline; retry on transient 'device busy' errors."""
+        """Open the pipeline; retry on transient RealSense startup errors."""
         last_exc: Exception | None = None
         for attempt in range(max_retries):
             try:
@@ -153,13 +153,14 @@ class RealSenseCamera(CameraDriver):
                 return
             except RuntimeError as exc:
                 last_exc = exc
-                if self._is_busy_error(exc):
+                if self._is_retryable_open_error(exc):
                     if attempt >= max_retries - 1:
                         break
                     wait_s = 0.5 * (attempt + 1)
                     logger.warning(
-                        "RealSense device %s busy, retrying in %.1fs (%d/%d)",
+                        "RealSense device %s open failed (%s), retrying in %.1fs (%d/%d)",
                         self.device_id or "auto",
+                        exc,
                         wait_s,
                         attempt + 1,
                         max_retries,
@@ -172,8 +173,9 @@ class RealSenseCamera(CameraDriver):
             raise last_exc
 
     @staticmethod
-    def _is_busy_error(exc: Exception) -> bool:
-        return "busy" in str(exc).lower()
+    def _is_retryable_open_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "busy" in message or "frame didn't arrive" in message or "no color" in message
 
     def _start_pipeline_once(self) -> None:
         rs = self._rs
@@ -181,6 +183,8 @@ class RealSenseCamera(CameraDriver):
 
         pipe = rs.pipeline()
         cfg = rs.config()
+        if self.device_id is not None:
+            cfg.enable_device(self.device_id)
         stream = rs.stream.color if has_color else rs.stream.infrared
         if self.enable_depth:
             cfg.enable_stream(rs.stream.depth, self._depth_width, self._depth_height, rs.format.z16, self.fps)
@@ -188,13 +192,25 @@ class RealSenseCamera(CameraDriver):
 
         self._profile = pipe.start(cfg)
 
-        for _ in range(10):
+        got_frame = False
+        # A bad RealSense pipeline can start but never deliver frames. Keep this
+        # warmup short so startup retries happen before the operator's first recording.
+        for _ in range(6):
             try:
-                frames = pipe.wait_for_frames(timeout_ms=2000)
+                frames = pipe.wait_for_frames(timeout_ms=500)
                 if frames.get_color_frame() or frames.get_infrared_frame():
+                    got_frame = True
                     break
             except RuntimeError:
                 continue
+        if not got_frame:
+            try:
+                pipe.stop()
+            except Exception as exc:
+                logger.debug("RealSenseCamera pipeline stop after failed warmup failed: %s", exc)
+            self._profile = None
+            self._pipeline = None
+            raise RuntimeError("RealSenseCamera: no color/infrared frame during startup warmup")
 
         if self.device_id is not None:
             actual = self._profile.get_device().get_info(rs.camera_info.serial_number)
@@ -211,6 +227,18 @@ class RealSenseCamera(CameraDriver):
             self._depth_scale = self._profile.get_device().first_depth_sensor().get_depth_scale()
         self._pipeline = pipe
         self._use_infrared = not has_color
+        self._configure_exposure()
+
+    def _restart_pipeline(self) -> None:
+        if self._pipeline is not None:
+            try:
+                self._pipeline.stop()
+            except Exception as exc:
+                logger.debug("RealSenseCamera pipeline stop before restart failed: %s", exc)
+        self._pipeline = None
+        self._profile = None
+        self._align = None
+        self._start_pipeline_once()
 
     def _device_has_color_sensor(self) -> bool:
         rs = self._rs
@@ -232,51 +260,68 @@ class RealSenseCamera(CameraDriver):
         if self._profile is None:
             return
         device = self._profile.get_device()
+        target_sensor = None
+        fallback_sensor = None
         for sensor in device.query_sensors():
             try:
                 name = sensor.get_info(rs.camera_info.name)
             except Exception:
                 continue
-            if "stereo" in name.lower() or "rgb" in name.lower():
-                try:
-                    sensor.set_option(rs.option.enable_auto_exposure, bool(self.auto_exposure))
-                except Exception as exc:
-                    logger.debug("auto_exposure set failed on %s: %s", name, exc)
-                if not self.auto_exposure:
-                    if self.manual_exposure_us is not None and sensor.supports(rs.option.exposure):
-                        try:
-                            sensor.set_option(rs.option.exposure, float(self.manual_exposure_us))
-                            logger.info(
-                                "RealSenseCamera %s: manual exposure %.0fμs",
-                                self.device_id or "auto", self.manual_exposure_us,
-                            )
-                        except Exception as exc:
-                            logger.warning("manual exposure set failed on %s: %s", name, exc)
-                    if self.manual_gain is not None and sensor.supports(rs.option.gain):
-                        try:
-                            sensor.set_option(rs.option.gain, float(self.manual_gain))
-                            logger.info(
-                                "RealSenseCamera %s: manual gain %.1f",
-                                self.device_id or "auto", self.manual_gain,
-                            )
-                        except Exception as exc:
-                            logger.warning("manual gain set failed on %s: %s", name, exc)
-                if self.manual_white_balance_k is not None:
-                    if sensor.supports(rs.option.enable_auto_white_balance):
-                        try:
-                            sensor.set_option(rs.option.enable_auto_white_balance, 0.0)
-                        except Exception as exc:
-                            logger.debug("disable AWB failed on %s: %s", name, exc)
-                    if sensor.supports(rs.option.white_balance):
-                        try:
-                            sensor.set_option(rs.option.white_balance, float(self.manual_white_balance_k))
-                            logger.info(
-                                "RealSenseCamera %s: manual white_balance %.0fK",
-                                self.device_id or "auto", self.manual_white_balance_k,
-                            )
-                        except Exception as exc:
-                            logger.warning("manual white_balance set failed on %s: %s", name, exc)
+            name_lower = name.lower()
+            if "rgb" in name_lower:
+                target_sensor = sensor
                 break
+            if "stereo" in name_lower and fallback_sensor is None:
+                fallback_sensor = sensor
+        sensor = target_sensor if target_sensor is not None else fallback_sensor
+        if sensor is not None:
+            try:
+                name = sensor.get_info(rs.camera_info.name)
+            except Exception:
+                name = "camera sensor"
+            try:
+                sensor.set_option(rs.option.enable_auto_exposure, 1.0 if self.auto_exposure else 0.0)
+            except Exception as exc:
+                logger.debug("auto_exposure set failed on %s: %s", name, exc)
+            if not self.auto_exposure:
+                if self.manual_exposure_us is not None and sensor.supports(rs.option.exposure):
+                    try:
+                        sensor.set_option(rs.option.exposure, float(self.manual_exposure_us))
+                        logger.info(
+                            "RealSenseCamera %s: manual exposure %.0fμs",
+                            self.device_id or "auto", self.manual_exposure_us,
+                        )
+                    except Exception as exc:
+                        logger.warning("manual exposure set failed on %s: %s", name, exc)
+                if self.manual_gain is not None and sensor.supports(rs.option.gain):
+                    try:
+                        sensor.set_option(rs.option.gain, float(self.manual_gain))
+                        logger.info(
+                            "RealSenseCamera %s: manual gain %.1f",
+                            self.device_id or "auto", self.manual_gain,
+                        )
+                    except Exception as exc:
+                        logger.warning("manual gain set failed on %s: %s", name, exc)
+            if self.manual_white_balance_k is not None:
+                if sensor.supports(rs.option.enable_auto_white_balance):
+                    try:
+                        sensor.set_option(rs.option.enable_auto_white_balance, 0.0)
+                    except Exception as exc:
+                        logger.debug("disable AWB failed on %s: %s", name, exc)
+                if sensor.supports(rs.option.white_balance):
+                    try:
+                        sensor.set_option(rs.option.white_balance, float(self.manual_white_balance_k))
+                        logger.info(
+                            "RealSenseCamera %s: manual white_balance %.0fK",
+                            self.device_id or "auto", self.manual_white_balance_k,
+                        )
+                    except Exception as exc:
+                        logger.warning("manual white_balance set failed on %s: %s", name, exc)
+            elif sensor.supports(rs.option.enable_auto_white_balance):
+                try:
+                    sensor.set_option(rs.option.enable_auto_white_balance, 1.0)
+                except Exception as exc:
+                    logger.debug("enable AWB failed on %s: %s", name, exc)
 
     def _read_intrinsics(self) -> dict:
         rs = self._rs
@@ -321,7 +366,16 @@ class RealSenseCamera(CameraDriver):
     def read(self) -> CameraData:
         if self._pipeline is None:
             raise RuntimeError("RealSenseCamera.read() called after stop() or before open")
-        frames = self._pipeline.wait_for_frames(timeout_ms=5000)
+        try:
+            frames = self._pipeline.wait_for_frames(timeout_ms=5000)
+        except RuntimeError as exc:
+            logger.warning(
+                "RealSenseCamera %s read timed out (%s); restarting pipeline once",
+                self.device_id or "auto",
+                exc,
+            )
+            self._restart_pipeline()
+            frames = self._pipeline.wait_for_frames(timeout_ms=5000)
         if self._align is not None:
             frames = self._align.process(frames)
 

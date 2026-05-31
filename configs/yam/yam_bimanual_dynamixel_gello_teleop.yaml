@@ -119,9 +119,9 @@ nodes:
     name: camera_top
     driver: RealSenseCamera
     device_id: "203522250539"
-    resolution: [640, 480]
+    resolution: [1280, 720]
     fps: 30
-    enable_depth: true
+    enable_depth: false
     extrinsics:
       position: [0.0, 0.0, 0.4]
       rpy_radians: [1.2, 3.1416, 1.2]
