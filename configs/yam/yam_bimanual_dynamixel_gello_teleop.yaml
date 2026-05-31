@@ -126,16 +126,16 @@ nodes:
       position: [0.0, 0.0, 0.4]
       rpy_radians: [1.2, 3.1416, 1.2]
 
-#  - type: CameraNode
-#    name: camera_left
-#    driver: OpenCVCamera
-#    device_path: /dev/video-left
-#    resolution: [640, 480]
-#    fps: 30
-#
-#  - type: CameraNode
-#    name: camera_right
-#    driver: OpenCVCamera
-#    device_path: /dev/video-right
-#    resolution: [640, 480]
-#    fps: 30
+  - type: CameraNode
+    name: camera_left
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.4:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+
+  - type: CameraNode
+    name: camera_right
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.2:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
