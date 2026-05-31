@@ -14,6 +14,16 @@ EXTRA_ARGS=()
 
 cd "$SCRIPT_DIR"
 
+echo "Cloning any missing git submodules..."
+# Only initialize submodules that aren't checked out yet (leading '-' in
+# `git submodule status`). This clones a fresh setup but does NOT force an
+# already-checked-out submodule back to the pinned commit, so a deliberately
+# selected branch/revision (e.g. i2rt on main) is left untouched.
+git submodule status --recursive | awk '/^-/ {print $2}' | while read -r _sm_path; do
+  echo "  initializing missing submodule: $_sm_path"
+  git submodule update --init --recursive -- "$_sm_path"
+done
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run-leaders)
@@ -57,6 +67,18 @@ check_leaders() {
     echo "ERROR: $LEADER_RIGHT not found. Run ./custom/init-mapping.sh and replug leaders." >&2
     exit 1
   fi
+}
+
+free_leaders() {
+  # Kill any leftover process still holding the leader serial ports so we don't
+  # hit "[Errno 16] Device or resource busy" on openPort().
+  for port in "$LEADER_LEFT" "$LEADER_RIGHT"; do
+    if [[ -e "$port" ]] && fuser -s "$port" 2>/dev/null; then
+      echo "Freeing $port (killing process(es) holding it)..."
+      fuser -k "$port" 2>/dev/null || true
+      sleep 0.5
+    fi
+  done
 }
 
 check_followers() {
@@ -140,6 +162,7 @@ finally:
 }
 
 check_leaders
+free_leaders
 
 if [[ "$DRY_RUN_LEADERS" -eq 1 ]]; then
   run_dry_leaders

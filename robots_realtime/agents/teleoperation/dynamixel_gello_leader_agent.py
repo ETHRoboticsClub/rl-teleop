@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 NUM_ARM_JOINTS = 6
 DEFAULT_MOTOR_IDS = [1, 2, 3, 4, 5, 6, 7]
 
+# Dynamixel X-series (Protocol 2.0) control-table addresses used for the
+# optional gripper "spring". This mirrors yams-robot-server's Dynamixel GELLO
+# setup: put the gripper motor in Current-based Position Control mode, cap its
+# output torque via Current_Limit, enable torque, and command the open position.
+# The motor gently holds the trigger open and the operator can overpower it to
+# squeeze; on release it springs back to open.
+_ADDR_OPERATING_MODE = 11   # EEPROM (torque must be off to write)
+_ADDR_CURRENT_LIMIT = 38    # EEPROM; output-torque cap, overpowerable by hand
+_ADDR_TORQUE_ENABLE = 64
+_ADDR_GOAL_POSITION = 116
+_OP_CURRENT_BASED_POSITION = 5
+_TORQUE_OFF = 0
+_TORQUE_ON = 1
+
 
 class _DynamixelPositionReader:
     """Reads positions from Dynamixel motors via serial."""
@@ -119,6 +133,40 @@ class _DynamixelPositionReader:
             return float("inf")
         return time.time() - self._last_read_time
 
+    def enable_gripper_spring(self, gripper_id: int, open_ticks: int, current_limit: int) -> None:
+        """Hold the gripper motor at ``open_ticks`` with a capped, overpowerable torque.
+
+        Puts the gripper motor in Current-based Position Control mode and bounds
+        its output via Current_Limit so the trigger is easy to squeeze and
+        gently springs back to the open position when released. Only the gripper
+        motor is touched; arm joints stay free.
+        """
+        pk, ph = self._packet_handler, self._port_handler
+
+        def _w(fn, addr, value, what):
+            comm, err = fn(ph, int(gripper_id), addr, int(value))
+            if comm != dynamixel_sdk.COMM_SUCCESS or err != 0:
+                logger.warning(
+                    "Gripper spring: failed to write %s on id=%d (comm=%d, err=%d)",
+                    what, gripper_id, comm, err,
+                )
+
+        # Operating mode and current limit live in EEPROM — torque must be off to write.
+        _w(pk.write1ByteTxRx, _ADDR_TORQUE_ENABLE, _TORQUE_OFF, "torque-off")
+        _w(pk.write1ByteTxRx, _ADDR_OPERATING_MODE, _OP_CURRENT_BASED_POSITION, "operating-mode")
+        _w(pk.write2ByteTxRx, _ADDR_CURRENT_LIMIT, current_limit, "current-limit")
+        _w(pk.write1ByteTxRx, _ADDR_TORQUE_ENABLE, _TORQUE_ON, "torque-on")
+        _w(pk.write4ByteTxRx, _ADDR_GOAL_POSITION, open_ticks, "goal-position")
+
+    def release_gripper(self, gripper_id: int) -> None:
+        """Disable torque on the gripper motor (best-effort)."""
+        try:
+            self._packet_handler.write1ByteTxRx(
+                self._port_handler, int(gripper_id), _ADDR_TORQUE_ENABLE, _TORQUE_OFF
+            )
+        except Exception:  # teardown must not raise
+            pass
+
     def close(self) -> None:
         self._port_handler.closePort()
 
@@ -151,6 +199,8 @@ class DynamixelGelloLeaderAgent(Agent):
         stale_timeout_s: float = 1.0,
         max_delta_rad: float = 3.14,
         num_read_retries: int = 3,
+        gripper_spring: bool = False,
+        gripper_spring_current_limit: int = 100,
         reader: Any = None,
     ) -> None:
         self.port = port
@@ -166,6 +216,8 @@ class DynamixelGelloLeaderAgent(Agent):
         self.stale_timeout_s = float(stale_timeout_s)
         self.max_delta_rad = float(max_delta_rad)
         self.num_read_retries = num_read_retries
+        self.gripper_spring = bool(gripper_spring)
+        self.gripper_spring_current_limit = int(gripper_spring_current_limit)
         self.joint_signs = np.array(joint_signs or [1] * NUM_ARM_JOINTS, dtype=np.float64)
         self.joint_offsets_ticks = np.array(joint_offsets_ticks or [0.0] * NUM_ARM_JOINTS, dtype=np.float64)
         self.joint_scales = np.array(joint_scales or [1.0] * NUM_ARM_JOINTS, dtype=np.float64)
@@ -202,6 +254,25 @@ class DynamixelGelloLeaderAgent(Agent):
             present_position_len=present_position_len,
             num_read_retries=self.num_read_retries,
         )
+
+        # Optional gripper trigger spring: actively hold the gripper motor at the
+        # open position with a capped current so the trigger pops back out when
+        # released (the rest of the arm stays read-only).
+        self._gripper_motor_id: Optional[int] = None
+        if self.include_gripper and self.gripper_spring and hasattr(self._reader, "enable_gripper_spring"):
+            if self.gripper_index >= len(self.motor_ids):
+                raise ValueError(
+                    f"gripper_index {self.gripper_index} out of range for motor_ids {self.motor_ids}"
+                )
+            self._gripper_motor_id = int(self.motor_ids[self.gripper_index])
+            self._reader.enable_gripper_spring(
+                self._gripper_motor_id, self.gripper_open_ticks, self.gripper_spring_current_limit
+            )
+            logger.info(
+                "DynamixelGelloLeaderAgent[%s]: gripper spring enabled on id=%d "
+                "(open_ticks=%d, current_limit=%d)",
+                self.port, self._gripper_motor_id, self.gripper_open_ticks, self.gripper_spring_current_limit,
+            )
 
     def _map_gripper(self, gripper_ticks: float) -> float:
         if self.gripper_range_ticks is not None:
@@ -262,6 +333,8 @@ class DynamixelGelloLeaderAgent(Agent):
         return {self.robot_name: {"pos": Array(shape=(n,), dtype=np.float32)}}
 
     def close(self) -> None:
+        if self._gripper_motor_id is not None and hasattr(self._reader, "release_gripper"):
+            self._reader.release_gripper(self._gripper_motor_id)
         self._reader.close()
 
     def reset(self) -> None:

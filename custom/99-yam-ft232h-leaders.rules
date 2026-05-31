@@ -3,10 +3,10 @@
 # Then: sudo udevadm control --reload-rules && sudo systemctl restart systemd-udevd
 # Replug the FT232H devices after reloading rules.
 
-# Right leader teaching handle FT232H.
-# Requested as Bus 007 Device 007, currently enumerated as Bus 007 Device 008 on this machine.
-# Stable ID: FTDI FT232H serial FT94EW3S.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", ATTRS{serial}=="FT94EW3S", GROUP="users", MODE="0660", SYMLINK+="leader-right"
+# Left leader teaching handle FT232H (motor IDs 1-7).
+# Stable ID: FTDI FT232H serial FT9BTE1J.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", ATTRS{serial}=="FT9BTE1J", GROUP="users", MODE="0660", SYMLINK+="leader-left"
 
-# Left leader teaching handle FT232H currently detected as serial FTA2U44N.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", ATTRS{serial}=="FTA2U44N", GROUP="users", MODE="0660", SYMLINK+="leader-left"
+# Right leader teaching handle FT232H (motor IDs 8-14).
+# Stable ID: FTDI FT232H serial FTA2U44N.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", ATTRS{serial}=="FTA2U44N", GROUP="users", MODE="0660", SYMLINK+="leader-right"

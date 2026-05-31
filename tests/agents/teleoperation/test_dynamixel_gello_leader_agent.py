@@ -7,6 +7,14 @@ import pytest
 from robots_realtime.agents.teleoperation.dynamixel_gello_leader_agent import (
     DEFAULT_MOTOR_IDS,
     DynamixelGelloLeaderAgent,
+    _ADDR_CURRENT_LIMIT,
+    _ADDR_GOAL_POSITION,
+    _ADDR_OPERATING_MODE,
+    _ADDR_TORQUE_ENABLE,
+    _DynamixelPositionReader,
+    _OP_CURRENT_BASED_POSITION,
+    _TORQUE_OFF,
+    _TORQUE_ON,
 )
 
 
@@ -40,6 +48,21 @@ class FakeDynamixelReader:
 
     def write(self, *args, **kwargs):
         self.write_calls.append((args, kwargs))
+
+
+class FakeSpringReader(FakeDynamixelReader):
+    """Fake reader that records gripper spring setup calls."""
+
+    def __init__(self, positions_ticks=None):
+        super().__init__(positions_ticks)
+        self.spring_calls = []
+        self.release_calls = []
+
+    def enable_gripper_spring(self, gripper_id: int, open_ticks: int, current_limit: int) -> None:
+        self.spring_calls.append((gripper_id, open_ticks, current_limit))
+
+    def release_gripper(self, gripper_id: int) -> None:
+        self.release_calls.append(gripper_id)
 
 
 def make_agent(reader, **kwargs):
@@ -163,6 +186,49 @@ def test_no_write_on_close():
 
     assert reader.close_calls == 1
     assert reader.write_calls == []
+
+
+def test_gripper_spring_defaults_to_yams_current_limit():
+    reader = FakeSpringReader(np.zeros(7))
+
+    agent = make_agent(reader, include_gripper=True, gripper_spring=True)
+
+    assert reader.spring_calls == [(7, 2280, 100)]
+
+    agent.close()
+
+    assert reader.release_calls == [7]
+
+
+def test_gripper_spring_uses_current_based_position_mode():
+    writes = []
+
+    class FakePacketHandler:
+        def write1ByteTxRx(self, port_handler, motor_id, addr, value):
+            writes.append(("write1", motor_id, addr, value))
+            return 0, 0
+
+        def write2ByteTxRx(self, port_handler, motor_id, addr, value):
+            writes.append(("write2", motor_id, addr, value))
+            return 0, 0
+
+        def write4ByteTxRx(self, port_handler, motor_id, addr, value):
+            writes.append(("write4", motor_id, addr, value))
+            return 0, 0
+
+    reader = _DynamixelPositionReader.__new__(_DynamixelPositionReader)
+    reader._packet_handler = FakePacketHandler()
+    reader._port_handler = object()
+
+    reader.enable_gripper_spring(gripper_id=14, open_ticks=2270, current_limit=100)
+
+    assert writes == [
+        ("write1", 14, _ADDR_TORQUE_ENABLE, _TORQUE_OFF),
+        ("write1", 14, _ADDR_OPERATING_MODE, _OP_CURRENT_BASED_POSITION),
+        ("write2", 14, _ADDR_CURRENT_LIMIT, 100),
+        ("write1", 14, _ADDR_TORQUE_ENABLE, _TORQUE_ON),
+        ("write4", 14, _ADDR_GOAL_POSITION, 2270),
+    ]
 
 
 @pytest.mark.parametrize(("include_gripper", "shape"), [(False, (6,)), (True, (7,))])

@@ -41,6 +41,7 @@ dependencies = [
     "mcap-protobuf-support>=0.5.4",
     "protobuf>=6.33.1",
     "openpi-client==0.1.2",
+    "pyrealsense2>=2.55",
 ]
 
 [project.scripts]
@@ -50,9 +51,6 @@ rr-replay  = "robots_realtime.rr_replay_cli:main"
 [project.optional-dependencies]
 sensors = [
     "pyzed",
-]
-realsense = [
-    "pyrealsense2>=2.55",
 ]
 franka_panda = [
     "panda_python",
