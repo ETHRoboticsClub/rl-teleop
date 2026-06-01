@@ -115,6 +115,16 @@ def _endpoints_text(session) -> Text | None:
     return t
 
 
+def _instruction_text(session) -> Text | None:
+    instruction = getattr(session, "instruction", "")
+    if not instruction:
+        return None
+    t = Text()
+    t.append("Instruction: ", style="bold")
+    t.append(str(instruction), style="bold white")
+    return t
+
+
 def _tail_file(path: Path, n: int) -> list[str]:
     """Return the last n lines of a file efficiently."""
     try:
@@ -179,6 +189,10 @@ def _render(session, n_log_lines: int = 8) -> Panel:
 
     content = Table.grid(expand=True)
     content.add_row(node_table)
+
+    instruction_text = _instruction_text(session)
+    if instruction_text is not None:
+        content.add_row(instruction_text)
 
     eps_text = _endpoints_text(session)
     if eps_text is not None:

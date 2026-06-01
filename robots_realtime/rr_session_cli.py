@@ -59,6 +59,11 @@ def main() -> None:
         action="store_true",
         help="Disable the Rich TUI and just block until Ctrl-C.",
     )
+    parser.add_argument(
+        "--instruction",
+        default=None,
+        help="Text instruction to show in the recording UI and save in session_meta.json.",
+    )
     args = parser.parse_args()
 
     session_arg: str = args.session
@@ -99,6 +104,8 @@ def main() -> None:
     if args.save_root:
         from pathlib import Path
         session._save_root = Path(args.save_root)
+    if args.instruction is not None:
+        session.instruction = args.instruction
 
     session.start()
 

@@ -42,6 +42,7 @@ dependencies = [
     "protobuf>=6.33.1",
     "openpi-client==0.1.2",
     "pyrealsense2>=2.55",
+    "rerun-sdk",
 ]
 
 [project.scripts]

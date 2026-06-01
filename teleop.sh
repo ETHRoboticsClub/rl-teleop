@@ -46,6 +46,14 @@ while [[ $# -gt 0 ]]; do
       CONFIG="$2"
       shift 2
       ;;
+    --instruction)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --instruction requires text" >&2
+        exit 1
+      fi
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
     --*)
       EXTRA_ARGS+=("$1")
       shift

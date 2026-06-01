@@ -12,5 +12,6 @@
 __pycache__/
 .venv/
 .ruff_cache/
+.env
 recordings/
 .omo/

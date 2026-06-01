@@ -87,6 +87,7 @@ class Session:
                               session start and stop after this many seconds.
         episode_timeout:      If set, automatically stop recording and pause
                               after this many seconds from episode start.
+        instruction:          Optional text instruction for the recorded episode.
         pub_port:             MessageBus XSUB port.
         sub_port:             MessageBus XPUB port.
     """
@@ -101,6 +102,7 @@ class Session:
         start_paused: bool = False,
         record_on_unpause: bool = False,
         episode_timeout: float | None = None,
+        instruction: str | None = None,
         pub_port: int = 5555,
         sub_port: int = DEFAULT_SUB_PORT,
     ) -> None:
@@ -119,6 +121,7 @@ class Session:
         self._start_paused = bool(start_paused)
         self._record_on_unpause = bool(record_on_unpause)
         self._episode_timeout = episode_timeout
+        self._instruction = instruction or ""
         self._episode_timeout_timer: threading.Timer | None = None
         self._is_paused: bool = False
         self._session_start_time = time.time()
@@ -236,6 +239,14 @@ class Session:
     @property
     def save_root(self) -> Path:
         return self._save_root
+
+    @property
+    def instruction(self) -> str:
+        return self._instruction
+
+    @instruction.setter
+    def instruction(self, value: str | None) -> None:
+        self._instruction = value or ""
 
     def start_episode(self) -> None:
         with self._recording_lock:
@@ -375,6 +386,7 @@ class Session:
             "nodes": self._node_descriptors,
             "record_topic": self._record_topic,
             "save_root": str(self._save_root),
+            "instruction": self._instruction,
         }
         try:
             (path / "session_meta.json").write_text(
