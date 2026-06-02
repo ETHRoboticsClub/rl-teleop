@@ -12,7 +12,6 @@ import os
 import shlex
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 REQUIRED_AWS_ENV = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
@@ -73,40 +72,11 @@ def normalize_s3_uri(uri: str) -> str:
     return uri
 
 
-def is_episode_dir(path: Path) -> bool:
-    return path.is_dir() and path.name.startswith("episode_") and (path / "session_meta.json").is_file()
-
-
-def newest_mtime(path: Path) -> float:
-    newest = path.stat().st_mtime
-    for child in path.rglob("*"):
-        try:
-            newest = max(newest, child.stat().st_mtime)
-        except FileNotFoundError:
-            continue
-    return newest
-
-
-def discover_episodes(recordings_root: Path, min_age_seconds: float) -> list[Path]:
+def validate_recordings_root(recordings_root: Path) -> None:
     if not recordings_root.exists():
         raise FileNotFoundError(f"Recordings root does not exist: {recordings_root}")
     if not recordings_root.is_dir():
         raise NotADirectoryError(f"Recordings root is not a directory: {recordings_root}")
-
-    cutoff = time.time() - min_age_seconds
-    episodes: list[Path] = []
-    for path in sorted(recordings_root.glob("**/episode_*")):
-        if not is_episode_dir(path):
-            continue
-        if newest_mtime(path) > cutoff:
-            continue
-        episodes.append(path)
-    return episodes
-
-
-def s3_target_for_episode(s3_uri: str, recordings_root: Path, episode_dir: Path) -> str:
-    rel = episode_dir.relative_to(recordings_root).as_posix()
-    return f"{s3_uri}/{rel}/"
 
 
 def require_env(env: dict[str, str], keys: tuple[str, ...]) -> None:
@@ -116,15 +86,13 @@ def require_env(env: dict[str, str], keys: tuple[str, ...]) -> None:
         raise RuntimeError(f"Missing required AWS environment variable(s): {joined}")
 
 
-def run_sync(episode_dir: Path, target: str, env: dict[str, str], dry_run: bool) -> None:
+def run_sync(recordings_root: Path, target: str, env: dict[str, str], dry_run: bool) -> None:
     cmd = [
         "aws",
         "s3",
         "sync",
-        str(episode_dir),
+        str(recordings_root),
         target,
-        "--only-show-errors",
-        "--no-progress",
     ]
     if dry_run:
         cmd.append("--dryrun")
@@ -154,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         "--min-age-seconds",
         type=float,
         default=None,
-        help="skip episodes with files modified more recently than this",
+        help="deprecated; ignored now that the recordings root is synced directly",
     )
     parser.add_argument(
         "--dry-run",
@@ -174,35 +142,24 @@ def main() -> int:
         recordings_root = args.recordings_root or Path(env.get("RECORDINGS_ROOT", "recordings"))
         recordings_root = recordings_root.expanduser().resolve()
         s3_uri = normalize_s3_uri(args.s3_uri or env.get("S3_EPISODE_URI", ""))
-        min_age_seconds = args.min_age_seconds
-        if min_age_seconds is None:
-            min_age_seconds = float(env.get("EPISODE_MIN_AGE_SECONDS", "60"))
-
         require_env(env, REQUIRED_AWS_ENV)
-        episodes = discover_episodes(recordings_root, min_age_seconds)
+        validate_recordings_root(recordings_root)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if not episodes:
-        print(f"No complete episodes older than {min_age_seconds:g}s found under {recordings_root}.")
-        return 0
-
-    print(f"Syncing {len(episodes)} episode(s) from {recordings_root} to {s3_uri}")
+    print(f"Syncing {recordings_root} to {s3_uri}/")
     if args.dry_run:
         print("Dry run only; no files will be uploaded.")
 
-    for episode_dir in episodes:
-        target = s3_target_for_episode(s3_uri, recordings_root, episode_dir)
-        print(f"{episode_dir.relative_to(recordings_root)} -> {target}")
-        try:
-            run_sync(episode_dir, target, env, args.dry_run)
-        except FileNotFoundError:
-            print("error: aws CLI not found. Install/configure AWS CLI v2 and try again.", file=sys.stderr)
-            return 127
-        except subprocess.CalledProcessError as exc:
-            print(f"error: aws s3 sync failed for {episode_dir} with exit code {exc.returncode}", file=sys.stderr)
-            return exc.returncode
+    try:
+        run_sync(recordings_root, f"{s3_uri}/", env, args.dry_run)
+    except FileNotFoundError:
+        print("error: aws CLI not found. Install/configure AWS CLI v2 and try again.", file=sys.stderr)
+        return 127
+    except subprocess.CalledProcessError as exc:
+        print(f"error: aws s3 sync failed for {recordings_root} with exit code {exc.returncode}", file=sys.stderr)
+        return exc.returncode
 
     return 0
 
