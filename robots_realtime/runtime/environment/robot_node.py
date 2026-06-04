@@ -44,6 +44,18 @@ def _instantiate_from_target_yaml(config_path: str):
     """Load a YAML config and recursively instantiate all ``_target_`` objects."""
     with open(config_path) as f:
         cfg = _yaml.safe_load(f)
+    if isinstance(cfg, dict) and cfg.get("pinned_cpu") is not None:
+        # Apply affinity before recursively constructing nested hardware objects.
+        # DMChainCanInterface starts its own CAN control thread during
+        # construction; if we pin only after _resolve(), that thread has already
+        # inherited the default all-CPU affinity.
+        from robots_realtime.utils.performance_utils import set_realtime_and_pin
+
+        set_realtime_and_pin(
+            int(cfg.pop("pinned_cpu")),
+            realtime_priority=int(cfg.pop("realtime_priority", 90)),
+            require_realtime=bool(cfg.pop("require_realtime", False)),
+        )
     return _resolve(cfg)
 
 

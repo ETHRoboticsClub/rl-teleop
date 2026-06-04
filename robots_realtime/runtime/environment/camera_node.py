@@ -44,6 +44,9 @@ _NODE_ONLY_KEYS = {
     "publish_resize_mode",
     "extrinsics",
     "extrinsics_file",
+    "pinned_cpu",
+    "realtime_priority",
+    "require_realtime",
 }
 
 

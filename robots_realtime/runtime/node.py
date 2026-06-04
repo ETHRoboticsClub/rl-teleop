@@ -76,6 +76,9 @@ class Node(ABC):
         pub_port: int = DEFAULT_PUB_PORT,
         sub_host: str = "127.0.0.1",
         sub_port: int = DEFAULT_SUB_PORT,
+        pinned_cpu: int | None = None,
+        realtime_priority: int | None = None,
+        require_realtime: bool = False,
     ) -> None:
         if name is not None:
             self.name = name
@@ -85,6 +88,9 @@ class Node(ABC):
         self._pub_port = pub_port
         self._sub_host = sub_host
         self._sub_port = sub_port
+        self._pinned_cpu = pinned_cpu
+        self._realtime_priority = realtime_priority
+        self._require_realtime = require_realtime
 
         # Injected writer — stored for pickling; passed to Publisher in run()
         self._writer = writer  # Writer | None
@@ -201,11 +207,23 @@ class Node(ABC):
         """
         return {"name": params["name"]}
 
+    def _apply_scheduling(self) -> None:
+        if self._pinned_cpu is None:
+            return
+        from robots_realtime.utils.performance_utils import set_realtime_and_pin
+
+        set_realtime_and_pin(
+            int(self._pinned_cpu),
+            realtime_priority=int(self._realtime_priority or 90),
+            require_realtime=bool(self._require_realtime),
+        )
+
     # ------------------------------------------------------------------
     # Main loop (called by ProcessHost worker)
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        self._apply_scheduling()
         self._publisher = Publisher(
             node_name=self.name,
             writer=self._writer,

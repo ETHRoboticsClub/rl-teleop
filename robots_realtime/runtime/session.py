@@ -92,6 +92,7 @@ class Session:
         episode_timeout:      If set, automatically stop recording and pause
                               after this many seconds from episode start.
         instruction:          Optional text instruction for the recorded episode.
+        instruction_mappings: Mapping from number keys to episode instructions.
         pub_port:             MessageBus XSUB port.
         sub_port:             MessageBus XPUB port.
     """
@@ -107,6 +108,7 @@ class Session:
         record_on_unpause: bool = False,
         episode_timeout: float | None = None,
         instruction: str | None = None,
+        instruction_mappings: dict[str, str] | None = None,
         pub_port: int = DEFAULT_PUB_PORT,
         sub_port: int = DEFAULT_SUB_PORT,
     ) -> None:
@@ -126,6 +128,9 @@ class Session:
         self._record_on_unpause = bool(record_on_unpause)
         self._episode_timeout = episode_timeout
         self._instruction = instruction or ""
+        self._instruction_mappings = self._normalize_instruction_mappings(
+            instruction_mappings
+        )
         self._episode_timeout_timer: threading.Timer | None = None
         self._is_paused: bool = False
         self._session_start_time = time.time()
@@ -275,6 +280,30 @@ class Session:
     def instruction(self, value: str | None) -> None:
         self._instruction = value or ""
 
+    @property
+    def instruction_mappings(self) -> dict[str, str]:
+        return dict(self._instruction_mappings)
+
+    @staticmethod
+    def _normalize_instruction_mappings(
+        instruction_mappings: dict[str, str] | None,
+    ) -> dict[str, str]:
+        if not instruction_mappings:
+            return {}
+
+        normalized: dict[str, str] = {}
+        for raw_key, raw_instruction in instruction_mappings.items():
+            key = str(raw_key)
+            if len(key) != 1 or key not in "0123456789":
+                raise ValueError(
+                    f"Instruction mapping key must be a number key 0-9, got {raw_key!r}"
+                )
+            instruction = str(raw_instruction or "").strip()
+            if not instruction:
+                raise ValueError(f"Instruction for key {key!r} must not be empty")
+            normalized[key] = instruction
+        return normalized
+
     def start_episode(self) -> None:
         with self._recording_lock:
             if self._is_recording:
@@ -302,7 +331,11 @@ class Session:
         self.end_episode(save=True)
         self.pause()
 
-    def end_episode(self, save: bool = True) -> Path | None:
+    def end_episode(
+        self,
+        save: bool = True,
+        instruction: str | None = None,
+    ) -> Path | None:
         if self._episode_timeout_timer is not None:
             self._episode_timeout_timer.cancel()
             self._episode_timeout_timer = None
@@ -326,6 +359,11 @@ class Session:
             import shutil
             shutil.rmtree(episode_dir, ignore_errors=True)
             return None
+
+        if instruction is not None:
+            self._instruction = instruction
+            if episode_dir is not None:
+                self._write_session_meta(episode_dir, instruction=instruction)
 
         return episode_dir
 
@@ -405,24 +443,33 @@ class Session:
             / f"episode_{now.strftime('%H%M%S')}_{uid}"
         )
         path.mkdir(parents=True, exist_ok=True)
-
-        meta = {
-            "session_start_time": self._session_start_time,
-            "episode_start_time": time.time(),
-            "episode_dir": str(path),
-            "nodes": self._node_descriptors,
-            "record_topic": self._record_topic,
-            "save_root": str(self._save_root),
-            "instruction": self._instruction,
-        }
-        try:
-            (path / "session_meta.json").write_text(
-                json.dumps(meta, indent=2, default=str)
-            )
-        except Exception:
-            pass
+        self._write_session_meta(path, instruction=self._instruction)
 
         return str(path)
+
+    def _write_session_meta(self, path: Path, instruction: str) -> None:
+        meta_path = path / "session_meta.json"
+        meta = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except Exception:
+                meta = {}
+        if not meta:
+            meta = {
+                "session_start_time": self._session_start_time,
+                "episode_start_time": time.time(),
+                "episode_dir": str(path),
+                "nodes": self._node_descriptors,
+                "record_topic": self._record_topic,
+                "save_root": str(self._save_root),
+            }
+        meta["instruction"] = instruction
+        meta["instruction_mappings"] = self._instruction_mappings
+        try:
+            meta_path.write_text(json.dumps(meta, indent=2, default=str))
+        except Exception:
+            pass
 
     def _monitor_loop(self) -> None:
         """Subscribe to all bus topics; measure Hz per node.

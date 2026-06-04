@@ -95,14 +95,26 @@ def _recording_line(session) -> Text:
 
 def _help_line(session=None) -> Text:
     t = Text(justify="right", style="dim")
-    t.append("[r]", style="bold white"); t.append(" record  ")
-    t.append("[d]", style="bold white"); t.append(" discard  ")
+    has_instruction_mappings = bool(
+        getattr(session, "instruction_mappings", {}) if session is not None else {}
+    )
+    if has_instruction_mappings:
+        t.append("[r]", style="bold white")
+        t.append(" start  ")
+        t.append("[0-9]", style="bold white")
+        t.append(" save  ")
+    else:
+        t.append("[r]", style="bold white")
+        t.append(" record  ")
+    t.append("[d]", style="bold white")
+    t.append(" discard  ")
     t.append("[space]", style="bold white")
     if session is not None and session.is_paused:
         t.append(" resume  ")
     else:
         t.append(" pause  ")
-    t.append("[q]", style="bold white"); t.append(" quit")
+    t.append("[q]", style="bold white")
+    t.append(" quit")
     return t
 
 
@@ -115,7 +127,18 @@ def _endpoints_text(session) -> Text | None:
     return t
 
 
-def _instruction_text(session) -> Text | None:
+def _instructions_text(session) -> Text | None:
+    mappings = getattr(session, "instruction_mappings", {})
+    if mappings:
+        t = Text()
+        t.append("Instructions:", style="bold")
+        for key in sorted(mappings):
+            t.append("\n  [", style="dim")
+            t.append(str(key), style="bold white")
+            t.append("] ", style="dim")
+            t.append(str(mappings[key]), style="white")
+        return t
+
     instruction = getattr(session, "instruction", "")
     if not instruction:
         return None
@@ -190,9 +213,9 @@ def _render(session, n_log_lines: int = 8) -> Panel:
     content = Table.grid(expand=True)
     content.add_row(node_table)
 
-    instruction_text = _instruction_text(session)
-    if instruction_text is not None:
-        content.add_row(instruction_text)
+    instructions_text = _instructions_text(session)
+    if instructions_text is not None:
+        content.add_row(instructions_text)
 
     eps_text = _endpoints_text(session)
     if eps_text is not None:
@@ -220,7 +243,15 @@ def _read_keys(session, stop_event: threading.Event) -> None:
         if _stdin_ready():
             ch = sys.stdin.read(1)
             if ch == "r":
-                session.toggle_recording()
+                if getattr(session, "instruction_mappings", {}):
+                    if not session.is_recording:
+                        session.start_episode()
+                else:
+                    session.toggle_recording()
+            elif ch in getattr(session, "instruction_mappings", {}):
+                if session.is_recording:
+                    instruction = session.instruction_mappings[ch]
+                    session.end_episode(save=True, instruction=instruction)
             elif ch == "d":
                 session.end_episode(save=False)
             elif ch == " ":

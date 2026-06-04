@@ -6,6 +6,9 @@ Session YAML schema:
       save_root: recordings
       auto_record_duration: 10.0   # optional
       record_topic: null            # optional, e.g. "gello_left/record"
+      instruction_mappings:         # optional, number keys save with labels
+        1: "pick up the object"
+        2: "place the object"
     nodes:
       - type: DummyGelloNode
         name: gello_left
@@ -40,6 +43,12 @@ _NODE_REGISTRY: dict[str, str] = {
     "ViserTeleopNode":  "robots_realtime.runtime.viser_teleop_node:ViserTeleopNode",
     "ViserMonitorNode": "robots_realtime.runtime.viser_monitor_node:ViserMonitorNode",
 }
+
+_COMMON_NODE_KWARGS = (
+    "pinned_cpu",
+    "realtime_priority",
+    "require_realtime",
+)
 
 
 def _resolve_node_cls(type_name: str):
@@ -138,6 +147,10 @@ def _load_from_yaml(
     record_on_unpause: bool = bool(session_cfg.get("record_on_unpause", False))
     episode_timeout: float | None = session_cfg.get("episode_timeout")
     instruction: str | None = session_cfg.get("instruction")
+    instruction_mappings: dict[str, str] | None = (
+        session_cfg.get("instruction_mappings")
+        or session_cfg.get("instructions")
+    )
     resolved_pub_port: int | None = pub_port
     resolved_sub_port: int | None = sub_port
     if resolved_pub_port is None and "pub_port" in session_cfg:
@@ -155,6 +168,9 @@ def _load_from_yaml(
 
         # Build constructor kwargs via classmethod
         kwargs = node_cls.build_kwargs({**node_params, "type": type_name})
+        for key in _COMMON_NODE_KWARGS:
+            if key in node_params:
+                kwargs[key] = node_params[key]
 
         # Inject writer
         node_params_with_type = {**node_params, "type": type_name}
@@ -181,6 +197,7 @@ def _load_from_yaml(
         record_on_unpause=record_on_unpause,
         episode_timeout=episode_timeout,
         instruction=instruction,
+        instruction_mappings=instruction_mappings,
     )
     if resolved_pub_port is not None or resolved_sub_port is not None:
         session.configure_bus_ports(
