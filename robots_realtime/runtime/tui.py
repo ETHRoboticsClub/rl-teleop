@@ -234,26 +234,44 @@ def _render(session, n_log_lines: int = 8) -> Panel:
 
 # ── Keyboard reader ───────────────────────────────────────────────────────────
 
+def _run_session_action_async(action_lock: threading.Lock, fn, *args, **kwargs) -> None:
+    """Run a potentially blocking session action without stalling key reads."""
+    if action_lock.locked():
+        return
+
+    def _worker() -> None:
+        with action_lock:
+            fn(*args, **kwargs)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def _read_keys(session, stop_event: threading.Event) -> None:
     """Read single keypresses from stdin without echoing.
 
     Terminal setup (setcbreak) is owned by run_tui, not here.
     """
+    action_lock = threading.Lock()
     while not stop_event.is_set():
         if _stdin_ready():
             ch = sys.stdin.read(1)
             if ch == "r":
                 if getattr(session, "instruction_mappings", {}):
                     if not session.is_recording:
-                        session.start_episode()
+                        _run_session_action_async(action_lock, session.start_episode)
                 else:
-                    session.toggle_recording()
+                    _run_session_action_async(action_lock, session.toggle_recording)
             elif ch in getattr(session, "instruction_mappings", {}):
                 if session.is_recording:
                     instruction = session.instruction_mappings[ch]
-                    session.end_episode(save=True, instruction=instruction)
+                    _run_session_action_async(
+                        action_lock,
+                        session.end_episode,
+                        save=True,
+                        instruction=instruction,
+                    )
             elif ch == "d":
-                session.end_episode(save=False)
+                _run_session_action_async(action_lock, session.end_episode, save=False)
             elif ch == " ":
                 session.toggle_pause()
             elif ch == "q":

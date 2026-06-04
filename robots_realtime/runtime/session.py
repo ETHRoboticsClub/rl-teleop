@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime
 import json
 import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -34,6 +35,71 @@ from robots_realtime.runtime.transport.serialization import unpack
 
 
 _HZ_WINDOW = 30
+
+
+def _run_git(args: list[str], cwd: Path, timeout: float = 2.0) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _git_dirty(cwd: Path) -> bool | None:
+    status = _run_git(["status", "--porcelain"], cwd)
+    if status is None:
+        return None
+    return bool(status)
+
+
+def _git_metadata() -> dict:
+    repo_root_raw = _run_git(["rev-parse", "--show-toplevel"], Path.cwd())
+    if not repo_root_raw:
+        return {"available": False}
+
+    repo_root = Path(repo_root_raw)
+    meta: dict = {
+        "available": True,
+        "root": str(repo_root),
+        "commit": _run_git(["rev-parse", "HEAD"], repo_root),
+        "branch": _run_git(["branch", "--show-current"], repo_root),
+        "dirty": _git_dirty(repo_root),
+        "submodules": [],
+    }
+
+    submodule_lines = _run_git(["submodule", "status", "--recursive"], repo_root)
+    if not submodule_lines:
+        return meta
+
+    for line in submodule_lines.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        state = line[0] if line else " "
+        commit = parts[0].lstrip("+-U")
+        path = parts[1]
+        desc = parts[2].strip("()") if len(parts) >= 3 else ""
+        sub_path = repo_root / path
+        meta["submodules"].append(
+            {
+                "path": path,
+                "commit": commit,
+                "descriptor": desc,
+                "state": state,
+                "dirty": _git_dirty(sub_path) if sub_path.exists() else None,
+            }
+        )
+    return meta
 
 
 def _node_descriptor(node) -> dict:
@@ -348,12 +414,17 @@ class Session:
             self._episode_dir = None
             self._episode_start_time = None
 
-        # Delegate stop_recording to all hosts
-        for host in self._hosts:
-            try:
-                host.stop_recording()
-            except Exception:
-                pass
+        # Delegate stop_recording to all hosts in parallel. Camera MP4 writers
+        # may need to drain encoder queues on close; doing this serially makes
+        # episode save latency add up across cameras.
+        threads = [
+            threading.Thread(target=self._safe_stop_recording, args=(host,), daemon=True)
+            for host in self._hosts
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=12.0)
 
         if not save and episode_dir is not None:
             import shutil
@@ -366,6 +437,13 @@ class Session:
                 self._write_session_meta(episode_dir, instruction=instruction)
 
         return episode_dir
+
+    @staticmethod
+    def _safe_stop_recording(host) -> None:
+        try:
+            host.stop_recording()
+        except Exception:
+            pass
 
     def toggle_recording(self) -> None:
         if self._is_recording:
@@ -463,6 +541,7 @@ class Session:
                 "nodes": self._node_descriptors,
                 "record_topic": self._record_topic,
                 "save_root": str(self._save_root),
+                "git": _git_metadata(),
             }
         meta["instruction"] = instruction
         meta["instruction_mappings"] = self._instruction_mappings
