@@ -81,7 +81,11 @@ def _make_writer_for_node(node_cls, node_params: dict):
 
 # ── YAML loader ───────────────────────────────────────────────────────────────
 
-def load_session(path: str) -> "Session":
+def load_session(
+    path: str,
+    pub_port: int | None = None,
+    sub_port: int | None = None,
+) -> "Session":
     """Load a Session from a YAML config file or Python module path.
 
     Args:
@@ -94,7 +98,10 @@ def load_session(path: str) -> "Session":
         try:
             mod = importlib.import_module(path)
             if hasattr(mod, "make_session"):
-                return mod.make_session()
+                session = mod.make_session()
+                if pub_port is not None or sub_port is not None:
+                    session.configure_bus_ports(pub_port=pub_port, sub_port=sub_port)
+                return session
         except (ImportError, ModuleNotFoundError):
             pass
 
@@ -103,10 +110,14 @@ def load_session(path: str) -> "Session":
     if not yaml_path.exists():
         raise FileNotFoundError(f"Session config not found: {yaml_path}")
 
-    return _load_from_yaml(yaml_path)
+    return _load_from_yaml(yaml_path, pub_port=pub_port, sub_port=sub_port)
 
 
-def _load_from_yaml(yaml_path: Path) -> "Session":
+def _load_from_yaml(
+    yaml_path: Path,
+    pub_port: int | None = None,
+    sub_port: int | None = None,
+) -> "Session":
     try:
         import yaml
     except ImportError as e:
@@ -127,6 +138,12 @@ def _load_from_yaml(yaml_path: Path) -> "Session":
     record_on_unpause: bool = bool(session_cfg.get("record_on_unpause", False))
     episode_timeout: float | None = session_cfg.get("episode_timeout")
     instruction: str | None = session_cfg.get("instruction")
+    resolved_pub_port: int | None = pub_port
+    resolved_sub_port: int | None = sub_port
+    if resolved_pub_port is None and "pub_port" in session_cfg:
+        resolved_pub_port = int(session_cfg["pub_port"])
+    if resolved_sub_port is None and "sub_port" in session_cfg:
+        resolved_sub_port = int(session_cfg["sub_port"])
 
     nodes_cfg: list[dict] = cfg.get("nodes", [])
     nodes = []
@@ -155,7 +172,7 @@ def _load_from_yaml(yaml_path: Path) -> "Session":
 
     from robots_realtime.runtime.session import Session
 
-    return Session(
+    session = Session(
         nodes=nodes,
         save_root=save_root,
         record_topic=record_topic,
@@ -165,3 +182,9 @@ def _load_from_yaml(yaml_path: Path) -> "Session":
         episode_timeout=episode_timeout,
         instruction=instruction,
     )
+    if resolved_pub_port is not None or resolved_sub_port is not None:
+        session.configure_bus_ports(
+            pub_port=resolved_pub_port,
+            sub_port=resolved_sub_port,
+        )
+    return session

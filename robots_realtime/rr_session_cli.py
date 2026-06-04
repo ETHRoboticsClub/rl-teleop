@@ -60,6 +60,18 @@ def main() -> None:
         help="Disable the Rich TUI and just block until Ctrl-C.",
     )
     parser.add_argument(
+        "--pub-port",
+        type=int,
+        default=None,
+        help="Override the MessageBus publisher/XSUB port. Defaults to 5555.",
+    )
+    parser.add_argument(
+        "--sub-port",
+        type=int,
+        default=None,
+        help="Override the MessageBus subscriber/XPUB port. Defaults to 5556.",
+    )
+    parser.add_argument(
         "--instruction",
         default=None,
         help="Text instruction to show in the recording UI and save in session_meta.json.",
@@ -76,7 +88,11 @@ def main() -> None:
         # YAML file path
         from robots_realtime.runtime.config import load_session
         try:
-            session = load_session(session_arg)
+            session = load_session(
+                session_arg,
+                pub_port=args.pub_port,
+                sub_port=args.sub_port,
+            )
         except FileNotFoundError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
@@ -99,6 +115,8 @@ def main() -> None:
             sys.exit(1)
 
         session = mod.make_session()
+        if args.pub_port is not None or args.sub_port is not None:
+            session.configure_bus_ports(pub_port=args.pub_port, sub_port=args.sub_port)
 
     # Allow save-root override
     if args.save_root:

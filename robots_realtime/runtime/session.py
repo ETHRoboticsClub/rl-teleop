@@ -25,7 +25,11 @@ from pathlib import Path
 import zmq
 
 from robots_realtime.runtime.node import Node, ProcessHost
-from robots_realtime.runtime.transport.message_bus import MessageBus, DEFAULT_SUB_PORT
+from robots_realtime.runtime.transport.message_bus import (
+    DEFAULT_PUB_PORT,
+    DEFAULT_SUB_PORT,
+    MessageBus,
+)
 from robots_realtime.runtime.transport.serialization import unpack
 
 
@@ -103,7 +107,7 @@ class Session:
         record_on_unpause: bool = False,
         episode_timeout: float | None = None,
         instruction: str | None = None,
-        pub_port: int = 5555,
+        pub_port: int = DEFAULT_PUB_PORT,
         sub_port: int = DEFAULT_SUB_PORT,
     ) -> None:
         self._pub_port = pub_port
@@ -162,6 +166,29 @@ class Session:
         self._recording_lock = threading.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def configure_bus_ports(
+        self,
+        pub_port: int | None = None,
+        sub_port: int | None = None,
+    ) -> None:
+        """Set broker and node ZMQ ports before the session is started."""
+        if self._hosts:
+            for host in self._hosts:
+                if getattr(host, "_proc", None) is not None:
+                    raise RuntimeError("Cannot change MessageBus ports after nodes start")
+
+        if pub_port is not None:
+            self._pub_port = int(pub_port)
+        if sub_port is not None:
+            self._sub_port = int(sub_port)
+
+        self._bus = MessageBus(pub_port=self._pub_port, sub_port=self._sub_port)
+        for host in self._hosts:
+            node = getattr(host, "_node", None)
+            if node is not None:
+                node._pub_port = self._pub_port
+                node._sub_port = self._sub_port
 
     def start(self) -> None:
         import tempfile
