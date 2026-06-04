@@ -411,7 +411,10 @@ class AsyncMp4Writer(Writer):
             frame, ts = item
             if writer is None:
                 h, w = frame.shape[:2]
-                cpu_count = os.cpu_count() or 1
+                try:
+                    cpu_count = len(os.sched_getaffinity(0))
+                except AttributeError:
+                    cpu_count = os.cpu_count() or 1
                 writer = imageio.get_writer(
                     str(mp4_path),
                     format="FFMPEG",

@@ -95,8 +95,6 @@ nodes:
   # headless hosts just see the URL in the log and can be visited remotely.
   - type: ViserMonitorNode
     name: viz
-    pinned_cpu: 10
-    realtime_priority: 50
     port: 8080
     viz_freq: 20
     auto_open_browser: true
@@ -133,8 +131,6 @@ nodes:
 
   - type: CameraNode
     name: camera_top
-    pinned_cpu: 12
-    realtime_priority: 60
     driver: RealSenseCamera
     device_id: "203522250539"
     resolution: [1280, 720]
@@ -146,8 +142,6 @@ nodes:
 
   - type: CameraNode
     name: camera_left
-    pinned_cpu: 14
-    realtime_priority: 60
     driver: OpenCVCamera
     device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.4:1.0-video-index0
     resolution: [640, 480]
@@ -174,8 +168,6 @@ nodes:
 
   - type: CameraNode
     name: camera_right
-    pinned_cpu: 15
-    realtime_priority: 60
     driver: OpenCVCamera
     device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.2:1.0-video-index0
     resolution: [640, 480]
