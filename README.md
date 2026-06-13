@@ -83,6 +83,34 @@ Upon running any of the above configs, you should see the terminal populate with
 ```
 Look under `/configs` for other existing configs
 
+### Run policy inference on real YAM Followers
+
+Autonomous rollout of a trained policy against the bimanual YAM followers (no leader arms). Drop a checkpoint into `checkpoints/<date>/` and launch:
+
+```bash
+./infer.sh
+```
+
+`infer.sh` mirrors `teleop.sh`'s pre-flight (submodule init, `can_follow_l/r` bring-up at 1 Mbit/s, `RS2_USE_RSUSB_BACKEND=true`) but skips all leader-arm steps. It also puts the repo root on `PYTHONPATH` so the top-level `adapters/` package is importable.
+
+The default config is `configs/yam/yam_bimanual_inference.yaml`. It wires:
+
+- **Single head camera** (RealSense D405) on `camera_top/rgb` — no wrist cams.
+- **Two YAM followers** with `startup_joint_pos` ramps + `session.start_paused: true` so arms hold until the operator hits `[space]` in the TUI.
+- **`CheckpointPolicyAgent`** — a generic loader that runs:
+  ```
+  obs --[obs_adapter]--> model_input --[model.pt]--> model_output --[action_adapter]--> {"left": {"pos": ...}, "right": {"pos": ...}}
+  ```
+
+Before a real rollout, fill in the two stubs at the repo-root `adapters/` folder:
+
+- `adapters/obs_to_input.py:transform(obs)` — convert the AgentNode obs dict into the input shape your `.pt` expects.
+- `adapters/output_to_action.py:transform(model_output)` — convert the model output into the bimanual action dict.
+
+The checkpoint path lives in the YAML (`agent_kwargs.checkpoint_path`, e.g. `checkpoints/2026-06-13/policy.pt`). The YAML also keeps OpenPI/π₀, local ACT, and lerobot agent stanzas as commented references — swap (D) for one of them if you'd rather use an existing backend.
+
+Flags: `./infer.sh --no-tui`, `./infer.sh --config <path>`, `./infer.sh <path>` (bare positional = config).
+
 ### Replay an episode
 
 ```bash

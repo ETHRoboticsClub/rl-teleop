@@ -1,0 +1,170 @@
+version: "1"
+
+# Bimanual YAM policy-inference deployment.
+#
+# Framework-agnostic scaffold: pick ONE of the (A)/(B)/(C) agent stanzas
+# below when the trained checkpoint format is known. The non-agent nodes
+# (followers, head camera) do not depend on the policy backend and should
+# not need changes.
+#
+# Camera setup: single head (top) RealSense D405. No wrist cameras, no
+# Viser visualizer — inference deployments are intentionally thinner than
+# teleop sessions.
+#
+# Prereqs:
+#   - can_follow_l / can_follow_r up at 1 Mbit/s (handled by ./infer.sh).
+#   - 1x RealSense D405 plugged in with the device ID below.
+#
+# Launch:
+#   ./infer.sh
+#   ./infer.sh --config configs/yam/yam_bimanual_inference.yaml
+
+session:
+  save_root: recordings
+  # Safety + ergonomics:
+  #   - start_paused: RobotNode commands are gated on startup so the arm
+  #     doesn't snap to wherever the policy thinks it should be. Hit
+  #     [space] in the TUI to hand off control.
+  #   - record_on_unpause: when the operator unpauses, automatically start
+  #     an episode so every rollout is captured from the instant of
+  #     handoff.
+  start_paused: true
+  record_on_unpause: true
+  # instruction: "<task description goes here>"
+
+nodes:
+  # ──────────────────────────────────────────────────────────────────────
+  # AgentNode — POLICY BACKEND.
+  # Active: (D) CheckpointPolicyAgent — generic .pt loader wired to
+  # adapter stubs at the repo-root `adapters/` folder. Fill in those
+  # stubs (obs_to_input.transform + output_to_action.transform) before
+  # this will actually drive the arms. infer.sh puts the repo root on
+  # PYTHONPATH so `import adapters` resolves.
+  #
+  # Alternatives (A)(B)(C) remain commented out below as references.
+  # All four publish bimanual actions; AgentNode fans them out to
+  # policy/left_pos and policy/right_pos automatically (no arm_key needed).
+  # ──────────────────────────────────────────────────────────────────────
+
+  # (D) Generic .pt checkpoint + user-provided adapters (active).
+  - type: AgentNode
+    name: policy
+    agent_class: robots_realtime.agents.policy_learning.checkpoint_policy_agent:CheckpointPolicyAgent
+    agent_kwargs:
+      # Edit per deployment. Path is relative to the repo root (infer.sh
+      # cd's there before launching).
+      checkpoint_path: checkpoints/2026-06-13/policy.pt
+      obs_adapter:    adapters.obs_to_input:transform
+      action_adapter: adapters.output_to_action:transform
+      device: cuda
+    state_topics:
+      left:  yam_left/joint_state
+      right: yam_right/joint_state
+    image_topics:
+      top_camera: camera_top/rgb
+    loop_mode: fixed_rate
+    poll_freq: 30
+
+  # (A) OpenPI / π₀ — remote websocket server. Zero Python work.
+  #     Run `serve_policy.py --path <ckpt>` in the openpi repo, then:
+  # - type: AgentNode
+  #   name: policy
+  #   agent_class: robots_realtime.agents.policy_learning.async_pi0_agent:AsyncDiffusionAgent
+  #   agent_kwargs:
+  #     ip: 127.0.0.1
+  #     port: 8012
+  #     action_horizon: 30
+  #     inference_mode: async_rtc        # sync | async | async_rtc | temporal_ensemble
+  #     image_preprocess: center_crop
+  #   state_topics:
+  #     left:  yam_left/joint_state
+  #     right: yam_right/joint_state
+  #   image_topics:
+  #     top_camera: camera_top/rgb
+  #   loop_mode: fixed_rate
+  #   poll_freq: 30
+
+  # (B) ACT local — in-process torch. Requires the `act` package installed.
+  #     Kwargs MUST match the trained ModelConfig exactly. The default
+  #     ACTModelIOConfig expects three cameras — override model_io_config
+  #     for this single-camera setup.
+  # - type: AgentNode
+  #   name: policy
+  #   agent_class: robots_realtime.agents.policy_learning.async_act_agent:AsyncACTAgent
+  #   agent_kwargs:
+  #     checkpoint_path: /abs/path/to/checkpoint_<step>.pt
+  #     norm_stats_path: /abs/path/to/norm_stats.json
+  #     action_dim: 14
+  #     proprio_dim: 14
+  #     action_chunk_size: 30
+  #     backbone: dinov3_vits16
+  #     encoder_image_size: 256
+  #     hidden_size: 384
+  #     num_heads: 12
+  #     num_blocks: 3
+  #     device: cuda
+  #     inference_mode: async_rate_limited
+  #     inference_interval_s: 0.5
+  #     image_preprocess: center_crop
+  #     model_io_config:
+  #       state_keys: ["left-joint_pos", "left-gripper_pos", "right-joint_pos", "right-gripper_pos"]
+  #       image_keys: ["top_camera-images-rgb"]
+  #       image_key_to_model_key:
+  #         top_camera-images-rgb: exo
+  #   state_topics:
+  #     left:  yam_left/joint_state
+  #     right: yam_right/joint_state
+  #   image_topics:
+  #     top_camera: camera_top/rgb
+  #   loop_mode: fixed_rate
+  #   poll_freq: 30
+
+  # (C) lerobot PreTrainedPolicy — REQUIRES a new agent wrapper.
+  #     Implement robots_realtime/agents/policy_learning/lerobot_policy_agent.py
+  #     as a thin PolicyAgent subclass: PreTrainedPolicy.from_pretrained(...)
+  #     in __init__, and act(obs) packs obs into
+  #     {"observation.state": ..., "observation.images.<cam>": ...},
+  #     calls policy.select_action, returns
+  #     {"left": {"pos": ...}, "right": {"pos": ...}}.
+  # - type: AgentNode
+  #   name: policy
+  #   agent_class: robots_realtime.agents.policy_learning.lerobot_policy_agent:LerobotPolicyAgent
+  #   agent_kwargs:
+  #     model_id_or_path: <hf-id-or-local-dir>
+  #     device: cuda
+  #   state_topics:
+  #     left:  yam_left/joint_state
+  #     right: yam_right/joint_state
+  #   image_topics:
+  #     top_camera: camera_top/rgb
+  #   loop_mode: subscriber_driven
+
+  # ── Followers (framework-agnostic) ───────────────────────────────────
+  - type: RobotNode
+    name: yam_left
+    robot_config: robot_configs/yam/xdof_hq/left.yaml
+    cmd_topic: policy/left_pos
+    poll_freq: 200
+    ramp_duration_s: 1.5
+    # In-distribution starting pose for tshirt_folding_d405. Replace with
+    # a pose suited to your task — the all-zeros pose is OOD for most
+    # trained policies and produces erratic predictions.
+    startup_joint_pos: [-0.0235, 1.56242, 0.3495, 0.95763, -0.11537, -0.02913, 1.0]
+    startup_duration_s: 2.0
+
+  - type: RobotNode
+    name: yam_right
+    robot_config: robot_configs/yam/xdof_hq/right.yaml
+    cmd_topic: policy/right_pos
+    poll_freq: 200
+    ramp_duration_s: 1.5
+    startup_joint_pos: [0.01732, 1.54234, 0.33567, 0.98454, 0.11514, 0.03717, 1.0]
+    startup_duration_s: 2.0
+
+  # ── Head camera (single RealSense D405) ──────────────────────────────
+  - type: CameraNode
+    name: camera_top
+    driver: RealSenseCamera
+    device_id: "203522250539"
+    resolution: VGA
+    fps: 30
