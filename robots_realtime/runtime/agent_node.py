@@ -297,6 +297,8 @@ class AgentNode(Node):
                     self._bbox_guardrails[arm_key] = CommandBoundingBoxGuardrail(
                         bbox["min"], bbox["max"]
                     )
+            if len(self._bbox_guardrails) == 1:
+                self._bbox_guardrails[None] = next(iter(self._bbox_guardrails.values()))
         else:
             bbox = cfg.get("bounding_box")
             validate_safety_config(
@@ -324,8 +326,7 @@ class AgentNode(Node):
             return self._arm_key
         if None in self._bbox_guardrails:
             return None
-        if len(self._bbox_guardrails) == 1:
-            return next(iter(self._bbox_guardrails))
+        # Do NOT fall back to a different arm's guardrail — that's unsafe
         return arm_key
 
     def cleanup(self) -> None:

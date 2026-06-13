@@ -62,6 +62,21 @@ def validate_safety_config(cfg: Dict[str, Any]) -> Union[bool, Dict[str, Any]]:
             "Set acceleration_limit to constrain joint acceleration."
         )
 
+    # ── Validate acceleration_limit when provided ──────────────────────────
+    if accel is not None:
+        try:
+            accel_f = float(accel)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"acceleration_limit must be numeric, got {type(accel).__name__}"
+            )
+        if math.isnan(accel_f):
+            raise ValueError("acceleration_limit is NaN")
+        if math.isinf(accel_f):
+            raise ValueError("acceleration_limit is inf")
+        if accel_f <= 0:
+            raise ValueError(f"acceleration_limit must be positive, got {accel_f}")
+
     # ── Validate bounding box contents ─────────────────────────────────────
     if bbox is not None:
         _validate_bbox(bbox)
@@ -69,25 +84,31 @@ def validate_safety_config(cfg: Dict[str, Any]) -> Union[bool, Dict[str, Any]]:
     return True
 
 
-def _validate_bbox(bbox: Dict[str, List[float]]) -> None:
-    """Check bounding box for NaN, inf, and min > max violations."""
-    mins = bbox.get("min", [])
-    maxs = bbox.get("max", [])
-
-    for i, (lo, hi) in enumerate(zip(mins, maxs, strict=False)):
+def _validate_bbox(bbox: dict) -> None:
+    """Check bounding box for missing keys, empty arrays, length mismatch, NaN, inf, and min > max."""
+    if "min" not in bbox:
+        raise ValueError("bounding_box missing 'min' key")
+    if "max" not in bbox:
+        raise ValueError("bounding_box missing 'max' key")
+    mins = bbox["min"]
+    maxs = bbox["max"]
+    if len(mins) == 0:
+        raise ValueError("bounding_box.min must not be empty")
+    if len(mins) != len(maxs):
+        raise ValueError(
+            f"bounding_box.min length ({len(mins)}) != bounding_box.max length ({len(maxs)})"
+        )
+    for i, (lo, hi) in enumerate(zip(mins, maxs)):
         lo_f = float(lo)
         hi_f = float(hi)
-
         if math.isnan(lo_f):
             raise ValueError(f"bounding_box.min[{i}] is NaN")
         if math.isnan(hi_f):
             raise ValueError(f"bounding_box.max[{i}] is NaN")
-
         if math.isinf(lo_f):
             raise ValueError(f"bounding_box.min[{i}] is inf")
         if math.isinf(hi_f):
             raise ValueError(f"bounding_box.max[{i}] is inf")
-
         if lo_f > hi_f:
             raise ValueError(
                 f"bounding_box.min[{i}] ({lo_f}) > bounding_box.max[{i}] ({hi_f})"

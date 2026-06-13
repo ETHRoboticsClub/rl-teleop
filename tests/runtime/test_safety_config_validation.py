@@ -189,3 +189,39 @@ def test_repeated_clamps_warn_without_pausing_or_stopping():
 
         assert len(node._clamp_log) == 10
         assert mock_warn.call_count == 10
+
+
+def test_empty_bbox_min_fails_validation():
+    with pytest.raises(ValueError, match="[Mm]in"):
+        validate_safety_config({"bounding_box": {"max": [1.0, 1.0]}})
+
+
+def test_empty_bbox_arrays_fail_validation():
+    with pytest.raises(ValueError, match="[Ee]mpty|[Ll]ength"):
+        validate_safety_config({"bounding_box": {"min": [], "max": []}})
+
+
+def test_mismatched_bbox_lengths_fail_validation():
+    with pytest.raises(ValueError, match="[Ll]ength|[Mm]ismatch"):
+        validate_safety_config({"bounding_box": {"min": [0.0], "max": [1.0, 1.0]}})
+
+
+def test_nan_acceleration_limit_rejected():
+    with pytest.raises(ValueError, match="[Nn]aN|[Aa]cceleration"):
+        validate_safety_config(
+            {"mode": "sim", "agent_type": "inference", "acceleration_limit": float("nan")}
+        )
+
+
+def test_negative_acceleration_limit_rejected():
+    with pytest.raises(ValueError, match="[Pp]ositive|[Nn]egative|[Aa]cceleration"):
+        validate_safety_config(
+            {"mode": "sim", "agent_type": "inference", "acceleration_limit": -1.0}
+        )
+
+
+def test_infinite_acceleration_limit_rejected():
+    with pytest.raises(ValueError, match="[Ii]nf|[Aa]cceleration"):
+        validate_safety_config(
+            {"mode": "sim", "agent_type": "inference", "acceleration_limit": float("inf")}
+        )
