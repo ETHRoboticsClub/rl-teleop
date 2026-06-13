@@ -29,6 +29,7 @@ Subscribed topics: state_topics.values() + image_topics.values()
 from __future__ import annotations
 
 import importlib
+import logging
 import time
 
 import numpy as np
@@ -123,6 +124,7 @@ class AgentNode(Node):
         self._bbox_guardrails: dict[str | None, CommandBoundingBoxGuardrail] = {}
         self._accel_guardrail: InferenceAccelerationGuardrail | None = None
         self._last_cmd: dict[str | None, np.ndarray] = {}
+        self._clamp_log: list[dict] = []
 
     # ------------------------------------------------------------------
 
@@ -236,17 +238,39 @@ class AgentNode(Node):
         if self._safety_agent_type == "inference" and self._accel_guardrail is not None:
             prev_cmd = self._last_cmd.get(guardrail_key)
             if prev_cmd is not None:
+                original = pos.copy()
                 pos = self._accel_guardrail.apply(prev_cmd, pos)
+                if not np.array_equal(pos, original):
+                    self._log_clamp(guardrail_key, "accel", original, pos)
         bbox_guardrail = self._bbox_guardrails.get(guardrail_key)
         if bbox_guardrail is not None:
+            original = pos.copy()
             pos = bbox_guardrail.apply(pos)
+            if not np.array_equal(pos, original):
+                self._log_clamp(guardrail_key, "bbox", original, pos)
         self._last_cmd[guardrail_key] = pos.copy()
         return pos
+
+    def _log_clamp(self, arm_key: str | None, guardrail: str, original: np.ndarray, clamped: np.ndarray) -> None:
+        entry = {
+            "arm_key": arm_key,
+            "guardrail": guardrail,
+            "original": original.tolist(),
+            "clamped": clamped.tolist(),
+            "timestamp": time.time(),
+        }
+        self._clamp_log.append(entry)
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            f"Safety clamp: arm={arm_key}, guardrail={guardrail}, "
+            f"original={original.tolist()}, clamped={clamped.tolist()}"
+        )
 
     def _setup_safety_guardrails(self) -> None:
         self._bbox_guardrails = {}
         self._accel_guardrail = None
         self._last_cmd = {}
+        self._clamp_log = []
 
         if not self._safety_config:
             self._safety_agent_type = "teleop"
