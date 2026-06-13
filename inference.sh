@@ -7,6 +7,7 @@ BITRATE="${CAN_BITRATE:-1000000}"
 NO_TUI=0
 RSUSB=1
 CONFIG="$DEFAULT_CONFIG"
+DURATION=""
 EXTRA_ARGS=()
 
 cd "$SCRIPT_DIR"
@@ -36,6 +37,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       CONFIG="$2"
+      shift 2
+      ;;
+    --duration)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --duration requires a value in seconds" >&2
+        exit 1
+      fi
+      DURATION="$2"
       shift 2
       ;;
     --*)
@@ -87,6 +96,14 @@ fi
 # Repo root on PYTHONPATH so `import adapters` resolves. The adapters/
 # folder lives at the top level (outside the installed robots_realtime
 # package) so user-edited model I/O stubs don't require a reinstall.
-export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+# Also add mimic-video/model so `cosmos_predict2` and `imaginaire` resolve
+# at runtime — they are not installable Python packages.
+export PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/mimic-video/model${PYTHONPATH:+:${PYTHONPATH}}"
 
+# --duration wraps rr-session with `timeout`. SIGINT lets the session run
+# its graceful shutdown (RobotNode ramps to shutdown_joint_pos); --kill-after
+# is a hard backstop if any node ignores SIGINT.
+if [[ -n "$DURATION" ]]; then
+  exec timeout --preserve-status --signal=INT --kill-after=10 "$DURATION" "${CMD[@]}"
+fi
 exec "${CMD[@]}"

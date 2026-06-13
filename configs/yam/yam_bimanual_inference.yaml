@@ -35,29 +35,37 @@ session:
 nodes:
   # ──────────────────────────────────────────────────────────────────────
   # AgentNode — POLICY BACKEND.
-  # Active: (D) CheckpointPolicyAgent — generic .pt loader wired to
-  # adapters/mimic_video.py (obs_to_input + output_to_action). infer.sh
-  # puts the repo root on PYTHONPATH so `import adapters` resolves.
+  # Active: (D) MimicVideoAgent — Cosmos Predict 2 Video2World2Action
+  # pipeline. Loads two checkpoints (video backbone + action decoder),
+  # denoises the head-cam video to step `stop_video_denoising_step` (τ),
+  # then runs the action DiT and dequeues `num_execute_actions` per chunk.
+  # infer.sh puts both the repo root and `mimic-video/model` on PYTHONPATH.
   #
   # Alternatives (A)(B)(C) remain commented out below as references.
   # All four publish bimanual actions; AgentNode fans them out to
   # policy/left_pos and policy/right_pos automatically (no arm_key needed).
   # ──────────────────────────────────────────────────────────────────────
 
-  # (D) Generic .pt checkpoint + user-provided adapters (active).
-  # Adapter functions live in adapters/mimic_video.py:
-  #   obs_to_input(obs)   — head-camera RGB → (1, N, 3, H, W) clip
-  #   output_to_action(o) — action chunk → {"left": {"pos": (7,)}, "right": {"pos": (7,)}}
+  # (D) Mimic Video (VAM) — Cosmos Predict 2 video→world→action (active).
+  # τ knob: stop_video_denoising_step ∈ [0, num_sampling_step]. Lower τ
+  # means fewer denoising steps before handing off to the action DiT
+  # (faster, less polished embeddings).
   - type: AgentNode
     name: policy
-    agent_class: robots_realtime.agents.policy_learning.checkpoint_policy_agent:CheckpointPolicyAgent
+    agent_class: robots_realtime.agents.policy_learning.mimic_video_agent:MimicVideoAgent
     agent_kwargs:
-      # Edit per deployment. Path is relative to the repo root (infer.sh
-      # cd's there before launching).
-      checkpoint_path: checkpoints/2026-06-13/policy.pt
-      obs_adapter:    adapters.mimic_video:obs_to_input
-      action_adapter: adapters.mimic_video:output_to_action
+      experiment_name: <vam-experiment-name>
+      video_model_path: checkpoints/2026-06-13/video_backbone.pt
+      action_model_path: checkpoints/2026-06-13/action_decoder.pt
+      dataset_statistics_path: checkpoints/2026-06-13/dataset_statistics.json
+      prompt: "fold the t-shirt"
+      img_horizon: 5
+      lowdim_horizon: 1
+      num_sampling_step: 35
+      stop_video_denoising_step: 20
+      num_execute_actions: 5
       device: cuda
+      dtype: bfloat16
     state_topics:
       left:  yam_left/joint_state
       right: yam_right/joint_state
