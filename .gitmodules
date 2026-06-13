@@ -8,3 +8,6 @@
 [submodule "dependencies/lerobot_teleoperator_yamactiveleader"]
 	path = dependencies/lerobot_teleoperator_yamactiveleader
 	url = https://github.com/uynitsuj/lerobot_teleoperator_yamactiveleader.git
+[submodule "mimic-video"]
+	path = mimic-video
+	url = https://github.com/mimic-video/mimic-video.git

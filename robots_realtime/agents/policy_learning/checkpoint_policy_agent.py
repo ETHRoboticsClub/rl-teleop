@@ -69,6 +69,8 @@ class CheckpointPolicyAgent(PolicyAgent):
 
     def act(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         model_input = self._obs_adapter(obs)
+        if model_input is None:
+            return {}
         with self._torch.no_grad():
             model_output = self._model(model_input)
         return self._action_adapter(model_output)

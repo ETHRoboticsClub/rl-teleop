@@ -104,8 +104,8 @@ The default config is `configs/yam/yam_bimanual_inference.yaml`. It wires:
 
 Before a real rollout, fill in the two stubs at the repo-root `adapters/` folder:
 
-- `adapters/obs_to_input.py:transform(obs)` — convert the AgentNode obs dict into the input shape your `.pt` expects.
-- `adapters/output_to_action.py:transform(model_output)` — convert the model output into the bimanual action dict.
+- `adapters/mimic_video.py:obs_to_input(obs)` — convert the AgentNode obs dict into the input shape your `.pt` expects (stacked-frame video clip).
+- `adapters/mimic_video.py:output_to_action(model_output)` — convert the model output (action chunk) into the bimanual action dict.
 
 The checkpoint path lives in the YAML (`agent_kwargs.checkpoint_path`, e.g. `checkpoints/2026-06-13/policy.pt`). The YAML also keeps OpenPI/π₀, local ACT, and lerobot agent stanzas as commented references — swap (D) for one of them if you'd rather use an existing backend.
 

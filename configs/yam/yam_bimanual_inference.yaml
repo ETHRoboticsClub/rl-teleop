@@ -36,10 +36,8 @@ nodes:
   # ──────────────────────────────────────────────────────────────────────
   # AgentNode — POLICY BACKEND.
   # Active: (D) CheckpointPolicyAgent — generic .pt loader wired to
-  # adapter stubs at the repo-root `adapters/` folder. Fill in those
-  # stubs (obs_to_input.transform + output_to_action.transform) before
-  # this will actually drive the arms. infer.sh puts the repo root on
-  # PYTHONPATH so `import adapters` resolves.
+  # adapters/mimic_video.py (obs_to_input + output_to_action). infer.sh
+  # puts the repo root on PYTHONPATH so `import adapters` resolves.
   #
   # Alternatives (A)(B)(C) remain commented out below as references.
   # All four publish bimanual actions; AgentNode fans them out to
@@ -47,6 +45,9 @@ nodes:
   # ──────────────────────────────────────────────────────────────────────
 
   # (D) Generic .pt checkpoint + user-provided adapters (active).
+  # Adapter functions live in adapters/mimic_video.py:
+  #   obs_to_input(obs)   — head-camera RGB → (1, N, 3, H, W) clip
+  #   output_to_action(o) — action chunk → {"left": {"pos": (7,)}, "right": {"pos": (7,)}}
   - type: AgentNode
     name: policy
     agent_class: robots_realtime.agents.policy_learning.checkpoint_policy_agent:CheckpointPolicyAgent
@@ -54,8 +55,8 @@ nodes:
       # Edit per deployment. Path is relative to the repo root (infer.sh
       # cd's there before launching).
       checkpoint_path: checkpoints/2026-06-13/policy.pt
-      obs_adapter:    adapters.obs_to_input:transform
-      action_adapter: adapters.output_to_action:transform
+      obs_adapter:    adapters.mimic_video:obs_to_input
+      action_adapter: adapters.mimic_video:output_to_action
       device: cuda
     state_topics:
       left:  yam_left/joint_state
