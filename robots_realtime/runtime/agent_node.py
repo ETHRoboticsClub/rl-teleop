@@ -281,7 +281,12 @@ class AgentNode(Node):
         self._safety_agent_type = cfg.get("agent_type", "teleop")
         acceleration_limit = cfg.get("acceleration_limit")
 
-        arms = cfg.get("arms") or {}
+        arms = cfg.get("arms")
+        if mode == "real" and arms is not None and len(arms) == 0:
+            raise ValueError(
+                "Real hardware requires per-arm bounding_box config. "
+                "safety.arms is empty; add entries for each arm (e.g. left, right)."
+            )
         if arms:
             for arm_key, arm_cfg in arms.items():
                 bbox = arm_cfg.get("bounding_box")
