@@ -113,3 +113,94 @@ def _validate_bbox(bbox: dict) -> None:
             raise ValueError(
                 f"bounding_box.min[{i}] ({lo_f}) > bounding_box.max[{i}] ({hi_f})"
             )
+
+
+def validate_cartesian_workspace_config(cfg: Dict[str, Any]) -> bool:
+    """Validate a cartesian workspace config dict; raise ValueError on invalid values.
+
+    Requires agent_type, site_name, xml_path, frame, min_xyz, max_xyz when present.
+    Follows the same element-wise validation pattern as _validate_bbox.
+
+    Args:
+        cfg: Config dict with cartesian workspace keys.
+
+    Returns:
+        True on success.
+
+    Raises:
+        ValueError: If any constraint is violated.
+    """
+    # ── Required fields ────────────────────────────────────────────────────
+    for key in ("agent_type", "site_name", "xml_path"):
+        if key not in cfg:
+            raise ValueError(f"cartesian workspace missing '{key}'")
+
+    agent_type = cfg["agent_type"]
+    site_name = cfg["site_name"]
+    xml_path = cfg["xml_path"]
+
+    # ── agent_type must be teleop or inference ─────────────────────────────
+    if agent_type not in ("teleop", "inference"):
+        raise ValueError(
+            f"cartesian workspace agent_type must be 'teleop' or 'inference', got '{agent_type}'"
+        )
+
+    # ── site_name must be non-empty ────────────────────────────────────────
+    if not isinstance(site_name, str) or not site_name.strip():
+        raise ValueError("cartesian workspace site_name must be a non-empty string")
+
+    # ── xml_path must be non-empty ─────────────────────────────────────────
+    if not isinstance(xml_path, str) or not xml_path.strip():
+        raise ValueError("cartesian workspace xml_path must be a non-empty string")
+
+    # ── frame must be 'model' only ─────────────────────────────────────────
+    if "frame" not in cfg:
+        raise ValueError("cartesian workspace missing 'frame'")
+    frame = cfg["frame"]
+    if frame != "model":
+        raise ValueError(
+            f"cartesian workspace frame must be 'model', got '{frame}'"
+        )
+
+    # ── min_xyz / max_xyz presence ─────────────────────────────────────────
+    if "min_xyz" not in cfg:
+        raise ValueError("cartesian workspace missing 'min_xyz'")
+    if "max_xyz" not in cfg:
+        raise ValueError("cartesian workspace missing 'max_xyz'")
+
+    mins = cfg["min_xyz"]
+    maxs = cfg["max_xyz"]
+
+    if len(mins) == 0:
+        raise ValueError("cartesian workspace min_xyz must not be empty")
+    if len(mins) != len(maxs):
+        raise ValueError(
+            f"cartesian workspace min_xyz length ({len(mins)}) != max_xyz length ({len(maxs)}), mismatch"
+        )
+
+    # ── Element-wise numeric validation (NaN, inf, min > max) ─────────────
+    for i, (lo, hi) in enumerate(zip(mins, maxs)):
+        lo_f = float(lo)
+        hi_f = float(hi)
+        if math.isnan(lo_f):
+            raise ValueError(f"cartesian workspace min_xyz[{i}] is NaN")
+        if math.isnan(hi_f):
+            raise ValueError(f"cartesian workspace max_xyz[{i}] is NaN")
+        if math.isinf(lo_f):
+            raise ValueError(f"cartesian workspace min_xyz[{i}] is inf")
+        if math.isinf(hi_f):
+            raise ValueError(f"cartesian workspace max_xyz[{i}] is inf")
+        if lo_f > hi_f:
+            raise ValueError(
+                f"cartesian workspace min_xyz[{i}] ({lo_f}) exceeds max_xyz[{i}] ({hi_f})"
+            )
+
+    # ── fk_ik_clamp not allowed for teleop ─────────────────────────────────
+    enforcement = cfg.get("enforcement")
+    if agent_type == "teleop" and enforcement == "fk_ik_clamp":
+        raise ValueError(
+            "fk_ik_clamp enforcement is not supported for teleop mode. "
+            "Use 'reject_hold' or omit enforcement for teleop agents."
+        )
+
+    return True
