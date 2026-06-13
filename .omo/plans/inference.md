@@ -5,7 +5,7 @@
 > **Deliverables**:
 > - TDD fake-policy test suite for checkpoint loading, observation mapping, action mapping, timing, and safety failures.
 > - `CosmosIdmPolicyAgent` implementing the existing `PolicyAgent.act(obs)` contract.
-> - Checkpoint inspection utilities that load/probe the Cosmos and IDM `.pt` files on CPU to discover available tensors, metadata, input/output shapes, and required mapping config before any robot session starts.
+> - An implementation discovery step where the executor probes the real Cosmos and IDM `.pt` files, if available, to learn what the adapter must adapt: artifact type, keys, tensor shapes, callable signature, and any metadata.
 > - Config validation helpers for model path/device/mapping/normalization/safety settings.
 > - Example `configs/yam/*cosmos_idm*_inference*.yaml` showing `.pt` deployment with existing arms, cameras, Viser, and TUI.
 > - Deployment docs explaining `uv run rr-session <config>` and why LeRobot is out of v1 scope.
@@ -32,13 +32,21 @@
 - Guardrails added: no new dashboard, no LeRobot runtime ownership, no recording/export pipeline, no real hardware required for tests, fail-closed action safety.
 - Acceptance criteria require executable commands and fake data, not manual operator confirmation.
 
+### Mimic-Video Architecture Reference
+- User provided `https://github.com/mimic-video/mimic-video` as the model-architecture reference.
+- Research target for implementer: `mimic_video.MimicVideo` is the likely primary model class; `.sample(...)` is the likely inference entry point.
+- Likely inference inputs: `prompts`, `video` shaped `(B, T, C, H, W)`, `joint_state` shaped `(B, D_j)`, optional `prefix_action_chunk` shaped `(B, T_pre, D_a)`, and sampling/forecast controls.
+- Likely inference output: action chunk shaped `(B, T_act, D_a)` that must be queued/sliced into existing RR arm commands.
+- Critical reference files/functions for implementation discovery: `mimic_video/__init__.py`, `mimic_video/cosmos_predict.py`, `mimic_video/model/`, `experiment/world2action.py`, `model/*.yaml`, and `scripts/download_checkpoints.py`.
+- Critical model-config fields to discover from code/checkpoint/config: `dim_action`, `dim_joint_state`, `action_chunk_len`, `extract_layer`/`extract_layers`, video resolution/frame count, prompt handling, and normalization constants such as `latents_mean`/`latents_std` if present.
+
 ## Work Objectives
 ### Core Objective
 Enable Cosmos/IDM PyTorch policy inference inside the existing robots_realtime runtime by adding a tested `PolicyAgent` adapter that maps existing session observations to model inputs and maps model outputs to existing left/right arm command topics.
 
 ### Deliverables
-1. `tests/agents/policy_learning/test_cosmos_idm_policy_agent.py` with fake checkpoint/model tests, including fake Cosmos and IDM `.pt` shape-inspection fixtures.
-2. `robots_realtime/agents/policy_learning/cosmos_idm_policy_agent.py` with adapter implementation and checkpoint-probing helpers.
+1. `tests/agents/policy_learning/test_cosmos_idm_policy_agent.py` with fake checkpoint/model tests derived from the discovered Cosmos/IDM contract.
+2. `robots_realtime/agents/policy_learning/cosmos_idm_policy_agent.py` with adapter implementation.
 3. Config/dataclass or validation helpers inside the same module unless complexity justifies `cosmos_idm_config.py`.
 4. Example config under `configs/yam/`, derived from existing ACT/OpenPI policy configs.
 5. README or docs update documenting deployment with `uv run rr-session <config>`.
@@ -54,19 +62,21 @@ Enable Cosmos/IDM PyTorch policy inference inside the existing robots_realtime r
 ### Must Have
 - Existing `rr-session` remains the user-facing launcher.
 - Adapter implements `PolicyAgent` from `robots_realtime/agents/agent.py:31`.
-- Adapter inspects both configured Cosmos and IDM `.pt` files before first inference, records discovered tensor/module shapes, and rejects ambiguous or unsupported checkpoint contents before `Session.start()` can command hardware.
+- Executor must probe the actual Cosmos and IDM `.pt` files during implementation discovery, when those files are available, and translate those findings into explicit adapter tests/config fields.
 - Existing `AgentNode` YAML `agent_class`/`agent_kwargs` dynamic build path at `robots_realtime/runtime/agent_node.py:45` and `robots_realtime/runtime/agent_node.py:127` is reused.
 - Existing multi-arm output format from `robots_realtime/runtime/agent_node.py:14` and fanout at `robots_realtime/runtime/agent_node.py:197` is used: `{"left": {"pos": ...}, "right": {"pos": ...}}`.
 - Existing TUI/session lifecycle from `robots_realtime/rr_session_cli.py:121` and `robots_realtime/rr_session_cli.py:128` is reused.
 - Example config uses `session.start_paused: true`, matching policy config safety pattern at `configs/yam/yam_bimanual_openpi_policy_autolab.yaml:21` and `configs/yam/yam_bimanual_act_policy_xdof_hq.yaml:31`.
 - Robot nodes reuse existing YAM `robot_config` entries and `cmd_topic` fanout patterns from `configs/yam/yam_bimanual_act_policy_xdof_hq.yaml:86` through `configs/yam/yam_bimanual_act_policy_xdof_hq.yaml:108`.
+- Adapter contract must be informed by Mimic-Video architecture references: `MimicVideo.sample`, `CosmosPredictWrapper`, `dim_action`, `dim_joint_state`, `action_chunk_len`, `extract_layer`, and normalization constants.
 
 ### Must NOT Have
 - No LeRobot runtime, `lerobot-record`, `lerobot-rollout`, or LeRobot robot/camera construction in v1.
 - No LeRobotDataset or RR recording output changes in v1.
 - No new dashboard or alternate session manager.
 - No model-specific hardcoded station details in Python: camera serials, YAM config paths, startup poses, and command topics stay in YAML.
-- No hardcoded Cosmos/IDM tensor shapes in Python without checkpoint inspection or explicit YAML override.
+- No hardcoded Cosmos/IDM tensor shapes in Python without evidence from implementation-time checkpoint probing, fake fixtures, or explicit YAML config.
+- No assumption that the model returns a single action vector if Mimic-Video returns action chunks; chunk-to-command behavior must be explicit and tested.
 - No silent action clamping unless explicitly configured; default invalid action behavior is reject/fail closed.
 - No real hardware requirement for automated tests.
 
@@ -104,10 +114,10 @@ Wave 3: Task 7 (integration QA), Task 8 (safety hardening review/docs finalizati
 > Implementation + Test = ONE task. Never separate.
 > EVERY task MUST have: Agent Profile + Parallelization + QA Scenarios.
 
-- [ ] 1. Define Cosmos/IDM checkpoint inspection and policy adapter contract with fake-policy TDD
+- [ ] 1. Probe real Cosmos/IDM artifacts and define adapter contract with fake-policy TDD
 
-  **What to do**: Create `tests/agents/policy_learning/test_cosmos_idm_policy_agent.py`. Add fake Cosmos `.pt` and fake IDM `.pt` fixtures that define the v1 supported contract before implementation: local PyTorch load path, CPU-only checkpoint inspection, discovered tensor/module metadata, device selection (`cpu`, `cuda`, `mps` with unavailable-device failure), required observation keys, optional image keys, normalizer config, action vector shape, and left/right split. Tests must assert the adapter constructor rejects unsupported checkpoint formats, missing paths, missing mapping keys, missing normalizer when `action_normalization: required`, unavailable device, and ambiguous left/right action splits.
-  **Must NOT do**: Do not import real Cosmos/NVIDIA dependencies. Do not require real `.pt` files beyond tiny fake fixtures created in `tmp_path`. Do not start `rr-session` or hardware in this task.
+  **What to do**: First, if the real Cosmos and IDM `.pt` files or their containing directory are available in the workspace, run a read-only CPU probe script from `/tmp` to inspect `torch.load(..., map_location="cpu")` top-level type, keys, nested tensor shapes, metadata fields, and whether either artifact is directly callable/TorchScript/state-dict-only. Cross-check findings against the Mimic-Video reference architecture: confirm whether the checkpoint expects `MimicVideo.sample(prompts, video, joint_state, steps, prefix_action_chunk, ...)`, action chunk output `(B, T_act, D_a)`, `dim_action`, `dim_joint_state`, `action_chunk_len`, `extract_layer`/`extract_layers`, and normalization constants. Save only the summarized findings outside the repo, e.g. `/tmp/rr-inference-evidence/task-1-real-artifact-probe.txt`. Then create `tests/agents/policy_learning/test_cosmos_idm_policy_agent.py` with fake fixtures that encode the discovered contract: supported artifact style, local PyTorch load path, device selection (`cpu`, `cuda`, `mps` with unavailable-device failure), required observation keys, optional image/video keys, prompt field, action chunk shape, action queue/slicing behavior, normalizer config, and left/right split. If the real files are unavailable, proceed with fake fixtures based on Mimic-Video references and mark the real probe as blocked in `/tmp/rr-inference-evidence/task-1-real-artifact-probe.txt`.
+  **Must NOT do**: Do not import heavyweight real Cosmos/NVIDIA dependencies unless the artifact cannot be understood without them and the import is already installed. Do not commit or copy real `.pt` files. Do not require real `.pt` files for tests beyond tiny fake fixtures created in `tmp_path`. Do not start `rr-session` or hardware in this task.
 
   **Recommended Agent Profile**:
   - Category: `quick` - Reason: test-first contract in one test file with fake fixtures.
@@ -121,11 +131,14 @@ Wave 3: Task 7 (integration QA), Task 8 (safety hardening review/docs finalizati
   - Pattern: `tests/runtime/test_rr_session_cli.py:84` - temp YAML config test style.
   - API/Type: `robots_realtime/agents/agent.py:31` - `PolicyAgent` contract to implement.
   - Pattern: `robots_realtime/agents/policy_learning/diffusion_policy_agent.py:29` - learned policy `act()` returns left/right `pos` commands.
+  - External Reference: `https://github.com/mimic-video/mimic-video` - inspect `mimic_video.MimicVideo.sample` and `mimic_video/cosmos_predict.py` before finalizing fake fixtures.
 
   **Acceptance Criteria**:
   - [ ] `uv run pytest tests/agents/policy_learning/test_cosmos_idm_policy_agent.py -q` initially fails because `CosmosIdmPolicyAgent` does not exist or does not validate the contract.
-  - [ ] Test file includes concrete fake Cosmos and IDM `.pt` files saved under `tmp_path`; inspection asserts discovered keys/shapes before fake inference runs.
-  - [ ] Test file includes concrete fake observation: `left.joint_pos=np.zeros(7)`, `right.joint_pos=np.ones(7)`, and fake action tensor of shape `(14,)` split into two `(7,)` commands.
+  - [ ] `/tmp/rr-inference-evidence/task-1-real-artifact-probe.txt` exists and either summarizes discovered real Cosmos/IDM artifact shapes/contracts or states that real artifacts were unavailable.
+  - [ ] Probe summary records whether the model follows Mimic-Video `MimicVideo.sample` semantics and records `dim_action`, `dim_joint_state`, `action_chunk_len`, `extract_layer`, video shape requirements, and normalization constants when discoverable.
+  - [ ] Test file includes fake fixtures that mirror the discovered or assumed Cosmos/IDM contract without requiring real model files.
+  - [ ] Test file includes concrete fake observation: `left.joint_pos=np.zeros(7)`, `right.joint_pos=np.ones(7)`, fake video/history tensor if required by Mimic-Video contract, and fake action chunk tensor shaped `(1, T_act, D_a)` whose first executable action splits into two `(7,)` commands.
   - [ ] Test file includes failure cases for missing checkpoint path, unavailable device, missing observation key, wrong output shape `(13,)`, NaN output, and missing normalization config when required.
 
   **QA Scenarios**:
@@ -142,30 +155,30 @@ Wave 3: Task 7 (integration QA), Task 8 (safety hardening review/docs finalizati
     Expected: Test asserts a clear `ValueError` message containing `unsupported checkpoint`.
     Evidence: /tmp/rr-inference-evidence/task-1-unsupported-checkpoint.txt
 
-  Scenario: Cosmos and IDM checkpoint shape probes are specified
+  Scenario: Real artifact probe informs fake contract
     Tool: Bash
-    Steps: Run `uv run pytest tests/agents/policy_learning/test_cosmos_idm_policy_agent.py -q -k "inspect_checkpoint_shapes or probe_checkpoint"`.
-    Expected: Test asserts fake Cosmos and IDM `.pt` keys/shapes are discovered on CPU and stored in debug metadata.
-    Evidence: /tmp/rr-inference-evidence/task-1-checkpoint-shape-probe.txt
+    Steps: Run a `/tmp/probe_cosmos_idm_artifacts.py` script that takes available real `.pt` paths from the executor's environment or notes they are unavailable, then run `test -s /tmp/rr-inference-evidence/task-1-real-artifact-probe.txt`.
+    Expected: Evidence file exists and contains either summarized artifact type/key/shape findings plus Mimic-Video contract fields or a clear `REAL_ARTIFACTS_UNAVAILABLE` marker.
+    Evidence: /tmp/rr-inference-evidence/task-1-real-artifact-probe.txt
   ```
 
   **Commit**: YES | Message: `add cosmos idm policy contract tests` | Files: [`tests/agents/policy_learning/test_cosmos_idm_policy_agent.py`]
 
-- [ ] 2. Implement `CosmosIdmPolicyAgent` and checkpoint shape probing behind existing `PolicyAgent`
+- [ ] 2. Implement `CosmosIdmPolicyAgent` behind existing `PolicyAgent`
 
-  **What to do**: Add `robots_realtime/agents/policy_learning/cosmos_idm_policy_agent.py`. Implement `CosmosIdmPolicyAgent(PolicyAgent)` with clear sub-functions: resolve configured `cosmos_checkpoint_path` and `idm_checkpoint_path`, inspect each `.pt` on CPU with safe PyTorch loading, summarize discovered keys/tensor shapes/module signatures, validate config against discovered shapes, load runtime model(s), map observations to model input, run inference under `torch.no_grad()`, map action to `{"left": {"pos": np.ndarray}, "right": {"pos": np.ndarray}}`, validate finite values/shape/bounds, expose optional `_chunk` and `_images` only if config supplies them. Support only local PyTorch/TorchScript-style callables needed by fake tests; if a raw `state_dict` requires an unavailable model class, fail with a clear error instructing the user to provide a loader module path in config.
+  **What to do**: Add `robots_realtime/agents/policy_learning/cosmos_idm_policy_agent.py`. Implement `CosmosIdmPolicyAgent(PolicyAgent)` using the contract discovered/encoded in Task 1. Use clear sub-functions: resolve configured checkpoint/model paths, load runtime model(s), validate required config, map RR observations to Mimic-Video-style inputs (`prompts`, video tensor `(B,T,C,H,W)`, `joint_state`, optional `prefix_action_chunk`), run `model.sample(...)` or the discovered equivalent under `torch.no_grad()`, buffer returned action chunks `(B,T_act,D_a)`, pop one action per `act()` call, map action to `{"left": {"pos": np.ndarray}, "right": {"pos": np.ndarray}}`, validate finite values/shape/bounds, expose optional `_chunk` and `_images` only if config supplies them. Support only the artifact/loading style established by Task 1 fake tests; if a raw `state_dict` requires an unavailable model class, fail with a clear error instructing the user to provide a loader module path in config.
   **Must NOT do**: Do not modify `AgentNode` for basic mapping. Do not add LeRobot imports. Do not silently guess joint order, gripper scaling, image preprocessing, normalization, or Cosmos/IDM tensor shapes.
 
   **Adapter Implementation Details**:
-  - Add a small inspection result type, e.g. `CheckpointInfo(kind, path, top_level_type, keys, tensor_shapes, module_class, metadata)`.
-  - Add `inspect_checkpoint(path, kind)` that loads with `map_location="cpu"`, never starts CUDA/MPS, and returns shape metadata for tensors nested in dict/list/module state dicts.
-  - For actual runtime load, support explicit config fields:
-    - `cosmos_checkpoint_path`: required path to the fine-tuned Cosmos `.pt`.
-    - `idm_checkpoint_path`: required path to custom IDM `.pt` if IDM is a separate artifact; optional only if config says `idm: null` / `idm_enabled: false`.
+  - Treat checkpoint probing as implementation discovery, not a mandatory runtime behavior.
+  - For actual runtime load, support explicit config fields determined by Task 1, expected to include:
+    - `cosmos_checkpoint_path` or equivalent path to the fine-tuned Cosmos `.pt` if the adapter directly loads it.
+    - `idm_checkpoint_path` or equivalent path to custom IDM `.pt` if IDM is a separate artifact.
     - `loader`: optional dotted `module:function` for project-specific model construction when `.pt` is a state dict rather than callable module.
-    - `expected_input_shapes` and `expected_action_shape`: explicit overrides that must match inspected shapes or fail with a shape mismatch.
-  - Setup sequence must be: validate paths → inspect Cosmos `.pt` → inspect IDM `.pt` → validate YAML mapping/expected shapes → load callable runtime model(s) → set debug metadata → allow `act()`.
-  - `act()` must refuse to run if inspection failed, model load failed, or config/discovered shape mismatch remains unresolved.
+    - `input_schema`, `action_schema`, `action_chunk_len`, `dim_action`, `dim_joint_state`, `video_shape`, `prompt`, and `extract_layer` or equivalent explicit mapping fields derived from the real-artifact probe and Mimic-Video reference.
+  - Setup sequence must be: validate configured paths/schema → load callable runtime model(s) → validate YAML observation/action/video/prompt mapping → initialize action chunk buffer → set debug metadata → allow `act()`.
+  - `act()` sequence must be: gather latest RR obs → build Mimic-Video input tensors → if action buffer empty, call `sample()`/equivalent → validate returned chunk `(B,T_act,D_a)` → publish `_chunk` for Viser if useful → pop next action → split into left/right commands.
+  - `act()` must refuse to run if model load failed or required mapping/schema remains unresolved.
 
   **Recommended Agent Profile**:
   - Category: `unspecified-high` - Reason: safety-critical adapter with validation and test-driven implementation.
@@ -183,10 +196,11 @@ Wave 3: Task 7 (integration QA), Task 8 (safety hardening review/docs finalizati
   **Acceptance Criteria**:
   - [ ] `uv run pytest tests/agents/policy_learning/test_cosmos_idm_policy_agent.py -q` passes.
   - [ ] `uv run ruff check robots_realtime/agents/policy_learning/cosmos_idm_policy_agent.py tests/agents/policy_learning/test_cosmos_idm_policy_agent.py` passes.
-  - [ ] Adapter debug metadata includes inspected Cosmos and IDM paths, top-level types, and tensor shapes.
-  - [ ] Adapter rejects mismatches between YAML `expected_*_shape` fields and inspected checkpoint/model output shapes before `act()` returns any command.
+  - [ ] Adapter debug metadata includes configured model paths, selected loader, model input schema, action schema, and any shape facts derived from Task 1.
+  - [ ] Adapter rejects mismatches between configured schema and actual fake model output before `act()` returns any command.
   - [ ] Adapter rejects NaN/Inf and wrong action shapes before returning commands to `AgentNode`.
   - [ ] Adapter returns exactly `left.pos.shape == (7,)` and `right.pos.shape == (7,)` for the fake bimanual action.
+  - [ ] Adapter test proves a fake `(1, T_act, 14)` action chunk is buffered and emitted over multiple `act()` calls without re-sampling until empty.
 
   **QA Scenarios**:
   ```
@@ -202,11 +216,11 @@ Wave 3: Task 7 (integration QA), Task 8 (safety hardening review/docs finalizati
     Expected: Tests pass and assert no arm command dict is returned for invalid output; clear exception is raised.
     Evidence: /tmp/rr-inference-evidence/task-2-invalid-output.txt
 
-  Scenario: Checkpoint shape mismatch fails before command output
+  Scenario: Schema mismatch fails before command output
     Tool: Bash
-    Steps: Run `uv run pytest tests/agents/policy_learning/test_cosmos_idm_policy_agent.py -q -k "shape_mismatch or checkpoint_info"`.
-    Expected: Tests pass and assert explicit shape mismatch errors include checkpoint kind (`cosmos` or `idm`) and expected vs discovered shape.
-    Evidence: /tmp/rr-inference-evidence/task-2-checkpoint-shape-mismatch.txt
+    Steps: Run `uv run pytest tests/agents/policy_learning/test_cosmos_idm_policy_agent.py -q -k "shape_mismatch or schema"`.
+    Expected: Tests pass and assert explicit mismatch errors include expected vs actual fake model output shape.
+    Evidence: /tmp/rr-inference-evidence/task-2-schema-shape-mismatch.txt
   ```
 
   **Commit**: YES | Message: `add cosmos idm policy agent` | Files: [`robots_realtime/agents/policy_learning/cosmos_idm_policy_agent.py`, `tests/agents/policy_learning/test_cosmos_idm_policy_agent.py`]
@@ -291,7 +305,7 @@ Wave 3: Task 7 (integration QA), Task 8 (safety hardening review/docs finalizati
 
 - [ ] 5. Add fake-safe Cosmos/IDM inference YAML derived from existing policy configs
 
-  **What to do**: Add `configs/yam/yam_bimanual_cosmos_idm_inference_fake.yaml`. Copy the structure from `yam_bimanual_act_policy_xdof_hq.yaml` or `yam_bimanual_openpi_policy_autolab.yaml`: `session.start_paused: true`, `record_on_unpause: false`, one `AgentNode`, two `RobotNode`s, camera nodes as needed, and one `ViserMonitorNode`. Change only the policy node name/class/kwargs and command topics. Use fake/sample `cosmos_checkpoint_path` and `idm_checkpoint_path` values documented as placeholders for validation tests; do not point to real private models. Include explicit `observation_mapping`, `action_mapping`, `expected_input_shapes`, `expected_action_shape`, `safety`, `device`, and `inference_mode` kwargs.
+  **What to do**: Add `configs/yam/yam_bimanual_cosmos_idm_inference_fake.yaml`. Copy the structure from `yam_bimanual_act_policy_xdof_hq.yaml` or `yam_bimanual_openpi_policy_autolab.yaml`: `session.start_paused: true`, `record_on_unpause: false`, one `AgentNode`, two `RobotNode`s, camera nodes as needed, and one `ViserMonitorNode`. Change only the policy node name/class/kwargs and command topics. Use fake/sample Cosmos/IDM path fields documented as placeholders for validation tests; do not point to real private models. Include explicit `observation_mapping`, `image_topics`, `video_shape`, `prompt`, `action_mapping`, `action_chunk_len`, `input_schema`/`action_schema` or equivalent fields derived from Task 1, `safety`, `device`, and `inference_mode` kwargs.
   **Must NOT do**: Do not duplicate robot configs. Do not change existing ACT/OpenPI configs. Do not enable recording output. Do not set `start_paused: false`.
 
   **Recommended Agent Profile**:
@@ -310,7 +324,7 @@ Wave 3: Task 7 (integration QA), Task 8 (safety hardening review/docs finalizati
   **Acceptance Criteria**:
   - [ ] `uv run rr-session configs/yam/yam_bimanual_cosmos_idm_inference_fake.yaml --validate` exits `0` after Task 4.
   - [ ] Config contains `agent_class: robots_realtime.agents.policy_learning.cosmos_idm_policy_agent:CosmosIdmPolicyAgent`.
-  - [ ] Config contains placeholder `cosmos_checkpoint_path`, placeholder `idm_checkpoint_path`, `expected_input_shapes`, and `expected_action_shape` fields with comments explaining they are validated against inspected `.pt` shapes.
+  - [ ] Config contains placeholder Cosmos/IDM path fields plus explicit schema/mapping/video/prompt/action-chunk fields with comments explaining they should be filled from the Task 1 real-artifact probe and Mimic-Video references.
   - [ ] Config contains `session.start_paused: true` and `session.record_on_unpause: false`.
   - [ ] Robot `cmd_topic` values are `cosmos_idm_policy/left_pos` and `cosmos_idm_policy/right_pos`.
 
@@ -339,7 +353,7 @@ PY`.
 
 - [ ] 6. Document `rr-session` inference deployment and v1 scope
 
-  **What to do**: Update `README.md` or add `docs/inference.md` and link it from README. Explain that `rr-session` is the repo launcher for YAML sessions, show how to deploy `.pt` artifacts by editing the Cosmos/IDM YAML `cosmos_checkpoint_path` and `idm_checkpoint_path`, and state that the adapter inspects both checkpoint files to discover keys/shapes before session startup. State that v1 uses existing TUI/dashboard/arms/cameras. Include a short “Why not LeRobot in v1?” note: artifacts are Cosmos/IDM `.pt`, no LeRobotDataset output is required, and LeRobot can be future backend only.
+  **What to do**: Update `README.md` or add `docs/inference.md` and link it from README. Explain that `rr-session` is the repo launcher for YAML sessions, show how to deploy `.pt` artifacts by editing the Cosmos/IDM YAML path and schema fields, and state that the implementation agent should probe real Cosmos/IDM checkpoints during development to fill the adapter contract. State that `https://github.com/mimic-video/mimic-video` is the model-architecture reference and that runtime does not need to re-probe checkpoints unless the implementer chooses that design. State that v1 uses existing TUI/dashboard/arms/cameras. Include a short “Why not LeRobot in v1?” note: artifacts are Cosmos/IDM `.pt`, no LeRobotDataset output is required, and LeRobot can be future backend only.
   **Must NOT do**: Do not promise support for arbitrary `.pt` formats beyond the implemented loader contract. Do not include private checkpoint paths or hardware serials not already in configs.
 
   **Recommended Agent Profile**:
@@ -357,7 +371,7 @@ PY`.
   **Acceptance Criteria**:
   - [ ] Docs contain command `uv run rr-session configs/yam/yam_bimanual_cosmos_idm_inference_fake.yaml --validate`.
   - [ ] Docs contain command `uv run rr-session configs/yam/yam_bimanual_cosmos_idm_inference_fake.yaml` for actual launch.
-  - [ ] Docs explain `.pt` supported contract, Cosmos/IDM checkpoint shape inspection, expected-shape YAML validation, and explicit unsupported cases.
+  - [ ] Docs explain `.pt` supported contract, Mimic-Video reference architecture, implementation-time Cosmos/IDM checkpoint probing, schema YAML validation, and explicit unsupported cases.
   - [ ] Docs state LeRobot/recording output is out of v1 scope.
 
   **QA Scenarios**:
@@ -436,7 +450,7 @@ PY`.
 
 - [ ] 8. Harden safety/debug surfaces and finalize docs
 
-  **What to do**: Ensure adapter logs or exposes deterministic debug information at setup and per failure: checkpoint path, device, model input keys/shapes, image preprocessing expectations, state vector order, action vector split, latency, and rejection reason. Add tests for debug metadata if represented in code. Finalize docs with a hardware rollout checklist that is agent-executable up to validation and explicitly says real robot handoff requires operator procedures outside automated acceptance.
+  **What to do**: Ensure adapter logs or exposes deterministic debug information at setup and per failure: checkpoint/model path, loader, device, prompt, video shape/history length, model input keys/shapes from configured schema, image preprocessing expectations, state vector order, action chunk length, action vector split, latency, and rejection reason. Add tests for debug metadata if represented in code. Finalize docs with a hardware rollout checklist that is agent-executable up to validation and explicitly says real robot handoff requires operator procedures outside automated acceptance.
   **Must NOT do**: Do not add manual confirmation as acceptance criteria. Do not hide safety failures behind warnings while still sending commands.
 
   **Recommended Agent Profile**:
@@ -454,7 +468,7 @@ PY`.
   **Acceptance Criteria**:
   - [ ] `uv run pytest tests/agents/policy_learning/test_cosmos_idm_policy_agent.py -q -k "debug or safety or latency"` passes.
   - [ ] Docs contain a checklist item for validating config before launch.
-  - [ ] Docs contain explicit failure behavior: checkpoint shape mismatch, invalid output, missing observations, stale observations, and unavailable device fail closed.
+  - [ ] Docs contain explicit failure behavior: schema/model-output shape mismatch, invalid output, missing observations, stale observations, and unavailable device fail closed.
   - [ ] `uv run ruff check robots_realtime/agents/policy_learning tests/agents/policy_learning tests/runtime` passes.
 
   **QA Scenarios**:
@@ -462,7 +476,7 @@ PY`.
   Scenario: Debug metadata identifies model contract
     Tool: Bash
     Steps: Run `uv run pytest tests/agents/policy_learning/test_cosmos_idm_policy_agent.py -q -k debug`.
-    Expected: Test asserts debug info includes checkpoint path, device, input keys/shapes, and action split.
+    Expected: Test asserts debug info includes checkpoint path, device, prompt/video schema, input keys/shapes, action chunk length, and action split.
     Evidence: /tmp/rr-inference-evidence/task-8-debug-metadata.txt
 
   Scenario: Docs list fail-closed behavior
@@ -473,7 +487,7 @@ text = Path('README.md').read_text()
 docs = Path('docs')
 if docs.exists():
     text += '\n' + '\n'.join(p.read_text() for p in docs.glob('*.md'))
-for term in ['fail closed', 'NaN', 'stale observation', 'unavailable device', 'checkpoint shape mismatch']:
+for term in ['fail closed', 'NaN', 'stale observation', 'unavailable device', 'shape mismatch']:
     assert term in text, term
 PY`.
     Expected: All terms appear in the safety/failure section with concrete behavior.
