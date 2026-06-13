@@ -34,6 +34,11 @@ import time
 import numpy as np
 
 from robots_realtime.runtime.node import Node, NodeRole
+from robots_realtime.runtime.safety.config import validate_safety_config
+from robots_realtime.runtime.safety.guardrails import (
+    CommandBoundingBoxGuardrail,
+    InferenceAccelerationGuardrail,
+)
 
 
 class AgentNode(Node):
@@ -58,6 +63,7 @@ class AgentNode(Node):
         gripper_open_deg:  Raw degrees corresponding to gripper fully open (1.0).
         gripper_closed_deg: Raw degrees corresponding to gripper fully closed (0.0).
         writer:          Optional Writer injected at construction for recording.
+        safety:          Optional command safety config from YAML.
     """
 
     role = NodeRole.CONTROLLER
@@ -79,6 +85,7 @@ class AgentNode(Node):
         gripper_open_deg: float = 85.0,
         gripper_closed_deg: float = 5.0,
         writer=None,
+        safety: dict | None = None,
         **kwargs,
     ) -> None:
         self._state_topics = state_topics or {}
@@ -111,6 +118,11 @@ class AgentNode(Node):
         self._normalize_gripper = normalize_gripper
         self._gripper_open_deg = gripper_open_deg
         self._gripper_closed_deg = gripper_closed_deg
+        self._safety_config = safety
+        self._safety_agent_type = "teleop"
+        self._bbox_guardrails: dict[str | None, CommandBoundingBoxGuardrail] = {}
+        self._accel_guardrail: InferenceAccelerationGuardrail | None = None
+        self._last_cmd: dict[str | None, np.ndarray] = {}
 
     # ------------------------------------------------------------------
 
@@ -121,6 +133,7 @@ class AgentNode(Node):
                     f"[{self.name}] AgentNode requires 'agent' or 'agent_class'"
                 )
             self._agent = self._build_agent()
+        self._setup_safety_guardrails()
         if hasattr(self._agent, "reset"):
             self._agent.reset()
 
@@ -184,13 +197,13 @@ class AgentNode(Node):
                 pos = arm_action["pos"] if isinstance(arm_action, dict) else arm_action
                 self.publish(
                     "joint_pos",
-                    {"joint_pos": self._process_pos(pos)},
+                    {"joint_pos": self._process_pos(pos, arm_key=self._arm_key)},
                     ts=ts,
                 )
         elif "pos" in action:
             self.publish(
                 "joint_pos",
-                {"joint_pos": self._process_pos(action["pos"])},
+                {"joint_pos": self._process_pos(action["pos"], arm_key=self._arm_key)},
                 ts=ts,
             )
         else:
@@ -200,7 +213,7 @@ class AgentNode(Node):
                 if isinstance(arm_action, dict) and "pos" in arm_action:
                     self.publish(
                         "joint_pos",
-                        {"joint_pos": self._process_pos(arm_action["pos"])},
+                        {"joint_pos": self._process_pos(arm_action["pos"], arm_key=arm_keys[0])},
                         ts=ts,
                     )
             else:
@@ -209,17 +222,87 @@ class AgentNode(Node):
                     if isinstance(arm_action, dict) and "pos" in arm_action:
                         self.publish(
                             f"{key}_pos",
-                            {"joint_pos": self._process_pos(arm_action["pos"])},
+                            {"joint_pos": self._process_pos(arm_action["pos"], arm_key=key)},
                             ts=ts,
                         )
 
-    def _process_pos(self, pos) -> np.ndarray:
+    def _process_pos(self, pos, arm_key: str | None = None) -> np.ndarray:
         pos = np.asarray(pos, dtype=np.float32)
         if self._normalize_gripper and len(pos) > 6:
             span = self._gripper_open_deg - self._gripper_closed_deg
             pos = pos.copy()
             pos[-1] = float(np.clip((pos[-1] - self._gripper_closed_deg) / span, 0.0, 1.0))
+        guardrail_key = self._resolve_guardrail_key(arm_key)
+        if self._safety_agent_type == "inference" and self._accel_guardrail is not None:
+            prev_cmd = self._last_cmd.get(guardrail_key)
+            if prev_cmd is not None:
+                pos = self._accel_guardrail.apply(prev_cmd, pos)
+        bbox_guardrail = self._bbox_guardrails.get(guardrail_key)
+        if bbox_guardrail is not None:
+            pos = bbox_guardrail.apply(pos)
+        self._last_cmd[guardrail_key] = pos.copy()
         return pos
+
+    def _setup_safety_guardrails(self) -> None:
+        self._bbox_guardrails = {}
+        self._accel_guardrail = None
+        self._last_cmd = {}
+
+        if not self._safety_config:
+            self._safety_agent_type = "teleop"
+            return
+
+        cfg = self._safety_config
+        mode = cfg.get("mode", "sim")
+        self._safety_agent_type = cfg.get("agent_type", "teleop")
+        acceleration_limit = cfg.get("acceleration_limit")
+
+        arms = cfg.get("arms") or {}
+        if arms:
+            for arm_key, arm_cfg in arms.items():
+                bbox = arm_cfg.get("bounding_box")
+                validate_safety_config(
+                    {
+                        "mode": mode,
+                        "agent_type": self._safety_agent_type,
+                        "bounding_box": bbox,
+                        "acceleration_limit": acceleration_limit,
+                    }
+                )
+                if bbox is not None:
+                    self._bbox_guardrails[arm_key] = CommandBoundingBoxGuardrail(
+                        bbox["min"], bbox["max"]
+                    )
+        else:
+            bbox = cfg.get("bounding_box")
+            validate_safety_config(
+                {
+                    "mode": mode,
+                    "agent_type": self._safety_agent_type,
+                    "bounding_box": bbox,
+                    "acceleration_limit": acceleration_limit,
+                }
+            )
+            if bbox is not None:
+                self._bbox_guardrails[None] = CommandBoundingBoxGuardrail(
+                    bbox["min"], bbox["max"]
+                )
+
+        if self._safety_agent_type == "inference" and acceleration_limit is not None:
+            self._accel_guardrail = InferenceAccelerationGuardrail(
+                float(acceleration_limit)
+            )
+
+    def _resolve_guardrail_key(self, arm_key: str | None) -> str | None:
+        if arm_key in self._bbox_guardrails:
+            return arm_key
+        if self._arm_key in self._bbox_guardrails:
+            return self._arm_key
+        if None in self._bbox_guardrails:
+            return None
+        if len(self._bbox_guardrails) == 1:
+            return next(iter(self._bbox_guardrails))
+        return arm_key
 
     def cleanup(self) -> None:
         if self._agent is not None and hasattr(self._agent, "close"):
@@ -240,4 +323,5 @@ class AgentNode(Node):
             "normalize_gripper": params.get("normalize_gripper", False),
             "gripper_open_deg": params.get("gripper_open_deg", 85.0),
             "gripper_closed_deg": params.get("gripper_closed_deg", 5.0),
+            "safety": params.get("safety"),
         }

@@ -72,29 +72,30 @@ def test_invalid_nan_inf_and_min_greater_than_max_configs_fail():
 def test_invalid_safety_config_fails_before_agent_reset():
     """Invalid safety config should raise before agent.reset() is called."""
     from robots_realtime.runtime.agent_node import AgentNode
+    from robots_realtime.runtime.node import Node
     from unittest.mock import MagicMock, patch
     
     bad_cfg = {
         "mode": "real",
         "agent_type": "inference",
-        "bounding_box": None,
+        "arms": {"left": {"bounding_box": None}},
         "acceleration_limit": None,
     }
     
-    with patch.object(AgentNode, '_load_safety_config', return_value=bad_cfg):
-        mock_agent = MagicMock(spec=AgentNode)
-        mock_agent.reset = MagicMock()
-        
-        try:
-            # Validation should fire during init/reset, before the actual agent reset
-            from robots_realtime.runtime.safety.config import validate_safety_config
-            validate_safety_config(bad_cfg)
-            assert False, "Should have raised ValueError"
-        except ValueError:
-            mock_agent.reset.assert_not_called()
-            pass
-        except NotImplementedError:
-            raise NotImplementedError("AgentNode safety validation not implemented yet")
+    mock_agent = MagicMock()
+    mock_agent.reset = MagicMock()
+    
+    with patch.object(Node, "__init__", return_value=None):
+        node = AgentNode(agent=mock_agent, name="agent", safety=bad_cfg)
+    node.name = "agent"
+    node.publish = MagicMock()
+    
+    # _setup_safety_guardrails() runs before agent.reset() in setup()
+    with pytest.raises(ValueError, match="[Bb]ounding"):
+        node.setup()
+    
+    # agent.reset() must NOT have been called
+    mock_agent.reset.assert_not_called()
 
 def test_clamp_event_is_logged_or_counted_with_arm_and_guardrail_name():
     """Clamp events should include arm key, guardrail name, original/clamped command, timestamp."""
