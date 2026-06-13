@@ -16,6 +16,24 @@ nodes:
     arm_key: left
     loop_mode: flat_out
 
+    # Safety config for simulation teleop.
+    # These are command-space joint-position limits, NOT Cartesian workspace
+    # limits. Position indices [0..5] map to the six revolute DOFs of the
+    # follower arm; gripper index 6 is excluded from positional clamping.
+    # Numeric ranges chosen as QA-safe bounds for the GELLO leader → YAM
+    # follower kinematic chain in simulation. Teleop does not use
+    # acceleration_limit (only inference agents need it).
+    safety:
+      mode: sim
+      agent_type: teleop
+      arms:
+        left:
+          position_indices: [0, 1, 2, 3, 4, 5]
+          gripper_index: 6
+          bounding_box:
+            min: [-2.5, -2.5, -2.5, -2.5, -2.5, -2.5]
+            max: [2.5, 2.5, 2.5, 2.5, 2.5, 2.5]
+
   - type: AgentNode
     name: gello_right
     agent_class: robots_realtime.agents.teleoperation.gello_leader_agent:GelloLeaderAgent
@@ -26,6 +44,24 @@ nodes:
       joint_signs: [-1, -1, -1, -1, -1, -1]
     arm_key: right
     loop_mode: flat_out
+
+    # Safety config for simulation teleop.
+    # These are command-space joint-position limits, NOT Cartesian workspace
+    # limits. Position indices [0..5] map to the six revolute DOFs of the
+    # follower arm; gripper index 6 is excluded from positional clamping.
+    # Numeric ranges chosen as QA-safe bounds for the GELLO leader -> YAM
+    # follower kinematic chain in simulation. Teleop does not use
+    # acceleration_limit (only inference agents need it).
+    safety:
+      mode: sim
+      agent_type: teleop
+      arms:
+        right:
+          position_indices: [0, 1, 2, 3, 4, 5]
+          gripper_index: 6
+          bounding_box:
+            min: [-2.5, -2.5, -2.5, -2.5, -2.5, -2.5]
+            max: [2.5, 2.5, 2.5, 2.5, 2.5, 2.5]
 
   - type: XdofSimNode
     name: yam
