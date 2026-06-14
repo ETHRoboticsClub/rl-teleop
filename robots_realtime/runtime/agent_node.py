@@ -35,7 +35,8 @@ import time
 import numpy as np
 
 from robots_realtime.runtime.node import Node, NodeRole
-from robots_realtime.runtime.safety.config import validate_safety_config
+from robots_realtime.runtime.safety.config import validate_cartesian_workspace_config, validate_safety_config
+from robots_realtime.runtime.safety.cartesian import CartesianWorkspaceRejectGuardrail
 from robots_realtime.runtime.safety.guardrails import (
     CommandBoundingBoxGuardrail,
     InferenceAccelerationGuardrail,
@@ -122,22 +123,69 @@ class AgentNode(Node):
         self._safety_config = safety
         self._safety_agent_type = "teleop"
         self._bbox_guardrails: dict[str | None, CommandBoundingBoxGuardrail] = {}
+        self._cartesian_guardrails: dict[str | None, CartesianWorkspaceRejectGuardrail] = {}
         self._accel_guardrail: InferenceAccelerationGuardrail | None = None
         self._last_cmd: dict[str | None, np.ndarray] = {}
         self._clamp_log: list[dict] = []
 
     # ------------------------------------------------------------------
 
-    def setup(self) -> None:
+    def setup(self, fk_factory=None) -> None:
         if self._agent is None:
             if self._agent_class is None:
                 raise RuntimeError(
                     f"[{self.name}] AgentNode requires 'agent' or 'agent_class'"
                 )
             self._agent = self._build_agent()
-        self._setup_safety_guardrails()
+        self._setup_safety_guardrails(fk_factory=fk_factory)
+        self._validate_cartesian_startup()
         if hasattr(self._agent, "reset"):
             self._agent.reset()
+
+    def _validate_cartesian_startup(self) -> None:
+        """Validate cartesian workspace guardrails before agent reset.
+
+        Fails closed if:
+        - cartesian_workspace enabled but no production_current_state provided
+        - initial follower state is outside cartesian bounds
+        """
+        if not self._safety_config:
+            return
+
+        cfg = self._safety_config
+        arms = cfg.get("arms", {})
+        current_state = cfg.get("production_current_state")
+
+        for arm_key, arm_cfg in arms.items():
+            cw = arm_cfg.get("cartesian_workspace")
+            if not cw or not cw.get("enabled"):
+                continue
+
+            # Must have current state for real mode
+            if cfg.get("mode") == "real" and current_state is None:
+                raise ValueError(
+                    f"Cartesian workspace enabled for arm '{arm_key}' but "
+                    "production_current_state is missing. Guarded teleop requires "
+                    "initial follower state to initialize last_safe. "
+                    "Set production_current_state in safety config."
+                )
+
+            # FK-check initial state
+            if current_state and arm_key in current_state:
+                qpos = current_state[arm_key].get("qpos")
+                if qpos is not None and arm_key in self._cartesian_guardrails:
+                    guardrail = self._cartesian_guardrails[arm_key]
+                    q = np.asarray(qpos, dtype=np.float64)
+                    xyz = guardrail._fk_xyz(q)
+                    if not guardrail._is_in_bounds(xyz):
+                        raise ValueError(
+                            f"Cartesian workspace startup validation failed for arm '{arm_key}': "
+                            f"initial pose FK position {xyz.tolist()} is outside bounds "
+                            f"[{guardrail._min_xyz.tolist()}, {guardrail._max_xyz.tolist()}]. "
+                            "Guarded teleop fails closed. Move arm to safe position before starting."
+                        )
+                    # Initialize last_safe from current state
+                    guardrail.mark_published_safe(q)
 
     def _build_agent(self):
         ref = self._agent_class
@@ -235,6 +283,17 @@ class AgentNode(Node):
             pos = pos.copy()
             pos[-1] = float(np.clip((pos[-1] - self._gripper_closed_deg) / span, 0.0, 1.0))
         guardrail_key = self._resolve_guardrail_key(arm_key)
+
+        # Cartesian workspace guardrail (FK-based reject/hold)
+        cw_guardrail = self._cartesian_guardrails.get(guardrail_key)
+        if cw_guardrail is not None:
+            result = cw_guardrail.apply(pos)
+            if result.state != "accepted":
+                original = pos.copy()
+                pos = result.final_command
+                if not np.array_equal(pos, original):
+                    self._log_clamp(guardrail_key, "cartesian", original, pos)
+
         if self._safety_agent_type == "inference" and self._accel_guardrail is not None:
             prev_cmd = self._last_cmd.get(guardrail_key)
             if prev_cmd is not None:
@@ -248,6 +307,11 @@ class AgentNode(Node):
             pos = bbox_guardrail.apply(pos)
             if not np.array_equal(pos, original):
                 self._log_clamp(guardrail_key, "bbox", original, pos)
+
+        # Update cartesian last_safe with final published command
+        if cw_guardrail is not None:
+            cw_guardrail.mark_published_safe(pos)
+
         self._last_cmd[guardrail_key] = pos.copy()
         return pos
 
@@ -266,8 +330,9 @@ class AgentNode(Node):
             f"original={original.tolist()}, clamped={clamped.tolist()}"
         )
 
-    def _setup_safety_guardrails(self) -> None:
+    def _setup_safety_guardrails(self, fk_factory=None) -> None:
         self._bbox_guardrails = {}
+        self._cartesian_guardrails = {}
         self._accel_guardrail = None
         self._last_cmd = {}
         self._clamp_log = []
@@ -302,8 +367,60 @@ class AgentNode(Node):
                     self._bbox_guardrails[arm_key] = CommandBoundingBoxGuardrail(
                         bbox["min"], bbox["max"]
                     )
+
+                # Cartesian workspace guardrail
+                cw = arm_cfg.get("cartesian_workspace")
+                if cw and cw.get("enabled"):
+                    try:
+                        validate_cartesian_workspace_config(
+                            {
+                                "agent_type": self._safety_agent_type,
+                                "site_name": cw.get("site_name"),
+                                "xml_path": cw.get("xml_path"),
+                                "frame": cw.get("frame"),
+                                "min_xyz": cw.get("min_xyz"),
+                                "max_xyz": cw.get("max_xyz"),
+                                "enforcement": cw.get("enforcement"),
+                            }
+                        )
+                    except ValueError as e:
+                        raise ValueError(
+                            f"Cartesian workspace validation failed for arm '{arm_key}': {e}"
+                        ) from e
+
+                    # Convert reentry_max_velocity_rad_s to per-cycle delta
+                    control_hz = cw.get("configured_control_hz", 200.0)
+                    reentry_delta = cw.get("reentry_max_velocity_rad_s", 1.0) / control_hz
+
+                    # Get FK provider from factory (allows test mocking)
+                    fk = None
+                    if fk_factory is not None:
+                        fk = fk_factory(cw.get("xml_path"), cw.get("site_name"))
+                    else:
+                        try:
+                            from i2rt.robots.kinematics import Kinematics
+                            fk = Kinematics(cw["xml_path"], cw["site_name"])
+                        except (ImportError, KeyError, ValueError):
+                            fk = None
+
+                    if fk is not None:
+                        pass_through = cw.get("pass_through_indices", [])
+                        self._cartesian_guardrails[arm_key] = CartesianWorkspaceRejectGuardrail(
+                            fk_provider=fk,
+                            arm_key=arm_key,
+                            site_name=cw["site_name"],
+                            min_xyz=cw["min_xyz"],
+                            max_xyz=cw["max_xyz"],
+                            tolerance_m=cw.get("tolerance_m", 1e-4),
+                            reentry_margin_m=cw.get("reentry_margin_m", 0.002),
+                            reentry_max_delta_per_cycle=reentry_delta,
+                            pass_through_indices=pass_through,
+                        )
+
             if len(self._bbox_guardrails) == 1:
                 self._bbox_guardrails[None] = next(iter(self._bbox_guardrails.values()))
+            if len(self._cartesian_guardrails) == 1:
+                self._cartesian_guardrails[None] = next(iter(self._cartesian_guardrails.values()))
         else:
             bbox = cfg.get("bounding_box")
             validate_safety_config(

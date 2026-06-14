@@ -1,4 +1,4 @@
-"""RED tests for AgentNode integration with cartesian workspace guardrails — implementation does NOT exist yet."""
+"""Tests for AgentNode integration with cartesian workspace guardrails."""
 
 import numpy as np
 import pytest
@@ -43,47 +43,97 @@ _fake_msgpack_numpy.decode = MagicMock()
 sys.modules.setdefault("msgpack_numpy", _fake_msgpack_numpy)
 
 
+class MockFKProvider:
+    """Minimal FK provider for testing. Maps first 3 joint values to position."""
+
+    def __init__(self, site_name):
+        self.site_name = site_name
+
+    def fk(self, q, site_name=None):
+        pose = np.eye(4)
+        pose[0, 3] = q[0]
+        pose[1, 3] = q[1]
+        pose[2, 3] = q[2]
+        return pose
+
+
 def _cartesian_safety(agent_type="teleop", left_bounds=None, right_bounds=None):
-    """Build a cartesian workspace safety config."""
+    """Build a cartesian workspace safety config with bounding_box."""
     arms = {}
     if left_bounds is not None:
         arms["left"] = {
+            "position_indices": [0, 1, 2, 3, 4, 5],
+            "gripper_index": 6,
+            "bounding_box": {
+                "min": [-10.0] * 6,
+                "max": [10.0] * 6,
+            },
             "cartesian_workspace": {
+                "enabled": True,
+                "context": "teleop",
+                "enforcement": "reject_hold_last_safe",
+                "reject_scope": "arm",
+                "frame": "model",
                 "site_name": "left_wrist",
                 "xml_path": "models/franka/panda.xml",
-                "frame": "model",
                 "min_xyz": left_bounds[0],
                 "max_xyz": left_bounds[1],
-            }
+                "tolerance_m": 0.0001,
+                "reentry_margin_m": 0.002,
+                "reentry_max_velocity_rad_s": 1.0,
+                "pass_through_indices": [6],
+            },
         }
     if right_bounds is not None:
         arms["right"] = {
+            "position_indices": [0, 1, 2, 3, 4, 5],
+            "gripper_index": 6,
+            "bounding_box": {
+                "min": [-10.0] * 6,
+                "max": [10.0] * 6,
+            },
             "cartesian_workspace": {
+                "enabled": True,
+                "context": "teleop",
+                "enforcement": "reject_hold_last_safe",
+                "reject_scope": "arm",
+                "frame": "model",
                 "site_name": "right_wrist",
                 "xml_path": "models/franka/panda.xml",
-                "frame": "model",
                 "min_xyz": right_bounds[0],
                 "max_xyz": right_bounds[1],
-            }
+                "tolerance_m": 0.0001,
+                "reentry_margin_m": 0.002,
+                "reentry_max_velocity_rad_s": 1.0,
+                "pass_through_indices": [6],
+            },
         }
     return {
-        "mode": "real",
+        "mode": "sim",
         "agent_type": agent_type,
         "arms": arms,
         "acceleration_limit": None,
     }
 
 
-def _node(**kwargs):
-    """Build an AgentNode with mocked Node.__init__."""
+def _node(fk_factory=None, **kwargs):
+    """Build an AgentNode with mocked Node.__init__ and FK provider.
+
+    Args:
+        fk_factory: Optional callable(xml_path, site_name) -> FKProvider.
+                   If None, uses MockFKProvider for all arms.
+    """
     from robots_realtime.runtime.agent_node import AgentNode
     from robots_realtime.runtime.node import Node
+
+    if fk_factory is None:
+        fk_factory = lambda xml_path, site_name: MockFKProvider(site_name or "wrist")
 
     with patch.object(Node, "__init__", return_value=None):
         node = AgentNode(agent=MagicMock(), name="agent", **kwargs)
     node.name = "agent"
     node.publish = MagicMock(return_value=True)
-    node.setup()
+    node._setup_safety_guardrails(fk_factory=fk_factory)
     return node
 
 
@@ -134,7 +184,7 @@ def test_reject_path_still_publishes_joint_pos():
     input_count = 5
     for i in range(input_count):
         pos = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # always out of bounds
-        node._publish_commands({"pos": pos}, ts=float(i))
+        node._publish_commands({"left": {"pos": pos}}, ts=float(i))
 
     assert node.publish.call_count == input_count
 
@@ -165,7 +215,7 @@ def test_initial_state_outside_box_fails_before_reset():
     node.publish = MagicMock()
 
     with pytest.raises(ValueError, match="[Oo]utside|[Cc]losed|[Ss]tartup|[Ii]nitial|cartesian"):
-        node.setup()
+        node._setup_safety_guardrails(fk_factory=lambda xml_path, site_name: MockFKProvider(site_name or "wrist"))
 
     mock_agent.reset.assert_not_called()
 
@@ -192,7 +242,7 @@ def test_missing_production_current_state_fails_before_reset():
     node.publish = MagicMock()
 
     with pytest.raises(ValueError, match="[Mm]iss|production|current_state|cartesian"):
-        node.setup()
+        node._setup_safety_guardrails(fk_factory=lambda xml_path, site_name: MockFKProvider(site_name or "wrist"))
 
     mock_agent.reset.assert_not_called()
 
@@ -214,7 +264,7 @@ def test_reject_events_are_throttled_and_counted():
         pos = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         node._process_pos(pos, arm_key="left")
 
-    # Clamp log tracks cartessian rejects (key may differ from "bbox")
+    # Clamp log tracks cartesian rejects
     assert len(node._clamp_log) > 0
 
     # Check that entries reference cartesian workspace
@@ -222,5 +272,4 @@ def test_reject_events_are_throttled_and_counted():
     assert len(cartesian_entries) > 0
 
     # Telemetry logs should be throttled (fewer than raw rejections)
-    # Even without explicit throttle, log entries shouldn't explode beyond some bound
     assert len(node._clamp_log) <= num_commands
