@@ -27,9 +27,6 @@ nodes:
         left:
           position_indices: [0, 1, 2, 3, 4, 5]
           gripper_index: 6
-          bounding_box:
-            min: [null, null, null, null, null, null]
-            max: [null, null, null, null, null, null]
           cartesian_workspace:
             enabled: true
             context: teleop
@@ -67,9 +64,6 @@ nodes:
         right:
           position_indices: [0, 1, 2, 3, 4, 5]
           gripper_index: 6
-          bounding_box:
-            min: [null, null, null, null, null, null]
-            max: [null, null, null, null, null, null]
           cartesian_workspace:
             enabled: true
             context: teleop

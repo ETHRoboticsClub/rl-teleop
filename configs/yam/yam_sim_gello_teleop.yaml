@@ -30,14 +30,6 @@ nodes:
         left:
           position_indices: [0, 1, 2, 3, 4, 5]
           gripper_index: 6
-          bounding_box:
-            min: [-2.5, -2.5, -2.5, -2.5, -2.5, -2.5]
-            max: [2.5, 2.5, 2.5, 2.5, 2.5, 2.5]
-
-          # Cartesian workspace guardrail for true FK-based workspace safety.
-          # Unlike bounding_box (which is joint-space), these are model-frame
-          # Cartesian meters for the TCP site. Values below are QA-safe
-          # placeholders for the bimanual YAM sim scene.
           cartesian_workspace:
             enabled: true
             context: teleop
@@ -77,14 +69,6 @@ nodes:
         right:
           position_indices: [0, 1, 2, 3, 4, 5]
           gripper_index: 6
-          bounding_box:
-            min: [-2.5, -2.5, -2.5, -2.5, -2.5, -2.5]
-            max: [2.5, 2.5, 2.5, 2.5, 2.5, 2.5]
-
-          # Cartesian workspace guardrail for true FK-based workspace safety.
-          # Unlike bounding_box (which is joint-space), these are model-frame
-          # Cartesian meters for the TCP site. Values below are QA-safe
-          # placeholders for the bimanual YAM sim scene.
           cartesian_workspace:
             enabled: true
             context: teleop

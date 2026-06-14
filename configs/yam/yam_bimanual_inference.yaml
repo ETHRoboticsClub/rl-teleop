@@ -75,18 +75,11 @@ nodes:
     poll_freq: 30
 
     # ── Safety config (FAILS CLOSED until filled) ────────────────────────
-    # WARNING: Values below are command-space joint-position limits, NOT
-    # Cartesian workspace limits. Position indices [0..5] correspond to the
-    # six revolute joints; gripper index 6 is excluded from clamping by
-    # default. Each list entry maps 1:1 to the DOF order in the robot's
-    # joint_state message. Fill in site-specific finite numeric values
-    # before deployment on real hardware — the safety validator will reject
-    # this config as-is and refuse to start.
-    #
-    # Bounding box format:
-    #   bounding_box:
-    #     min: [joint_0_lo, joint_1_lo, ..., joint_5_lo]
-    #     max: [joint_0_hi, joint_1_hi, ..., joint_5_hi]
+    # WARNING: Values below are Cartesian workspace limits (model-frame
+    # meters for the TCP site). Fill in site_name, xml_path, min_xyz,
+    # max_xyz with site-specific finite numeric values before deployment
+    # on real hardware — the safety validator will reject this config
+    # as-is and refuse to start.
     safety:
       mode: real
       agent_type: inference
@@ -94,9 +87,6 @@ nodes:
         left:
           position_indices: [0, 1, 2, 3, 4, 5]
           gripper_index: 6
-          bounding_box:
-            min: [null, null, null, null, null, null]
-            max: [null, null, null, null, null, null]
           cartesian_workspace:
             enabled: true
             context: teleop
@@ -114,9 +104,6 @@ nodes:
         right:
           position_indices: [0, 1, 2, 3, 4, 5]
           gripper_index: 6
-          bounding_box:
-            min: [null, null, null, null, null, null]
-            max: [null, null, null, null, null, null]
           cartesian_workspace:
             enabled: true
             context: teleop
