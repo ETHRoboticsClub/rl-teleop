@@ -34,6 +34,24 @@ nodes:
             min: [-2.5, -2.5, -2.5, -2.5, -2.5, -2.5]
             max: [2.5, 2.5, 2.5, 2.5, 2.5, 2.5]
 
+          # Cartesian workspace guardrail for true FK-based workspace safety.
+          # Unlike bounding_box (which is joint-space), these are model-frame
+          # Cartesian meters for the TCP site. Values below are QA-safe
+          # placeholders for the bimanual YAM sim scene.
+          cartesian_workspace:
+            enabled: true
+            context: teleop
+            enforcement: reject_hold_last_safe
+            frame: model
+            reject_scope: arm
+            xml_path: robots_realtime/sim/models/yam_bimanual_scene.xml
+            site_name: left_tcp_site
+            min_xyz: [-0.5, -0.3, 0.0]
+            max_xyz: [0.5, 0.3, 0.5]
+            tolerance_m: 0.0001
+            reentry_margin_m: 0.002
+            reentry_max_velocity_rad_s: 1.0
+
   - type: AgentNode
     name: gello_right
     agent_class: robots_realtime.agents.teleoperation.gello_leader_agent:GelloLeaderAgent
@@ -62,6 +80,24 @@ nodes:
           bounding_box:
             min: [-2.5, -2.5, -2.5, -2.5, -2.5, -2.5]
             max: [2.5, 2.5, 2.5, 2.5, 2.5, 2.5]
+
+          # Cartesian workspace guardrail for true FK-based workspace safety.
+          # Unlike bounding_box (which is joint-space), these are model-frame
+          # Cartesian meters for the TCP site. Values below are QA-safe
+          # placeholders for the bimanual YAM sim scene.
+          cartesian_workspace:
+            enabled: true
+            context: teleop
+            enforcement: reject_hold_last_safe
+            frame: model
+            reject_scope: arm
+            xml_path: robots_realtime/sim/models/yam_bimanual_scene.xml
+            site_name: right_tcp_site
+            min_xyz: [-0.5, -0.3, 0.0]
+            max_xyz: [0.5, 0.3, 0.5]
+            tolerance_m: 0.0001
+            reentry_margin_m: 0.002
+            reentry_max_velocity_rad_s: 1.0
 
   - type: XdofSimNode
     name: yam

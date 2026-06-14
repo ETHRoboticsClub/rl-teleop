@@ -89,12 +89,40 @@ nodes:
           bounding_box:
             min: [null, null, null, null, null, null]
             max: [null, null, null, null, null, null]
+          cartesian_workspace:
+            enabled: true
+            context: teleop
+            enforcement: reject_hold_last_safe
+            reject_scope: arm
+            frame: model
+            site_name: null
+            xml_path: null
+            min_xyz: [null, null, null]
+            max_xyz: [null, null, null]
+            tolerance_m: 0.0001
+            reentry_margin_m: 0.002
+            reentry_max_velocity_rad_s: 1.0
+            pass_through_indices: [6]
         right:
           position_indices: [0, 1, 2, 3, 4, 5]
           gripper_index: 6
           bounding_box:
             min: [null, null, null, null, null, null]
             max: [null, null, null, null, null, null]
+          cartesian_workspace:
+            enabled: true
+            context: teleop
+            enforcement: reject_hold_last_safe
+            reject_scope: arm
+            frame: model
+            site_name: null
+            xml_path: null
+            min_xyz: [null, null, null]
+            max_xyz: [null, null, null]
+            tolerance_m: 0.0001
+            reentry_margin_m: 0.002
+            reentry_max_velocity_rad_s: 1.0
+            pass_through_indices: [6]
       acceleration_limit: null  # MUST be a finite float for real inference
 
   # (A) OpenPI / π₀ — remote websocket server. Zero Python work.

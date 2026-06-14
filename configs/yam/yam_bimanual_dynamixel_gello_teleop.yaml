@@ -38,6 +38,34 @@ nodes:
     arm_key: left
     loop_mode: flat_out
 
+    # Safety config for real hardware teleop.
+    # WARNING: Values below are null placeholders that will fail closed
+    # until filled with site-specific finite numeric values.
+    safety:
+      mode: real
+      agent_type: teleop
+      arms:
+        left:
+          position_indices: [0, 1, 2, 3, 4, 5]
+          gripper_index: 6
+          bounding_box:
+            min: [null, null, null, null, null, null]
+            max: [null, null, null, null, null, null]
+          cartesian_workspace:
+            enabled: true
+            context: teleop
+            enforcement: reject_hold_last_safe
+            reject_scope: arm
+            frame: model
+            site_name: null
+            xml_path: null
+            min_xyz: [null, null, null]
+            max_xyz: [null, null, null]
+            tolerance_m: 0.0001
+            reentry_margin_m: 0.002
+            reentry_max_velocity_rad_s: 1.0
+            pass_through_indices: [6]
+
   - type: AgentNode
     name: gello_right
     pinned_cpu: 8
@@ -65,6 +93,34 @@ nodes:
       gripper_spring_current_limit: 100   # matches yams-robot-server's current-based position trigger spring
     arm_key: right
     loop_mode: flat_out
+
+    # Safety config for real hardware teleop.
+    # WARNING: Values below are null placeholders that will fail closed
+    # until filled with site-specific finite numeric values.
+    safety:
+      mode: real
+      agent_type: teleop
+      arms:
+        right:
+          position_indices: [0, 1, 2, 3, 4, 5]
+          gripper_index: 6
+          bounding_box:
+            min: [null, null, null, null, null, null]
+            max: [null, null, null, null, null, null]
+          cartesian_workspace:
+            enabled: true
+            context: teleop
+            enforcement: reject_hold_last_safe
+            reject_scope: arm
+            frame: model
+            site_name: null
+            xml_path: null
+            min_xyz: [null, null, null]
+            max_xyz: [null, null, null]
+            tolerance_m: 0.0001
+            reentry_margin_m: 0.002
+            reentry_max_velocity_rad_s: 1.0
+            pass_through_indices: [6]
 
   - type: RobotNode
     name: yam_left
