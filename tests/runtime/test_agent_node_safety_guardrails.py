@@ -40,16 +40,12 @@ _fake_msgpack_numpy.decode = MagicMock()
 sys.modules.setdefault("msgpack_numpy", _fake_msgpack_numpy)
 
 
-def _safety(agent_type="teleop", left_bbox=None, right_bbox=None, acceleration_limit=0.25):
-    arms = {}
-    if left_bbox is not None:
-        arms["left"] = {"bounding_box": left_bbox}
-    if right_bbox is not None:
-        arms["right"] = {"bounding_box": right_bbox}
+def _safety(agent_type="teleop", acceleration_limit=0.25):
+    """Build a safety config (Cartesian-only, no bounding_box)."""
     return {
-        "mode": "real",
+        "mode": "sim",
         "agent_type": agent_type,
-        "arms": arms,
+        "arms": {},
         "acceleration_limit": acceleration_limit,
     }
 
@@ -65,30 +61,31 @@ def _node(**kwargs):
     node.setup()
     return node
 
-def test_teleop_applies_bbox_but_not_acceleration():
-    """Teleop should only apply bbox, not acceleration limiting."""
+
+def test_teleop_no_bbox_clamp_passthrough():
+    """Teleop should pass through positions without bbox clamping after migration."""
     node = _node(
         safety=_safety(
             agent_type="teleop",
-            left_bbox={"min": [-10.0] * 6, "max": [10.0] * 6},
-            acceleration_limit=0.25,
+            acceleration_limit=None,
         )
     )
 
+    # Without bbox guardrails, positions pass through unchanged
     first = node._process_pos(np.zeros(6), arm_key="left")
     second = node._process_pos(np.array([9.0, 8.0, 7.0, 6.0, 5.0, 4.0]), arm_key="left")
-    out_of_bounds = node._process_pos(np.array([99.0, -99.0, 0.0, 0.0, 0.0, 0.0]), arm_key="left")
+    large = node._process_pos(np.array([99.0, -99.0, 0.0, 0.0, 0.0, 0.0]), arm_key="left")
 
     np.testing.assert_allclose(first, np.zeros(6, dtype=np.float32))
     np.testing.assert_allclose(second, np.array([9.0, 8.0, 7.0, 6.0, 5.0, 4.0], dtype=np.float32))
-    np.testing.assert_allclose(out_of_bounds, np.array([10.0, -10.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    np.testing.assert_allclose(large, np.array([99.0, -99.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32))
 
-def test_inference_applies_bbox_and_acceleration():
-    """Inference should apply both bbox and acceleration limiting."""
+
+def test_inference_applies_acceleration_only():
+    """Inference should apply acceleration limiting (no bbox clamping)."""
     node = _node(
         safety=_safety(
             agent_type="inference",
-            left_bbox={"min": [-1.0] * 6, "max": [1.0] * 6},
             acceleration_limit=0.25,
         )
     )
@@ -101,15 +98,12 @@ def test_inference_applies_bbox_and_acceleration():
     np.testing.assert_allclose(second, np.array([0.25, -0.25, 0.1, 0.0, 0.0, 0.0], dtype=np.float32))
     np.testing.assert_allclose(third, np.array([0.5, -0.5, 0.35, 0.0, 0.0, 0.0], dtype=np.float32))
 
-def test_arm_key_path_applies_matching_arm_safety_config():
-    """When arm_key is set, safety config for that arm should be applied."""
+
+def test_arm_key_path_publishes_without_bbox_clamp():
+    """When arm_key is set, position passes through without bbox clamping."""
     node = _node(
         arm_key="right",
-        safety=_safety(
-            agent_type="teleop",
-            left_bbox={"min": [0.0] * 6, "max": [1.0] * 6},
-            right_bbox={"min": [-0.5] * 6, "max": [0.5] * 6},
-        ),
+        safety=_safety(agent_type="teleop"),
     )
 
     node._publish_commands({"right": {"pos": np.array([2.0] * 6)}}, ts=123.0)
@@ -117,7 +111,9 @@ def test_arm_key_path_applies_matching_arm_safety_config():
     node.publish.assert_called_once()
     topic, payload = node.publish.call_args.args[:2]
     assert topic == "joint_pos"
-    np.testing.assert_allclose(payload["joint_pos"], np.array([0.5] * 6, dtype=np.float32))
+    # Without bbox, position passes through unchanged
+    np.testing.assert_allclose(payload["joint_pos"], np.array([2.0] * 6, dtype=np.float32))
+
 
 def test_metadata_keys_record_chunk_images_are_not_guardrailed():
     """Metadata keys starting with _ should not be guardrailed."""
@@ -140,10 +136,7 @@ def test_metadata_keys_record_chunk_images_are_not_guardrailed():
         node = AgentNode(
             agent=agent,
             name="agent",
-            safety=_safety(
-                agent_type="teleop",
-                left_bbox={"min": [-1.0] * 6, "max": [1.0] * 6},
-            ),
+            safety=_safety(agent_type="teleop"),
         )
     node.name = "agent"
     node.publish = MagicMock(return_value=True)
@@ -154,9 +147,10 @@ def test_metadata_keys_record_chunk_images_are_not_guardrailed():
     node.publish.assert_any_call("record", {"record": True}, ts=node.publish.call_args_list[0].kwargs["ts"])
     assert node.publish.call_args_list[1].args[:2] == ("chunk", chunk)
     assert node.publish.call_args_list[2].args[:2] == ("image/cam_top", {"images": {"rgb": images["cam_top"]}})
+    # Without bbox clamping, position passes through unchanged
     np.testing.assert_allclose(
         node.publish.call_args_list[3].args[1]["joint_pos"],
-        np.array([1.0] * 6, dtype=np.float32),
+        np.array([2.0] * 6, dtype=np.float32),
     )
 
 
@@ -165,7 +159,6 @@ def test_metadata_keys_record_chunk_images_are_not_guardrailed():
 
 def test_agent_node_has_no_bbox_guardrails():
     """After migration, AgentNode should not have _bbox_guardrails attribute."""
-    # After migration, _bbox_guardrails should not exist on AgentNode
     from robots_realtime.runtime.agent_node import AgentNode
     from robots_realtime.runtime.node import Node
 
@@ -175,7 +168,6 @@ def test_agent_node_has_no_bbox_guardrails():
     node.publish = MagicMock(return_value=True)
     node.setup()
 
-    # _bbox_guardrails should not exist after migration
     assert not hasattr(node, "_bbox_guardrails"), (
         "AgentNode should not have _bbox_guardrails after migration to Cartesian-only safety"
     )

@@ -1,4 +1,4 @@
-"""YAML config structure tests for safety settings."""
+"""YAML config structure tests for safety settings — Cartesian workspace only."""
 import pytest
 import yaml
 
@@ -18,8 +18,8 @@ def _get_agent_nodes(cfg):
 def test_yam_bimanual_inference_config_has_required_safety_structure():
     """Inference config should have safety structure with null placeholders.
 
-    The policy node must contain a 'safety' key with per-arm bounding_box
-    sections (left and right). Bounding box values may be null since real
+    The policy node must contain a 'safety' key with per-arm cartesian_workspace
+    sections (left and right). Cartesian workspace values may be null since real
     hardware validation is expected to reject them — but the structural keys
     must exist so they're discoverable before deployment.
     """
@@ -44,15 +44,17 @@ def test_yam_bimanual_inference_config_has_required_safety_structure():
 
     for arm_name in ("left", "right"):
         arm = arms[arm_name]
-        assert "bounding_box" in arm, f"safety.arms.{arm_name}.bounding_box missing"
+        assert "cartesian_workspace" in arm, \
+            f"safety.arms.{arm_name}.cartesian_workspace missing"
         assert "position_indices" in arm, \
             f"safety.arms.{arm_name}.position_indices missing"
         assert "gripper_index" in arm, \
             f"safety.arms.{arm_name}.gripper_index missing"
 
-        bbox = arm["bounding_box"]
-        assert "min" in bbox, f"safety.arms.{arm_name}.bounding_box.min missing"
-        assert "max" in bbox, f"safety.arms.{arm_name}.bounding_box.max missing"
+        cw = arm["cartesian_workspace"]
+        assert "enabled" in cw, f"safety.arms.{arm_name}.cartesian_workspace.enabled missing"
+        assert "min_xyz" in cw, f"safety.arms.{arm_name}.cartesian_workspace.min_xyz missing"
+        assert "max_xyz" in cw, f"safety.arms.{arm_name}.cartesian_workspace.max_xyz missing"
 
     # acceleration_limit must exist (even if null placeholder)
     assert "acceleration_limit" in safety, \
@@ -62,11 +64,11 @@ def test_yam_bimanual_inference_config_has_required_safety_structure():
 def test_yam_bimanual_inference_placeholders_fail_closed():
     """Inference config with null placeholders should fail validation until numeric values are filled.
 
-    The safety validator (validate_safety_config) must raise ValueError when
+    The cartesian workspace validator must raise ValueError when
     checking the inference YAML's safety section. This ensures deployment
     fails-closed until site-specific finite numeric values are filled in.
     """
-    from robots_realtime.runtime.safety.config import validate_safety_config
+    from robots_realtime.runtime.safety.config import validate_cartesian_workspace_config
 
     with open("configs/yam/yam_bimanual_inference.yaml", "r") as f:
         cfg = yaml.safe_load(f)
@@ -74,28 +76,31 @@ def test_yam_bimanual_inference_placeholders_fail_closed():
     policy = _get_policy_node(cfg)
     safety = policy["safety"]
 
-    # Build a flat SafetyConfig-style dict from the per-arm left config
-    # (the validator expects mode, agent_type, bounding_box, acceleration_limit)
+    # Build a cartesian workspace config dict from the per-arm left config
     left_arm = safety["arms"]["left"]
-    safety_dict = {
-        "mode": safety["mode"],
+    cw = left_arm["cartesian_workspace"]
+    cw_cfg = {
         "agent_type": safety["agent_type"],
-        "bounding_box": left_arm["bounding_box"],
-        "acceleration_limit": safety["acceleration_limit"],
+        "site_name": cw.get("site_name"),
+        "xml_path": cw.get("xml_path"),
+        "frame": cw.get("frame"),
+        "min_xyz": cw.get("min_xyz"),
+        "max_xyz": cw.get("max_xyz"),
     }
 
-    # Null placeholders in real + inference must trigger ValueError
+    # Null placeholders in real mode must trigger ValueError
     with pytest.raises(ValueError):
-        validate_safety_config(safety_dict)
+        validate_cartesian_workspace_config(cw_cfg)
 
 
-def test_yam_sim_gello_teleop_config_has_bbox_but_no_acceleration():
-    """Sim teleop config should have bbox but no acceleration limiter.
+def test_yam_sim_gello_teleop_config_has_cartesian_workspace():
+    """Sim teleop config should have cartesian workspace with numeric values.
 
-    Each gello leader AgentNode must define a bounding_box under its safety
-    section. Teleop nodes do NOT use acceleration_limit — that constraint
-    only applies to inference agents on real hardware.
+    Each gello leader AgentNode must define a cartesian_workspace under its safety
+    section. Values must be finite numbers (not None) for sim deployment.
     """
+    from robots_realtime.runtime.safety.config import validate_cartesian_workspace_config
+
     with open("configs/yam/yam_sim_gello_teleop.yaml", "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -107,34 +112,48 @@ def test_yam_sim_gello_teleop_config_has_bbox_but_no_acceleration():
         assert safety is not None, \
             f"Node '{node['name']}' missing safety section"
 
-        # Must have bounding box with numeric values
+        # Must have cartesian workspace with numeric values
         arms = safety.get("arms", {})
         arm_key = node.get("arm_key", node["name"].split("_")[1])
         arm = arms.get(arm_key, list(arms.values())[0])
 
-        bbox = arm.get("bounding_box")
-        assert bbox is not None, \
-            f"Node '{node['name']}' missing bounding_box"
+        cw = arm.get("cartesian_workspace")
+        assert cw is not None, \
+            f"Node '{node['name']}' missing cartesian_workspace"
 
         # Values must be lists of finite numbers (not None)
-        mins = bbox.get("min", [])
-        maxs = bbox.get("max", [])
+        mins = cw.get("min_xyz", [])
+        maxs = cw.get("max_xyz", [])
         assert all(v is not None for v in mins), \
-            f"Node '{node['name']}' has null values in bounding_box.min"
+            f"Node '{node['name']}' has null values in cartesian_workspace.min_xyz"
         assert all(v is not None for v in maxs), \
-            f"Node '{node['name']}' has null values in bounding_box.max"
+            f"Node '{node['name']}' has null values in cartesian_workspace.max_xyz"
+
+        # Validate the cartesian workspace config
+        cw_cfg = {
+            "agent_type": safety["agent_type"],
+            "site_name": cw["site_name"],
+            "xml_path": cw["xml_path"],
+            "frame": cw["frame"],
+            "min_xyz": cw["min_xyz"],
+            "max_xyz": cw["max_xyz"],
+        }
+        if "enforcement" in cw:
+            cw_cfg["enforcement"] = cw["enforcement"]
+
+        assert validate_cartesian_workspace_config(cw_cfg) is True
 
         # Teleop must NOT have acceleration_limit
         assert "acceleration_limit" not in safety, \
             f"Node '{node['name']}' must not include acceleration_limit (teleop)"
 
 
-def test_yam_safety_config_documents_command_space_not_cartesian():
-    """Safety config should document that values are command-space, not Cartesian.
+def test_yam_safety_config_documents_cartesian_workspace():
+    """Safety config should document that values are model-frame Cartesian meters.
 
     Both YAML files must contain a comment or annotation clarifying that
-    bounding box values represent joint-space / command-space limits rather
-    than end-effector Cartesian workspace limits. This prevents operators
+    cartesian workspace values represent model-frame Cartesian meters for the
+    TCP site rather than joint-space limits. This prevents operators
     from misinterpreting the constraints.
     """
     # Check inference YAML
@@ -142,17 +161,15 @@ def test_yam_safety_config_documents_command_space_not_cartesian():
         raw = f.read()
 
     lower = raw.lower()
-    assert "command" in lower or "joint" in lower, \
-        "Inference safety config must mention command/joint-space, not Cartesian"
-
-    # Also verify it mentions the distinction
     assert "cartesian" in lower, \
-        "Inference safety config must explicitly reference Cartesian for contrast"
+        "Inference safety config must mention Cartesian workspace"
+    assert "model" in lower or "frame" in lower, \
+        "Inference safety config must document model frame"
 
     # Check sim teleop YAML too
     with open("configs/yam/yam_sim_gello_teleop.yaml", "r") as f:
         sim_raw = f.read()
 
     sim_lower = sim_raw.lower()
-    assert "command" in sim_lower or "joint" in sim_lower, \
-        "Sim teleop safety config must mention command/joint-space, not Cartesian"
+    assert "cartesian" in sim_lower, \
+        "Sim teleop safety config must mention Cartesian workspace"
