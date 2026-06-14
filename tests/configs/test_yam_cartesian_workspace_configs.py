@@ -97,3 +97,23 @@ def test_cartesian_workspace_documents_model_frame():
     lower = raw.lower()
     assert "cartesian" in lower, "Sim teleop must mention Cartesian workspace"
     assert "model" in lower or "frame" in lower, "Must document model frame"
+
+
+# ── Migration RED tests: no branch-added bounding_box in YAML ─────────────
+
+
+def test_yam_configs_do_not_define_branch_added_bounding_box():
+    """After migration, YAM configs should not contain bounding_box sections."""
+    import glob as glob_mod
+
+    yam_configs = glob_mod.glob("configs/yam/yam_*.yaml")
+    assert len(yam_configs) > 0, "No YAM configs found"
+
+    for cfg_path in yam_configs:
+        with open(cfg_path, "r") as f:
+            raw = f.read()
+        # bounding_box should not appear in any YAM safety section after migration
+        assert "bounding_box:" not in raw, (
+            f"{cfg_path} still contains bounding_box section; "
+            "must be removed after migration to Cartesian-only safety"
+        )

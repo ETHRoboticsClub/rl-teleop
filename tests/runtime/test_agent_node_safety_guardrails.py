@@ -158,3 +158,24 @@ def test_metadata_keys_record_chunk_images_are_not_guardrailed():
         node.publish.call_args_list[3].args[1]["joint_pos"],
         np.array([1.0] * 6, dtype=np.float32),
     )
+
+
+# ── Migration RED tests: no bbox guardrails in AgentNode ──────────────────
+
+
+def test_agent_node_has_no_bbox_guardrails():
+    """After migration, AgentNode should not have _bbox_guardrails attribute."""
+    # After migration, _bbox_guardrails should not exist on AgentNode
+    from robots_realtime.runtime.agent_node import AgentNode
+    from robots_realtime.runtime.node import Node
+
+    with patch.object(Node, "__init__", return_value=None):
+        node = AgentNode(agent=MagicMock(), name="agent")
+    node.name = "agent"
+    node.publish = MagicMock(return_value=True)
+    node.setup()
+
+    # _bbox_guardrails should not exist after migration
+    assert not hasattr(node, "_bbox_guardrails"), (
+        "AgentNode should not have _bbox_guardrails after migration to Cartesian-only safety"
+    )

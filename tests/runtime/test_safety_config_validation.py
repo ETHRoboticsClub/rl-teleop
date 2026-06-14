@@ -225,3 +225,36 @@ def test_infinite_acceleration_limit_rejected():
         validate_safety_config(
             {"mode": "sim", "agent_type": "inference", "acceleration_limit": float("inf")}
         )
+
+
+# ── Migration RED tests: Cartesian-only safety (no bounding_box) ──────────
+
+
+def test_cartesian_workspace_does_not_require_joint_bounding_box():
+    """After migration, Cartesian workspace config should validate without bounding_box."""
+    from robots_realtime.runtime.safety.config import validate_cartesian_workspace_config
+
+    # Cartesian-only config — no bounding_box key at all
+    cw_cfg = {
+        "agent_type": "teleop",
+        "site_name": "left_tcp_site",
+        "xml_path": "robots_realtime/sim/models/yam_bimanual_scene.xml",
+        "frame": "model",
+        "min_xyz": [-0.5, -0.5, -0.5],
+        "max_xyz": [0.5, 0.5, 0.5],
+        "enforcement": "reject_hold_last_safe",
+    }
+    # Should pass — Cartesian workspace is sufficient for workspace safety
+    assert validate_cartesian_workspace_config(cw_cfg) is True
+
+
+def test_command_bounding_box_guardrail_removed():
+    """After migration, CommandBoundingBoxGuardrail should not be importable from safety package."""
+    # After migration, this import should fail or the class should not exist
+    try:
+        from robots_realtime.runtime.safety.guardrails import CommandBoundingBoxGuardrail
+        # If import succeeds, the class should not exist
+        assert False, "CommandBoundingBoxGuardrail should be removed after migration"
+    except (ImportError, AttributeError):
+        # Expected after migration
+        pass
