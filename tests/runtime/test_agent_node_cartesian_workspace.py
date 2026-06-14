@@ -234,6 +234,7 @@ def test_missing_production_current_state_fails_before_reset():
     safety_no_state = _cartesian_safety(
         left_bounds=([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]),
     )
+    safety_no_state["mode"] = "real"
     # No production_current_state key at all
 
     with patch.object(Node, "__init__", return_value=None):
@@ -252,11 +253,14 @@ def test_missing_production_current_state_fails_before_reset():
 
 def test_reject_events_are_throttled_and_counted():
     """Cartesian reject events are tracked in clamp_log and throttled for telemetry."""
-    node = _node(
-        safety=_cartesian_safety(
-            left_bounds=([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]),
-        ),
+    safety_cfg = _cartesian_safety(
+        left_bounds=([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]),
     )
+    # Initialize last_safe from a known safe position so rejects actually clamp
+    safety_cfg["production_current_state"] = {
+        "left": {"qpos": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5]},
+    }
+    node = _node(safety=safety_cfg)
 
     # Send many out-of-bounds commands
     num_commands = 50

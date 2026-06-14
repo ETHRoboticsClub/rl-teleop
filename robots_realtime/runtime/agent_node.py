@@ -143,16 +143,11 @@ class AgentNode(Node):
             self._agent.reset()
 
     def _validate_cartesian_startup(self) -> None:
-        """Validate cartesian workspace guardrails before agent reset.
-
-        Fails closed if:
-        - cartesian_workspace enabled but no production_current_state provided
-        - initial follower state is outside cartesian bounds
-        """
         if not self._safety_config:
             return
 
         cfg = self._safety_config
+        mode = cfg.get("mode", "sim")
         arms = cfg.get("arms", {})
         current_state = cfg.get("production_current_state")
 
@@ -161,8 +156,7 @@ class AgentNode(Node):
             if not cw or not cw.get("enabled"):
                 continue
 
-            # Must have current state for real mode
-            if cfg.get("mode") == "real" and current_state is None:
+            if mode == "real" and current_state is None:
                 raise ValueError(
                     f"Cartesian workspace enabled for arm '{arm_key}' but "
                     "production_current_state is missing. Guarded teleop requires "
@@ -170,13 +164,12 @@ class AgentNode(Node):
                     "Set production_current_state in safety config."
                 )
 
-            # FK-check initial state
             if current_state and arm_key in current_state:
                 qpos = current_state[arm_key].get("qpos")
                 if qpos is not None and arm_key in self._cartesian_guardrails:
                     guardrail = self._cartesian_guardrails[arm_key]
                     q = np.asarray(qpos, dtype=np.float64)
-                    xyz = guardrail._fk_xyz(q)
+                    xyz = guardrail._fk_call(q, guardrail._site_name)[:3, 3]
                     if not guardrail._is_in_bounds(xyz):
                         raise ValueError(
                             f"Cartesian workspace startup validation failed for arm '{arm_key}': "
@@ -184,7 +177,6 @@ class AgentNode(Node):
                             f"[{guardrail._min_xyz.tolist()}, {guardrail._max_xyz.tolist()}]. "
                             "Guarded teleop fails closed. Move arm to safe position before starting."
                         )
-                    # Initialize last_safe from current state
                     guardrail.mark_published_safe(q)
 
     def _build_agent(self):
@@ -440,6 +432,9 @@ class AgentNode(Node):
             self._accel_guardrail = InferenceAccelerationGuardrail(
                 float(acceleration_limit)
             )
+
+        # Initialize last_safe from production_current_state and validate startup
+        self._validate_cartesian_startup()
 
     def _resolve_guardrail_key(self, arm_key: str | None) -> str | None:
         if arm_key in self._bbox_guardrails:
