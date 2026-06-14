@@ -37,10 +37,7 @@ import numpy as np
 from robots_realtime.runtime.node import Node, NodeRole
 from robots_realtime.runtime.safety.config import validate_cartesian_workspace_config, validate_safety_config
 from robots_realtime.runtime.safety.cartesian import CartesianWorkspaceRejectGuardrail
-from robots_realtime.runtime.safety.guardrails import (
-    CommandBoundingBoxGuardrail,
-    InferenceAccelerationGuardrail,
-)
+from robots_realtime.runtime.safety.guardrails import InferenceAccelerationGuardrail
 
 
 class AgentNode(Node):
@@ -122,7 +119,6 @@ class AgentNode(Node):
         self._gripper_closed_deg = gripper_closed_deg
         self._safety_config = safety
         self._safety_agent_type = "teleop"
-        self._bbox_guardrails: dict[str | None, CommandBoundingBoxGuardrail] = {}
         self._cartesian_guardrails: dict[str | None, CartesianWorkspaceRejectGuardrail] = {}
         self._accel_guardrail: InferenceAccelerationGuardrail | None = None
         self._last_cmd: dict[str | None, np.ndarray] = {}
@@ -293,12 +289,6 @@ class AgentNode(Node):
                 pos = self._accel_guardrail.apply(prev_cmd, pos)
                 if not np.array_equal(pos, original):
                     self._log_clamp(guardrail_key, "accel", original, pos)
-        bbox_guardrail = self._bbox_guardrails.get(guardrail_key)
-        if bbox_guardrail is not None:
-            original = pos.copy()
-            pos = bbox_guardrail.apply(pos)
-            if not np.array_equal(pos, original):
-                self._log_clamp(guardrail_key, "bbox", original, pos)
 
         # Update cartesian last_safe with final published command
         if cw_guardrail is not None:
@@ -323,7 +313,6 @@ class AgentNode(Node):
         )
 
     def _setup_safety_guardrails(self, fk_factory=None) -> None:
-        self._bbox_guardrails = {}
         self._cartesian_guardrails = {}
         self._accel_guardrail = None
         self._last_cmd = {}
@@ -341,25 +330,11 @@ class AgentNode(Node):
         arms = cfg.get("arms")
         if mode == "real" and arms is not None and len(arms) == 0:
             raise ValueError(
-                "Real hardware requires per-arm bounding_box config. "
+                "Real hardware requires per-arm safety config. "
                 "safety.arms is empty; add entries for each arm (e.g. left, right)."
             )
         if arms:
             for arm_key, arm_cfg in arms.items():
-                bbox = arm_cfg.get("bounding_box")
-                validate_safety_config(
-                    {
-                        "mode": mode,
-                        "agent_type": self._safety_agent_type,
-                        "bounding_box": bbox,
-                        "acceleration_limit": acceleration_limit,
-                    }
-                )
-                if bbox is not None:
-                    self._bbox_guardrails[arm_key] = CommandBoundingBoxGuardrail(
-                        bbox["min"], bbox["max"]
-                    )
-
                 # Cartesian workspace guardrail
                 cw = arm_cfg.get("cartesian_workspace")
                 if cw and cw.get("enabled"):
@@ -409,24 +384,8 @@ class AgentNode(Node):
                             pass_through_indices=pass_through,
                         )
 
-            if len(self._bbox_guardrails) == 1:
-                self._bbox_guardrails[None] = next(iter(self._bbox_guardrails.values()))
             if len(self._cartesian_guardrails) == 1:
                 self._cartesian_guardrails[None] = next(iter(self._cartesian_guardrails.values()))
-        else:
-            bbox = cfg.get("bounding_box")
-            validate_safety_config(
-                {
-                    "mode": mode,
-                    "agent_type": self._safety_agent_type,
-                    "bounding_box": bbox,
-                    "acceleration_limit": acceleration_limit,
-                }
-            )
-            if bbox is not None:
-                self._bbox_guardrails[None] = CommandBoundingBoxGuardrail(
-                    bbox["min"], bbox["max"]
-                )
 
         if self._safety_agent_type == "inference" and acceleration_limit is not None:
             self._accel_guardrail = InferenceAccelerationGuardrail(
@@ -437,11 +396,11 @@ class AgentNode(Node):
         self._validate_cartesian_startup()
 
     def _resolve_guardrail_key(self, arm_key: str | None) -> str | None:
-        if arm_key in self._bbox_guardrails:
+        if arm_key in self._cartesian_guardrails:
             return arm_key
-        if self._arm_key in self._bbox_guardrails:
+        if self._arm_key in self._cartesian_guardrails:
             return self._arm_key
-        if None in self._bbox_guardrails:
+        if None in self._cartesian_guardrails:
             return None
         # Do NOT fall back to a different arm's guardrail — that's unsafe
         return arm_key
