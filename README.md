@@ -91,25 +91,29 @@ Autonomous rollout of a trained policy against the bimanual YAM followers (no le
 ./infer.sh
 ```
 
-`infer.sh` mirrors `teleop.sh`'s pre-flight (submodule init, `can_follow_l/r` bring-up at 1 Mbit/s, `RS2_USE_RSUSB_BACKEND=true`) but skips all leader-arm steps. It also puts the repo root on `PYTHONPATH` so the top-level `adapters/` package is importable.
+`infer.sh` mirrors `teleop.sh`'s pre-flight (submodule init, `can_follow_l/r` bring-up at 1 Mbit/s, `RS2_USE_RSUSB_BACKEND=true`) but skips all leader-arm steps. It puts the repo root and `mimic-video/model` on `PYTHONPATH` so the agent and the vendored `cosmos_predict2`/`imaginaire` modules are importable.
 
 The default config is `configs/yam/yam_bimanual_inference.yaml`. It wires:
 
 - **Single head camera** (RealSense D405) on `camera_top/rgb` — no wrist cams.
 - **Two YAM followers** with `startup_joint_pos` ramps + `session.start_paused: true` so arms hold until the operator hits `[space]` in the TUI.
-- **`CheckpointPolicyAgent`** — a generic loader that runs:
+- **`MimicVideoAgent`** — wraps Cosmos Predict 2's `Video2World2ActionPipeline` (see `mimic-video/eval/libero/run.py` for the reference loop):
   ```
-  obs --[obs_adapter]--> model_input --[model.pt]--> model_output --[action_adapter]--> {"left": {"pos": ...}, "right": {"pos": ...}}
+  N frames -> Video2WorldPipeline (denoise to τ) -> cross-attn embedding
+           -> World2ActionPipeline -> action chunk -> dequeue per tick
   ```
 
-Before a real rollout, fill in the two stubs at the repo-root `adapters/` folder:
+Set the deployment specifics in `agent_kwargs`:
+- `video_model_path` / `action_model_path` — two `.pt` checkpoints.
+- `dataset_statistics_path` — normalizer stats JSON.
+- `experiment_name` — name passed to `make_config` + `override(experiment=...)`.
+- `stop_video_denoising_step` (τ) — denoising steps to run before handing off to the action DiT (0 = pure noise; `num_sampling_step` = fully denoised).
+- `num_execute_actions` — how many actions to consume from each predicted chunk before re-querying the policy.
+- `prompt` — task description string fed to the video pipeline.
 
-- `adapters/mimic_video.py:obs_to_input(obs)` — convert the AgentNode obs dict into the input shape your `.pt` expects (stacked-frame video clip).
-- `adapters/mimic_video.py:output_to_action(model_output)` — convert the model output (action chunk) into the bimanual action dict.
+The YAML also keeps OpenPI/π₀, local ACT, lerobot, and the generic `CheckpointPolicyAgent` stanzas as commented references — swap (D) for one of them if you'd rather use a different backend.
 
-The checkpoint path lives in the YAML (`agent_kwargs.checkpoint_path`, e.g. `checkpoints/2026-06-13/policy.pt`). The YAML also keeps OpenPI/π₀, local ACT, and lerobot agent stanzas as commented references — swap (D) for one of them if you'd rather use an existing backend.
-
-Flags: `./infer.sh --no-tui`, `./infer.sh --config <path>`, `./infer.sh <path>` (bare positional = config).
+Flags: `./infer.sh --no-tui`, `./infer.sh --config <path>`, `./infer.sh --duration <seconds>` (caps the rollout via `timeout`, SIGINTs the session so RobotNodes ramp to their shutdown pose cleanly), `./infer.sh <path>` (bare positional = config).
 
 ### Replay an episode
 
