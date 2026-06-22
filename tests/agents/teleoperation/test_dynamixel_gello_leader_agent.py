@@ -231,6 +231,66 @@ def test_gripper_spring_uses_current_based_position_mode():
     ]
 
 
+def test_reader_discovery_reports_ping_status():
+    class FakePacketHandler:
+        def ping(self, port_handler, motor_id):
+            if motor_id == 1:
+                return 1060, 0, 0
+            return 0, -3001, 0
+
+        def getTxRxResult(self, comm_result):
+            return "success" if comm_result == 0 else "rx failed"
+
+    reader = _DynamixelPositionReader.__new__(_DynamixelPositionReader)
+    reader._packet_handler = FakePacketHandler()
+    reader._port_handler = object()
+    reader._motor_ids = [1, 2]
+
+    discovery = reader.ping_ids()
+
+    assert discovery == [
+        {
+            "motor_id": 1,
+            "ok": True,
+            "model_number": 1060,
+            "comm_result": 0,
+            "comm_result_text": "0 (success)",
+            "error": 0,
+            "error_text": "",
+        },
+        {
+            "motor_id": 2,
+            "ok": False,
+            "model_number": 0,
+            "comm_result": -3001,
+            "comm_result_text": "-3001 (rx failed)",
+            "error": 0,
+            "error_text": "",
+        },
+    ]
+
+
+def test_reader_discovery_can_scan_explicit_ids():
+    pinged_ids = []
+
+    class FakePacketHandler:
+        def ping(self, port_handler, motor_id):
+            pinged_ids.append(motor_id)
+            return 0, -3001, 0
+
+        def getTxRxResult(self, comm_result):
+            return "rx failed"
+
+    reader = _DynamixelPositionReader.__new__(_DynamixelPositionReader)
+    reader._packet_handler = FakePacketHandler()
+    reader._port_handler = object()
+    reader._motor_ids = [1, 2]
+
+    reader.ping_ids([8, 9, 10])
+
+    assert pinged_ids == [8, 9, 10]
+
+
 @pytest.mark.parametrize(("include_gripper", "shape"), [(False, (6,)), (True, (7,))])
 def test_action_spec_shape(include_gripper, shape):
     reader = FakeDynamixelReader(np.zeros(7))

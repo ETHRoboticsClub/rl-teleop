@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -76,6 +77,54 @@ class _DynamixelPositionReader:
                 self._port_handler.closePort()
                 raise RuntimeError(f"Failed to add Dynamixel id={motor_id} to sync read group on {port}")
 
+    def _format_comm_result(self, comm_result: int) -> str:
+        try:
+            message = self._packet_handler.getTxRxResult(comm_result)
+        except Exception:
+            message = ""
+        return f"{comm_result} ({message})" if message else str(comm_result)
+
+    def ping_ids(self, motor_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+        """Ping motor IDs and return per-ID communication status."""
+        results: List[Dict[str, Any]] = []
+        target_ids = self._motor_ids if motor_ids is None else motor_ids
+        for motor_id in target_ids:
+            try:
+                model_number, comm_result, error = self._packet_handler.ping(self._port_handler, int(motor_id))
+            except Exception as exc:
+                results.append(
+                    {
+                        "motor_id": int(motor_id),
+                        "ok": False,
+                        "model_number": None,
+                        "comm_result": None,
+                        "comm_result_text": "",
+                        "error": None,
+                        "error_text": "",
+                        "exception": str(exc),
+                    }
+                )
+                continue
+
+            error_text = ""
+            if error:
+                try:
+                    error_text = self._packet_handler.getRxPacketError(error)
+                except Exception:
+                    error_text = ""
+            results.append(
+                {
+                    "motor_id": int(motor_id),
+                    "ok": comm_result == dynamixel_sdk.COMM_SUCCESS and error == 0,
+                    "model_number": int(model_number) if model_number is not None else None,
+                    "comm_result": int(comm_result),
+                    "comm_result_text": self._format_comm_result(int(comm_result)),
+                    "error": int(error),
+                    "error_text": error_text,
+                }
+            )
+        return results
+
     def get_positions(self) -> np.ndarray:
         last_comm_result = 0
         last_missing_id: Optional[int] = None
@@ -125,7 +174,7 @@ class _DynamixelPositionReader:
             )
         raise RuntimeError(
             f"Dynamixel sync read failed after {self._num_read_retries + 1} attempts: "
-            f"comm_result={last_comm_result}"
+            f"comm_result={self._format_comm_result(last_comm_result)}"
         )
 
     def seconds_since_last_read(self) -> float:
@@ -350,10 +399,16 @@ if __name__ == "__main__":
     parser.add_argument("--samples", type=int, default=1, help="Number of samples")
     parser.add_argument("--output", type=str, help="Output JSON path")
     parser.add_argument("--discover", action="store_true", help="Auto-discovery mode")
+    parser.add_argument("--scan-id-start", type=int, help="First Dynamixel ID to ping when discovering")
+    parser.add_argument("--scan-id-end", type=int, help="Last Dynamixel ID to ping when discovering")
     parser.add_argument("--num-read-retries", type=int, default=3, help="Number of retries per motor read")
     args = parser.parse_args()
 
     ids = [int(x.strip()) for x in args.motor_ids.split(",")]
+    if (args.scan_id_start is None) != (args.scan_id_end is None):
+        parser.error("--scan-id-start and --scan-id-end must be provided together")
+    if args.scan_id_start is not None and args.scan_id_start > args.scan_id_end:
+        parser.error("--scan-id-start must be <= --scan-id-end")
 
     results = {
         "port": args.port,
@@ -366,6 +421,10 @@ if __name__ == "__main__":
         "last_positions_rad": [],
         "timestamps": [],
         "errors": [],
+        "discovery": [],
+        "discovered_ids": [],
+        "scan_id_start": args.scan_id_start,
+        "scan_id_end": args.scan_id_end,
     }
 
     exit_code = 0
@@ -379,7 +438,17 @@ if __name__ == "__main__":
             present_position_len=4,
             num_read_retries=args.num_read_retries,
         )
-        
+
+        if args.discover:
+            discover_ids = (
+                list(range(args.scan_id_start, args.scan_id_end + 1))
+                if args.scan_id_start is not None
+                else ids
+            )
+            discovery = reader.ping_ids(discover_ids)
+            results["discovery"] = discovery
+            results["discovered_ids"] = [item["motor_id"] for item in discovery if item["ok"]]
+
         samples_to_collect = args.samples
         max_attempts = max(args.samples * 5, args.samples)
         attempts = 0
@@ -438,6 +507,7 @@ if __name__ == "__main__":
         exit_code = 1
 
     if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         with open(args.output, "w") as f:
             json.dump(results, f, indent=2)
     else:
