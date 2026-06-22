@@ -136,6 +136,119 @@ def _load_episode(episode_dir: Path) -> dict:
     }
 
 
+def _load_yam_joint_states(episode_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Load real YAM joint_state MCAPs as command-space state.
+
+    Returns:
+        states: (T, 14) float64 on a regular 10 Hz grid, layout [left7, right7]
+        grid_ts: (T,) float64
+        raw_hz: approximate source publish rate before resampling
+    """
+
+    def _load_arm(side: str) -> tuple[np.ndarray, np.ndarray]:
+        path = episode_dir / f"yam_{side}.mcap"
+        if not path.exists():
+            raise FileNotFoundError(path)
+        msgs = _read_mcap_json(path, topic=f"/yam_{side}/joint_state")
+        if not msgs:
+            msgs = _read_mcap_json(path)
+        states = []
+        ts = []
+        for t, data in msgs:
+            joint_pos = np.asarray(data.get("joint_pos"), dtype=np.float64)
+            gripper_pos = np.asarray(data.get("gripper_pos"), dtype=np.float64).reshape(-1)
+            if joint_pos.shape == (6,) and gripper_pos.shape == (1,):
+                states.append(np.concatenate([joint_pos, gripper_pos]))
+                ts.append(t)
+            elif joint_pos.shape == (7,):
+                states.append(joint_pos)
+                ts.append(t)
+        if not states:
+            raise RuntimeError(f"{path} has no usable joint_state samples")
+        arr = np.asarray(states, dtype=np.float64)
+        ts_arr = np.asarray(ts, dtype=np.float64)
+        dur = ts_arr[-1] - ts_arr[0] if len(ts_arr) > 1 else 0.0
+        hz = (len(ts_arr) - 1) / dur if dur > 0 else 0.0
+        print(f"  yam_{side}/joint_state: {len(arr)} frames, {dur:.1f}s at ~{hz:.0f} Hz  (shape {arr.shape})")
+        return arr, ts_arr
+
+    left_path = episode_dir / "yam_left.mcap"
+    right_path = episode_dir / "yam_right.mcap"
+    if not left_path.exists() or not right_path.exists():
+        return None
+
+    left, ts_left = _load_arm("left")
+    right, ts_right = _load_arm("right")
+    t_start = max(ts_left[0], ts_right[0])
+    t_end = min(ts_left[-1], ts_right[-1])
+    if t_end <= t_start:
+        raise RuntimeError("yam_left/yam_right joint_state streams do not overlap in time")
+
+    # Real robot state is normally published around 200 Hz. The browser replay
+    # does not need that rate; 10 Hz matches the PIXEL IDM action/source cadence
+    # and keeps the Viser loop responsive for long recordings.
+    replay_hz = 10.0
+    grid_ts = np.arange(t_start, t_end, 1.0 / replay_hz)
+    left_grid = np.stack([np.interp(grid_ts, ts_left, left[:, i]) for i in range(7)], axis=1)
+    right_grid = np.stack([np.interp(grid_ts, ts_right, right[:, i]) for i in range(7)], axis=1)
+    states = np.concatenate([left_grid, right_grid], axis=1)
+    raw_hz = np.array([
+        (len(ts_left) - 1) / (ts_left[-1] - ts_left[0]) if len(ts_left) > 1 else 0.0,
+        (len(ts_right) - 1) / (ts_right[-1] - ts_right[0]) if len(ts_right) > 1 else 0.0,
+    ])
+    print(f"  yam joint-state replay grid: {len(states)} frames at {replay_hz:.0f} Hz, {grid_ts[-1] - grid_ts[0]:.1f}s")
+    return states, grid_ts, raw_hz
+
+
+def _states_to_qpos_timeline(env: Any, states: np.ndarray) -> np.ndarray:
+    """Convert 14D command-space states to full MuJoCo qpos snapshots."""
+    qposes = np.empty((len(states), len(env.data.qpos)), dtype=np.float64)
+    for i, state in enumerate(states):
+        mujoco.mj_resetData(env.model, env.data)
+        env._set_qpos(state)
+        mujoco.mj_forward(env.model, env.data)
+        qposes[i] = env.data.qpos.copy()
+    return qposes
+
+
+def _load_npz_action_window(
+    npz_path: Path,
+    *,
+    array_key: str,
+    window_idx: int,
+    source_hz: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load a 14D NPZ trajectory or one sampled 14D NPZ window."""
+    if source_hz <= 0:
+        raise ValueError(f"source_hz must be > 0, got {source_hz}")
+    with np.load(npz_path) as data:
+        if array_key not in data:
+            raise KeyError(f"{npz_path} has no {array_key!r}; keys={list(data.keys())}")
+        actions = np.asarray(data[array_key], dtype=np.float64)
+    if actions.ndim == 2 and actions.shape[-1] == 14:
+        states = actions
+        label = array_key
+    elif actions.ndim == 3 and actions.shape[-1] == 14:
+        if not 0 <= window_idx < actions.shape[0]:
+            raise IndexError(f"window_idx={window_idx} out of range for N={actions.shape[0]}")
+        states = np.asarray(actions[window_idx], dtype=np.float64)
+        label = f"{array_key}[{window_idx}]"
+    else:
+        raise ValueError(f"{array_key!r} must have shape (T, 14) or (N, T, 14), got {actions.shape}")
+    if states.shape[0] < 1:
+        raise ValueError(f"{label} must contain at least one frame, got shape {states.shape}")
+    if not np.all(np.isfinite(states)):
+        raise ValueError(f"{label} contains NaN or Inf")
+    grid_ts = np.arange(states.shape[0], dtype=np.float64) / float(source_hz)
+    print(
+        f"  npz {label}: {states.shape[0]} frames at {source_hz:.1f} Hz "
+        f"(shape {states.shape})"
+    )
+    print(f"  first: {np.array2string(states[0], precision=5, suppress_small=False)}")
+    print(f"  last:  {np.array2string(states[-1], precision=5, suppress_small=False)}")
+    return states, grid_ts
+
+
 def _load_sim_states(episode_dir: Path):
     """Load full qpos timeline from yam-sim_state.mcap.
 
@@ -502,30 +615,53 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Replay a robots_realtime sim episode through MuJoCo + Viser"
     )
-    parser.add_argument("episode_dir", help="Path to episode directory")
+    parser.add_argument("episode_dir", help="Path to episode directory, yam_left.mcap/yam_right.mcap, or action .npz")
     parser.add_argument("--port",  type=int,   default=8080, help="Viser server port (default: 8080)")
     parser.add_argument("--speed", type=float, default=1.0,  help="Playback speed multiplier (default: 1.0)")
     parser.add_argument("--scene", type=str,   default=None, help="Scene name (default: from session_meta or 'hybrid')")
     parser.add_argument("--task",  type=str,   default=None, help="Task name (default: 'bottles' for sim recordings, 'robot_only' for real-robot)")
+    parser.add_argument("--npz-array-key", default="predicted_actions", help="NPZ action array key")
+    parser.add_argument("--npz-window-idx", type=int, default=0, help="NPZ sampled window index to replay")
+    parser.add_argument("--npz-source-hz", type=float, default=10.0, help="NPZ source action frame rate")
     args = parser.parse_args()
 
-    episode_dir = Path(args.episode_dir).resolve()
+    input_path = Path(args.episode_dir).resolve()
+    is_npz = input_path.is_file() and input_path.suffix == ".npz"
+    episode_dir = input_path
+    if input_path.is_file() and input_path.suffix == ".mcap":
+        episode_dir = input_path.parent
 
     # Scene / task: prefer CLI args, then session_meta, then defaults.
     # Real-robot recordings don't have yam-sim_state.mcap and don't need task
     # objects in the scene — fall back to a robot-only scene (yams + station + walls).
-    sim_cfg = _read_sim_config(episode_dir)
-    has_sim_state = (episode_dir / "yam-sim_state.mcap").exists()
+    sim_cfg = {} if is_npz else _read_sim_config(episode_dir)
+    has_sim_state = False if is_npz else (episode_dir / "yam-sim_state.mcap").exists()
     default_task = "bottles" if has_sim_state else "robot_only"
     scene = args.scene or sim_cfg.get("scene", "hybrid")
     task  = args.task  or sim_cfg.get("task",  default_task)
 
-    # Load episode data
-    data = _load_episode(episode_dir)
-    print()
+    if is_npz:
+        print(f"Loading NPZ action window: {input_path}")
+        npz_states, npz_grid_ts = _load_npz_action_window(
+            input_path,
+            array_key=args.npz_array_key,
+            window_idx=args.npz_window_idx,
+            source_hz=args.npz_source_hz,
+        )
+        data = {
+            "camera_frames": {},
+            "camera_ts": {},
+        }
+        raw_states = None
+        raw_yam_states = None
+    else:
+        # Load episode data
+        data = _load_episode(episode_dir)
+        print()
 
-    # Load sim states for exact qpos replay
-    raw_states = _load_sim_states(episode_dir)
+        # Load sim states for exact qpos replay
+        raw_states = _load_sim_states(episode_dir)
+        raw_yam_states = _load_yam_joint_states(episode_dir)
 
     # Build MuJoCo environment (scene_variant = visual style, task = scene XML)
     print(f"Creating environment (scene_variant={scene}, task={task}) ...")
@@ -537,20 +673,34 @@ def main() -> None:
     control_hz = 1.0 / (env.model.opt.timestep * env._control_decimation)
     print(f"Control Hz: {control_hz:.1f}")
 
-    # Build the physics-rate action timeline (needed for re-step mode).
-    actions_physics, grid_ts_physics = _build_action_timeline(
-        data["actions_left"],  data["ts_left"],
-        data["actions_right"], data["ts_right"],
-        control_hz=control_hz,
-    )
-    print(f"Physics timeline: {len(actions_physics)} steps at {control_hz:.0f} Hz, {grid_ts_physics[-1]-grid_ts_physics[0]:.1f}s")
+    if is_npz:
+        actions_physics = npz_states.astype(np.float32)
+        grid_ts_physics = npz_grid_ts
+        print(f"NPZ kinematic timeline: {len(actions_physics)} steps, {grid_ts_physics[-1] - grid_ts_physics[0]:.1f}s")
+    else:
+        # Build the physics-rate action timeline (needed for re-step mode).
+        actions_physics, grid_ts_physics = _build_action_timeline(
+            data["actions_left"],  data["ts_left"],
+            data["actions_right"], data["ts_right"],
+            control_hz=control_hz,
+        )
+        print(f"Physics timeline: {len(actions_physics)} steps at {control_hz:.0f} Hz, {grid_ts_physics[-1]-grid_ts_physics[0]:.1f}s")
 
     # Align sim_states to control grid (same rate as physics mode).
     sim_states: np.ndarray | None = None
-    if raw_states is not None:
+    if is_npz:
+        sim_states = _states_to_qpos_timeline(env, npz_states)
+        print(f"NPZ states:      {len(sim_states)} kinematic qpos frames")
+    elif raw_states is not None:
         qposes_raw, ts_raw = raw_states
         sim_states = _sample_hold(qposes_raw, ts_raw, grid_ts_physics)
         print(f"Sim states:      {len(sim_states)} steps aligned to {control_hz:.1f} Hz grid")
+    elif raw_yam_states is not None:
+        yam_states, yam_grid_ts, _raw_hz = raw_yam_states
+        sim_states = _states_to_qpos_timeline(env, yam_states)
+        grid_ts_physics = yam_grid_ts
+        actions_physics = yam_states.astype(np.float32)
+        print(f"YAM joint states: {len(sim_states)} kinematic qpos frames from recorded yam_left/yam_right MCAPs")
     else:
         print("No yam-sim_state.mcap — only physics re-step mode available")
 
