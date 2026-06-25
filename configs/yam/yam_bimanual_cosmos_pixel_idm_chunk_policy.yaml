@@ -10,8 +10,8 @@ nodes:
     name: cosmos_pixel_idm_policy
     agent_class: robots_realtime.agents.policy_learning.cosmos_pixel_idm_chunk_agent:CosmosPixelIDMChunkAgent
     agent_kwargs:
-      cosmos_url:
-      pixel_idm_url:
+      cosmos_url: http://127.0.0.1:8021
+      pixel_idm_url: http://127.0.0.1:8022
       prompt:
       source_hz: 10
       command_hz: 30
@@ -21,7 +21,7 @@ nodes:
       array_key: predicted_actions
       request_timeout_s: 900
       num_latent_conditional_frames: 2
-      open_video_plan: true
+      open_video_plan: false
       left_limits_path: robot_configs/yam/xdof_hq/left.yaml
       right_limits_path: robot_configs/yam/xdof_hq/right.yaml
       limit_tolerance: 0.05
@@ -57,7 +57,7 @@ nodes:
     name: camera_top
     driver: RealSenseCamera
     device_id: "203522250539"
-    resolution: VGA
+    resolution: HD720
     fps: 30
 
   - type: ViserMonitorNode
@@ -94,3 +94,4 @@ nodes:
           rotation: [1.0, 0.0, 0.0, 0.0]
     image_topics:
       top: cosmos_pixel_idm_policy/image/top_camera
+      plan: cosmos_pixel_idm_policy/image/cosmos_plan

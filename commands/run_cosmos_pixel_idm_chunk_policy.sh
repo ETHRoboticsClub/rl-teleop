@@ -3,8 +3,8 @@ set -euo pipefail
 
 PROMPT=""
 EXECUTE=0
-COSMOS_URL="${COSMOS_PIXEL_IDM_COSMOS_URL:-http://127.0.0.1:8021}"
-PIXEL_IDM_URL="${COSMOS_PIXEL_IDM_PIXEL_URL:-http://127.0.0.1:8022}"
+COSMOS_URL="http://127.0.0.1:8021"
+PIXEL_IDM_URL="http://127.0.0.1:8022"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -12,20 +12,14 @@ while [[ $# -gt 0 ]]; do
       PROMPT="${2:-}"
       shift 2
       ;;
-    --cosmos-url)
-      COSMOS_URL="${2:-}"
-      shift 2
-      ;;
-    --pixel-idm-url)
-      PIXEL_IDM_URL="${2:-}"
-      shift 2
-      ;;
     --execute)
       EXECUTE=1
       shift
       ;;
     -h|--help)
-      echo "Usage: $0 --prompt \"task prompt\" [--cosmos-url URL] [--pixel-idm-url URL] [--execute]"
+      echo "Usage: $0 --prompt \"task prompt\" [--execute]"
+      echo "Cosmos URL is hardcoded to ${COSMOS_URL}; use commands/tunnel_cosmos_ec2.sh for EC2."
+      echo "Pixel-IDM URL is hardcoded to ${PIXEL_IDM_URL}."
       echo "Default is validate-only MuJoCo dry-run; --execute starts the SocketCAN hardware config."
       exit 0
       ;;
@@ -68,8 +62,16 @@ for name, base_url in {
     url = base_url.rstrip("/") + "/health"
     try:
         with urllib.request.urlopen(url, timeout=5.0) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            body = response.read().decode("utf-8").strip()
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        print(f"{name} server health check failed at {url}: {exc}", file=sys.stderr)
+        print("Start the model servers first, then rerun this command.", file=sys.stderr)
+        raise SystemExit(1) from exc
+    if name == "Cosmos" and not body:
+        continue
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
         print(f"{name} server health check failed at {url}: {exc}", file=sys.stderr)
         print("Start the model servers first, then rerun this command.", file=sys.stderr)
         raise SystemExit(1) from exc

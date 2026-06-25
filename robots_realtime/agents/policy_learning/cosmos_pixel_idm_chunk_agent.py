@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
-import shutil
-import subprocess
 import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -75,6 +73,24 @@ def _write_frame_video(path: Path, frames_rgb: list[np.ndarray], *, fps: float) 
         writer.release()
 
 
+def _read_video_frames(path: Path) -> list[np.ndarray]:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeError(f"could not open video for preview: {path}")
+    frames: list[np.ndarray] = []
+    try:
+        while True:
+            ok, frame_bgr = capture.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        capture.release()
+    if not frames:
+        raise RuntimeError(f"video preview had no frames: {path}")
+    return frames
+
+
 def _chunk_payload(chunk: np.ndarray, start: int = 0) -> dict[str, np.ndarray]:
     remaining = chunk[min(start, len(chunk) - 1) :]
     return {
@@ -99,27 +115,51 @@ def _post_json(url: str, payload: dict[str, Any], timeout_s: float) -> dict[str,
         raise RuntimeError(f"{url} returned HTTP {exc.code}: {detail}") from exc
 
 
-def _video_player_command(path: Path, player_cmd: str | None) -> list[str] | None:
-    path_str = str(path)
-    if player_cmd:
-        parts = shlex.split(player_cmd)
-        if any("{path}" in part for part in parts):
-            return [part.replace("{path}", path_str) for part in parts]
-        return [*parts, path_str]
-
-    mpv = shutil.which("mpv")
-    if mpv:
-        return [mpv, "--loop-file=inf", "--force-window=yes", path_str]
-
-    vlc = shutil.which("vlc") or shutil.which("cvlc")
-    if vlc:
-        return [vlc, "--loop", path_str]
-
-    xdg_open = shutil.which("xdg-open")
-    if xdg_open:
-        return [xdg_open, path_str]
-
-    return None
+def _post_multipart_bytes(
+    url: str,
+    *,
+    fields: dict[str, str],
+    files: dict[str, Path],
+    timeout_s: float,
+) -> bytes:
+    boundary = f"----cosmos-pixel-idm-{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                value.encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    for name, path in files.items():
+        path = path.expanduser().resolve()
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                (
+                    f'Content-Disposition: form-data; name="{name}"; '
+                    f'filename="{path.name}"\r\n'
+                ).encode("utf-8"),
+                b"Content-Type: video/mp4\r\n\r\n",
+                path.read_bytes(),
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    request = urllib.request.Request(
+        url,
+        data=b"".join(chunks),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{url} returned HTTP {exc.code}: {detail}") from exc
 
 
 class CosmosPixelIDMChunkAgent:
@@ -136,10 +176,14 @@ class CosmosPixelIDMChunkAgent:
         cosmos_video_fps: float = 16.0,
         validate_only: bool | None = None,
         image_key: str = "top_camera",
-        run_root: str = "/tmp/cosmos_pixel_idm_chunk_policy",
+        run_root: str = "~/Downloads/cosmos_pixel_idm_chunk_policy",
         array_key: str = "predicted_actions",
         request_timeout_s: float = 900.0,
         num_latent_conditional_frames: int = 2,
+        cosmos_width: int = 832,
+        cosmos_height: int = 480,
+        cosmos_num_frames: int = 45,
+        cosmos_num_inference_steps: int = 35,
         open_video_plan: bool | None = None,
         video_player_cmd: str | None = None,
         left_limits_path: str = DEFAULT_LEFT_LIMITS_PATH,
@@ -180,14 +224,18 @@ class CosmosPixelIDMChunkAgent:
                 "num_latent_conditional_frames must be 1 or 2, "
                 f"got {self.num_latent_conditional_frames}"
             )
+        self.cosmos_width = int(cosmos_width)
+        self.cosmos_height = int(cosmos_height)
+        self.cosmos_num_frames = int(cosmos_num_frames)
+        self.cosmos_num_inference_steps = int(cosmos_num_inference_steps)
+        if self.cosmos_width <= 0 or self.cosmos_height <= 0:
+            raise ValueError("cosmos_width and cosmos_height must be positive")
+        if self.cosmos_num_frames <= 0:
+            raise ValueError("cosmos_num_frames must be positive")
+        if self.cosmos_num_inference_steps <= 0:
+            raise ValueError("cosmos_num_inference_steps must be positive")
         self.left_limits_path = left_limits_path
         self.right_limits_path = right_limits_path
-        self.open_video_plan = (
-            _env_bool("COSMOS_PIXEL_IDM_OPEN_VIDEO_PLAN", True)
-            if open_video_plan is None
-            else bool(open_video_plan)
-        )
-        self.video_player_cmd = video_player_cmd or os.environ.get("COSMOS_PIXEL_IDM_VIDEO_PLAYER")
         self.limit_tolerance = float(limit_tolerance)
         self.gripper_tolerance = float(gripper_tolerance)
         self.gripper_clamp_tolerance = float(gripper_clamp_tolerance)
@@ -200,17 +248,21 @@ class CosmosPixelIDMChunkAgent:
         self._planning = False
         self._active_chunk: np.ndarray | None = None
         self._active_display_image: np.ndarray | None = None
+        self._plan_video_frames: list[np.ndarray] = []
+        self._plan_video_started_at = 0.0
+        self._plan_video_fps = self.cosmos_video_fps
         self._cursor = 0
         self._final_action: np.ndarray | None = None
         self._last_error: str | None = None
         self._plan_index = 0
         self._image_history: deque[np.ndarray] = deque(maxlen=4 * (self.num_latent_conditional_frames - 1) + 1)
-        self._video_player_proc: subprocess.Popen[bytes] | None = None
         print(
             "[CosmosPixelIDMChunkAgent] ready "
             f"validate_only={self.validate_only} source_hz={self.source_hz} command_hz={self.command_hz} "
             f"cosmos_url={self.cosmos_url} pixel_idm_url={self.pixel_idm_url} "
-            f"open_video_plan={self.open_video_plan}",
+            f"cosmos_video={self.cosmos_width}x{self.cosmos_height}@{self.cosmos_video_fps}x{self.cosmos_num_frames} "
+            f"steps={self.cosmos_num_inference_steps} "
+            "plan_preview=viser",
             flush=True,
         )
 
@@ -218,15 +270,16 @@ class CosmosPixelIDMChunkAgent:
         with self._lock:
             self._active_chunk = None
             self._active_display_image = None
+            self._plan_video_frames = []
+            self._plan_video_started_at = 0.0
             self._cursor = 0
             self._final_action = None
             self._last_error = None
             self._latest_obs = None
             self._planning = False
-        self._close_video_player()
 
     def close(self) -> None:
-        self._close_video_player()
+        pass
 
     def act(self, obs: dict[str, Any]) -> dict[str, Any]:
         image = _image_from_obs(obs, self.image_key)
@@ -288,7 +341,20 @@ class CosmosPixelIDMChunkAgent:
             out["_chunk"] = _chunk_payload(chunk, cursor)
         if display_image is not None:
             out["_images"] = {"top_camera": display_image}
+        plan_frame = self._current_plan_video_frame()
+        if plan_frame is not None:
+            out.setdefault("_images", {})["cosmos_plan"] = plan_frame
         return out
+
+    def _current_plan_video_frame(self) -> np.ndarray | None:
+        with self._lock:
+            frames = self._plan_video_frames
+            started_at = self._plan_video_started_at
+            fps = self._plan_video_fps
+        if not frames:
+            return None
+        idx = int(max(0.0, time.monotonic() - started_at) * max(1.0, fps)) % len(frames)
+        return frames[idx].copy()
 
     def _start_planning(self) -> None:
         with self._lock:
@@ -326,26 +392,32 @@ class CosmosPixelIDMChunkAgent:
             history = history[-frames_to_extract:]
             _write_frame_video(conditioning_path, history, fps=self.cosmos_video_fps)
 
-            cosmos_response = _post_json(
-                f"{self.cosmos_url}/generate",
-                {
-                    "image_path": str(image_path),
-                    "input_path": str(conditioning_path),
+            video_path = artifact_dir / "cosmos_plan.mp4"
+            video_bytes = _post_multipart_bytes(
+                f"{self.cosmos_url}/v1/videos/sync",
+                fields={
                     "prompt": self.prompt,
-                    "output_dir": str(artifact_dir),
-                    "name": "cosmos_plan",
-                    "num_latent_conditional_frames": self.num_latent_conditional_frames,
+                    "width": str(self.cosmos_width),
+                    "height": str(self.cosmos_height),
+                    "fps": str(int(round(self.cosmos_video_fps))),
+                    "num_frames": str(self.cosmos_num_frames),
+                    "num_inference_steps": str(self.cosmos_num_inference_steps),
                 },
-                self.request_timeout_s,
+                files={"input_reference": conditioning_path},
+                timeout_s=self.request_timeout_s,
             )
-            video_path = cosmos_response["video_path"]
-            video_fps = float(cosmos_response.get("fps") or self.cosmos_video_fps)
-            self._open_video_plan(Path(video_path))
+            video_path.write_bytes(video_bytes)
+            video_fps = self.cosmos_video_fps
+            plan_video_frames = _read_video_frames(video_path)
+            with self._lock:
+                self._plan_video_frames = plan_video_frames
+                self._plan_video_started_at = time.monotonic()
+                self._plan_video_fps = video_fps
 
             pixel_response = _post_json(
                 f"{self.pixel_idm_url}/infer",
                 {
-                    "video_path": video_path,
+                    "video_path": str(video_path),
                     "output_path": str(action_path),
                     "source_hz": self.source_hz,
                     "video_fps": video_fps,
@@ -402,51 +474,6 @@ class CosmosPixelIDMChunkAgent:
         finally:
             with self._lock:
                 self._planning = False
-
-    def _open_video_plan(self, video_path: Path) -> None:
-        if not self.open_video_plan:
-            return
-        if not video_path.exists():
-            print(f"[CosmosPixelIDMChunkAgent] video plan does not exist yet: {video_path}", flush=True)
-            return
-        command = _video_player_command(video_path, self.video_player_cmd)
-        if command is None:
-            print(
-                "[CosmosPixelIDMChunkAgent] no video player found; install mpv/vlc or set "
-                "COSMOS_PIXEL_IDM_VIDEO_PLAYER",
-                flush=True,
-            )
-            return
-
-        self._close_video_player()
-        try:
-            proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as exc:
-            print(f"[CosmosPixelIDMChunkAgent] failed to open video plan with {command}: {exc}", flush=True)
-            return
-
-        with self._lock:
-            self._video_player_proc = proc
-        print(f"[CosmosPixelIDMChunkAgent] opened video plan: {video_path}", flush=True)
-        if Path(command[0]).name == "xdg-open":
-            print(
-                "[CosmosPixelIDMChunkAgent] xdg-open does not provide reliable loop/close control; "
-                "install mpv or vlc for that behavior",
-                flush=True,
-            )
-
-    def _close_video_player(self) -> None:
-        with self._lock:
-            proc = self._video_player_proc
-            self._video_player_proc = None
-        if proc is None or proc.poll() is not None:
-            return
-        proc.terminate()
-        try:
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=2.0)
 
     def _load_actions(self, npz_path: Path) -> np.ndarray:
         if not npz_path.exists():
