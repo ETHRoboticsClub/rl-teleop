@@ -10,6 +10,7 @@ from robots_realtime.agents.policy_learning.pixel_idm_replay_agent import (
     DEFAULT_RIGHT_LIMITS_PATH,
     PixelIDMReplayAgent,
     load_and_validate_pixel_idm_window,
+    validate_pixel_idm_window,
 )
 
 
@@ -74,6 +75,22 @@ def test_accepts_current_pixel_idm_artifact_default_window_with_explicit_toleran
     assert report.source_shape == (10, 8, 14)
     assert window.shape == (8, 14)
     assert np.isfinite(window).all()
+
+
+def test_accepts_in_memory_generated_window_with_same_validation() -> None:
+    window, report = validate_pixel_idm_window(
+        _valid_window(),
+        source_name="<generated>",
+        source_shape=_valid_window().shape,
+        left_limits_path=DEFAULT_LEFT_LIMITS_PATH,
+        right_limits_path=DEFAULT_RIGHT_LIMITS_PATH,
+        source_hz=10,
+        command_hz=30,
+    )
+
+    assert report.npz_path == "<generated>"
+    assert report.source_shape == _valid_window().shape
+    assert window.shape == (3, 14)
 
 
 def test_rejects_missing_key(tmp_path: Path) -> None:

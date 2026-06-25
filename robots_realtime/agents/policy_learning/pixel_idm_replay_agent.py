@@ -150,7 +150,44 @@ def load_and_validate_pixel_idm_window(
     if not 0 <= int(window_idx) < actions.shape[0]:
         raise IndexError(f"window_idx={window_idx} is out of range for N={actions.shape[0]}")
 
-    window = np.array(actions[int(window_idx)], dtype=np.float32, copy=True)
+    return validate_pixel_idm_window(
+        actions[int(window_idx)],
+        source_name=str(npz_path),
+        array_key=array_key,
+        window_idx=window_idx,
+        source_shape=tuple(actions.shape),
+        left_limits_path=left_limits_path,
+        right_limits_path=right_limits_path,
+        limit_tolerance=limit_tolerance,
+        gripper_tolerance=gripper_tolerance,
+        gripper_clamp_tolerance=gripper_clamp_tolerance,
+        max_arm_frame_delta_rad=max_arm_frame_delta_rad,
+        max_gripper_frame_delta=max_gripper_frame_delta,
+        source_hz=source_hz,
+        command_hz=command_hz,
+    )
+
+
+def validate_pixel_idm_window(
+    window: np.ndarray,
+    *,
+    source_name: str = "<memory>",
+    array_key: str = "predicted_actions",
+    window_idx: int = 0,
+    source_shape: tuple[int, ...] | None = None,
+    left_limits_path: str | Path = DEFAULT_LEFT_LIMITS_PATH,
+    right_limits_path: str | Path = DEFAULT_RIGHT_LIMITS_PATH,
+    limit_tolerance: float = 1e-6,
+    gripper_tolerance: float = 1e-6,
+    gripper_clamp_tolerance: float = 2e-2,
+    max_arm_frame_delta_rad: float = 0.5,
+    max_gripper_frame_delta: float = 0.25,
+    source_hz: float | None = None,
+    command_hz: float | None = None,
+) -> tuple[np.ndarray, PixelIDMValidationReport]:
+    window = np.array(window, dtype=np.float32, copy=True)
+    if window.ndim != 2 or window.shape[1] != 14:
+        raise ValueError(f"{array_key!r} window must have shape (T, 14), got {window.shape}")
     if window.shape[0] < 2:
         raise ValueError(f"selected window must have T >= 2, got shape {window.shape}")
     if not np.all(np.isfinite(window)):
@@ -202,10 +239,10 @@ def load_and_validate_pixel_idm_window(
         )
 
     report = PixelIDMValidationReport(
-        npz_path=str(npz_path),
+        npz_path=source_name,
         array_key=array_key,
         window_idx=int(window_idx),
-        source_shape=tuple(actions.shape),
+        source_shape=tuple(source_shape) if source_shape is not None else tuple(window.shape),
         selected_shape=tuple(window.shape),
         first_state=window[0].copy(),
         last_state=window[-1].copy(),
