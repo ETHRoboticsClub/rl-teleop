@@ -9,10 +9,10 @@ see what the hardware is doing from any browser pointed at its port.
 
 Auto-opens the viser URL in a browser when a display is detected. Prefers
 ``chromium`` / ``google-chrome`` kiosk mode for a fullscreen, chromeless
-window that we can gracefully kill on ``cleanup()``. Falls back to
-``webbrowser.open()`` (standard tab) if no Chromium-family browser is
-installed, and skips entirely on headless machines (no ``DISPLAY`` /
-``WAYLAND_DISPLAY``).
+window that we can gracefully kill on ``cleanup()``. Chromium-family browsers
+are launched with background throttling disabled so Viser keeps rendering when
+the window loses focus. Falls back to ``webbrowser.open()`` (standard tab) if no
+managed browser is installed, and skips entirely on headless machines.
 
 YAML example::
 
@@ -830,30 +830,21 @@ class ViserMonitorNode(Node):
     def _open_browser(self) -> None:
         url = f"http://localhost:{self._port}"
 
-        # Only auto-launch when BOTH of these are true:
-        #   1. This terminal has no DISPLAY / WAYLAND_DISPLAY set (we're in SSH
-        #      or a bare tty) — because if the user is sitting at the machine
-        #      running the session from a graphical terminal, chromium --kiosk
-        #      would cover the terminal and kiosk mode traps input, leaving
-        #      them no way to stop the session.
-        #   2. A local graphical session (monitor + logged-in desktop) exists
-        #      for our uid — so there's actually a physical display to pop up on.
-        this_terminal_is_graphical = bool(
-            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-        )
-        if this_terminal_is_graphical:
-            logger.info(
-                "[%s] launched from a graphical terminal (DISPLAY set) — "
-                "skipping auto-browser so the console stays reachable. Visit %s",
-                self.name, url,
-            )
-            return
-
-        env_overrides = self._active_local_graphical_session_for_uid(os.geteuid())
-        source = "loginctl"
-        if not env_overrides:
-            env_overrides = self._fallback_display_from_sockets()
-            source = "socket_probe"
+        env_overrides: dict[str, str] = {}
+        source = "current_env"
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            if os.environ.get("DISPLAY"):
+                env_overrides["DISPLAY"] = os.environ["DISPLAY"]
+            if os.environ.get("WAYLAND_DISPLAY"):
+                env_overrides["WAYLAND_DISPLAY"] = os.environ["WAYLAND_DISPLAY"]
+            if os.environ.get("XDG_RUNTIME_DIR"):
+                env_overrides["XDG_RUNTIME_DIR"] = os.environ["XDG_RUNTIME_DIR"]
+        else:
+            env_overrides = self._active_local_graphical_session_for_uid(os.geteuid())
+            source = "loginctl"
+            if not env_overrides:
+                env_overrides = self._fallback_display_from_sockets()
+                source = "socket_probe"
         if not env_overrides:
             logger.info(
                 "[%s] no local graphical session found for uid=%d — skipping auto-browser; visit %s",
@@ -866,22 +857,31 @@ class ViserMonitorNode(Node):
         )
 
         # A display is targetable. Prefer a Chromium-family browser in kiosk
-        # mode so the window is fullscreen and we can kill the process on
-        # cleanup. Firefox also has a --kiosk flag. Fall back to the stdlib
-        # webbrowser module if none of those are installed.
+        # mode so the window is fullscreen, killable on cleanup, and not
+        # throttled when focus moves elsewhere. Firefox has a --kiosk flag but
+        # no equivalent flag set here, so it remains a fallback.
         kiosk_candidates: list[list[str]] = []
         if self._fullscreen:
+            chromium_flags = [
+                "--kiosk",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-features=CalculateNativeWinOcclusion",
+            ]
             for browser in (
                 "chromium",
                 "chromium-browser",
                 "google-chrome",
                 "google-chrome-stable",
-                "firefox",
             ):
                 bin_path = shutil.which(browser)
                 if bin_path is None:
                     continue
-                kiosk_candidates.append([bin_path, "--kiosk", url])
+                kiosk_candidates.append([bin_path, *chromium_flags, url])
+            firefox = shutil.which("firefox")
+            if firefox is not None:
+                kiosk_candidates.append([firefox, "--kiosk", url])
 
         child_env = os.environ.copy()
         child_env.update(env_overrides)

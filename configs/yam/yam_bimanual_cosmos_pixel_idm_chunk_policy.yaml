@@ -24,7 +24,7 @@ nodes:
       open_video_plan: false
       left_limits_path: robot_configs/yam/xdof_hq/left.yaml
       right_limits_path: robot_configs/yam/xdof_hq/right.yaml
-      limit_tolerance: 0.05
+      limit_tolerance: 0.15
       gripper_clamp_tolerance: 0.02
       max_handoff_distance: 0.75
     state_topics:

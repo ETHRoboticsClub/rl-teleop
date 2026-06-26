@@ -194,6 +194,7 @@ class CosmosPixelIDMChunkAgent:
         max_arm_frame_delta_rad: float = 0.5,
         max_gripper_frame_delta: float = 0.25,
         max_handoff_distance: float = 0.75,
+        unsafe_sim_playback: bool = False,
     ) -> None:
         if source_hz <= 0:
             raise ValueError(f"source_hz must be > 0, got {source_hz}")
@@ -224,8 +225,8 @@ class CosmosPixelIDMChunkAgent:
                 "num_latent_conditional_frames must be 1 or 2, "
                 f"got {self.num_latent_conditional_frames}"
             )
-        self.cosmos_width = int(cosmos_width)
-        self.cosmos_height = int(cosmos_height)
+        self.cosmos_width = int(os.environ.get("COSMOS_PIXEL_IDM_COSMOS_WIDTH", cosmos_width))
+        self.cosmos_height = int(os.environ.get("COSMOS_PIXEL_IDM_COSMOS_HEIGHT", cosmos_height))
         self.cosmos_num_frames = int(cosmos_num_frames)
         self.cosmos_num_inference_steps = int(cosmos_num_inference_steps)
         if self.cosmos_width <= 0 or self.cosmos_height <= 0:
@@ -242,6 +243,7 @@ class CosmosPixelIDMChunkAgent:
         self.max_arm_frame_delta_rad = float(max_arm_frame_delta_rad)
         self.max_gripper_frame_delta = float(max_gripper_frame_delta)
         self.max_handoff_distance = float(max_handoff_distance)
+        self.unsafe_sim_playback = bool(unsafe_sim_playback)
 
         self._lock = threading.Lock()
         self._latest_obs: dict[str, Any] | None = None
@@ -262,6 +264,7 @@ class CosmosPixelIDMChunkAgent:
             f"cosmos_url={self.cosmos_url} pixel_idm_url={self.pixel_idm_url} "
             f"cosmos_video={self.cosmos_width}x{self.cosmos_height}@{self.cosmos_video_fps}x{self.cosmos_num_frames} "
             f"steps={self.cosmos_num_inference_steps} "
+            f"unsafe_sim_playback={self.unsafe_sim_playback} "
             "plan_preview=viser",
             flush=True,
         )
@@ -305,13 +308,13 @@ class CosmosPixelIDMChunkAgent:
             self._start_planning()
 
         if active is None:
-            if final_action is None or self.validate_only:
+            if final_action is None or (self.validate_only and not self.unsafe_sim_playback):
                 return self._meta_action(display_image, None)
             action = _command_from_row(final_action)
             action.update(self._meta_action(display_image, None))
             return action
 
-        if self.validate_only:
+        if self.validate_only and not self.unsafe_sim_playback:
             return self._meta_action(display_image, active)
 
         with self._lock:
@@ -429,30 +432,48 @@ class CosmosPixelIDMChunkAgent:
             source_actions = self._load_actions(npz_path)
 
             chunk = interpolate_action_window(source_actions, source_hz=self.source_hz, command_hz=self.command_hz)
-            chunk, report = validate_pixel_idm_window(
-                chunk,
-                source_name=str(npz_path),
-                source_shape=tuple(source_actions.shape),
-                left_limits_path=self.left_limits_path,
-                right_limits_path=self.right_limits_path,
-                limit_tolerance=self.limit_tolerance,
-                gripper_tolerance=self.gripper_tolerance,
-                gripper_clamp_tolerance=self.gripper_clamp_tolerance,
-                max_arm_frame_delta_rad=self.max_arm_frame_delta_rad,
-                max_gripper_frame_delta=self.max_gripper_frame_delta,
-                source_hz=None,
-                command_hz=None,
-            )
+            if self.validate_only and self.unsafe_sim_playback:
+                if not np.all(np.isfinite(chunk)):
+                    raise ValueError("generated chunk contains NaN or Inf")
+                chunk[:, 6] = np.clip(chunk[:, 6], 0.0, 1.0)
+                chunk[:, 13] = np.clip(chunk[:, 13], 0.0, 1.0)
+                report = None
+            else:
+                chunk, report = validate_pixel_idm_window(
+                    chunk,
+                    source_name=str(npz_path),
+                    source_shape=tuple(source_actions.shape),
+                    left_limits_path=self.left_limits_path,
+                    right_limits_path=self.right_limits_path,
+                    limit_tolerance=self.limit_tolerance,
+                    gripper_tolerance=self.gripper_tolerance,
+                    gripper_clamp_tolerance=self.gripper_clamp_tolerance,
+                    max_arm_frame_delta_rad=self.max_arm_frame_delta_rad,
+                    max_gripper_frame_delta=self.max_gripper_frame_delta,
+                    source_hz=None,
+                    command_hz=None,
+                )
             left_distance = float(np.linalg.norm(chunk[0, :7] - obs["left"]))
             right_distance = float(np.linalg.norm(chunk[0, 7:] - obs["right"]))
-            if max(left_distance, right_distance) > self.max_handoff_distance:
+            if (
+                max(left_distance, right_distance) > self.max_handoff_distance
+                and not (self.validate_only and self.unsafe_sim_playback)
+            ):
                 raise ValueError(
                     "generated chunk first action is too far from live robot state "
                     f"(left={left_distance:.6f}, right={right_distance:.6f}, "
                     f"max={self.max_handoff_distance:.6f})"
                 )
-            print(report.with_handoff(left_distance, right_distance).format(), flush=True)
-            if self.validate_only:
+            if report is not None:
+                print(report.with_handoff(left_distance, right_distance).format(), flush=True)
+            if self.validate_only and self.unsafe_sim_playback:
+                print(
+                    "[CosmosPixelIDMChunkAgent] unsafe_sim_playback=true; "
+                    "bypassing hardware validation and commanding sim only "
+                    f"(handoff left={left_distance:.6f}, right={right_distance:.6f})",
+                    flush=True,
+                )
+            elif self.validate_only:
                 print("[CosmosPixelIDMChunkAgent] validate_only=true; chunk will not command hardware", flush=True)
             print(
                 f"[CosmosPixelIDMChunkAgent] plan {plan_index} ready: "

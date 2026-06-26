@@ -445,6 +445,10 @@ class XdofSimNode(Node):
         control_decimation: Physics steps per control step.
         camera_fps:         Camera render / viser update rate in Hz.
         cmd_topics:         Dict mapping arm key → subscribed topic.
+        command_flip_joints: Reverse the 6 arm joints in incoming command
+                            vectors before writing MuJoCo qpos. YAM policy
+                            commands are in motor order; Xdof MuJoCo uses
+                            MJCF/URDF order.
         viser_port:         Viser server port. None to disable.
         vr_port:            VR streaming port. None to disable; auto-starts
                             only when a Quest device is detected via ADB.
@@ -464,6 +468,7 @@ class XdofSimNode(Node):
         control_decimation: int = 17,
         camera_fps: float = 30.0,
         cmd_topics: dict | None = None,
+        command_flip_joints: bool = False,
         viser_port: int | None = 8765,
         vr_port: int | None = 8012,
         writer=None,
@@ -475,6 +480,7 @@ class XdofSimNode(Node):
         self._control_decimation = control_decimation
         self._camera_fps = camera_fps
         self._cmd_topics: dict[str, str] = cmd_topics or {}
+        self._command_flip_joints = bool(command_flip_joints)
         self._viser_port = viser_port
         self._vr_port = vr_port
 
@@ -598,6 +604,9 @@ class XdofSimNode(Node):
             if jp is None:
                 continue
             arr = np.asarray(jp, dtype=np.float64)
+            if self._command_flip_joints and arr.shape[0] >= _DOFS_PER_ARM - 1:
+                arr = arr.copy()
+                arr[: _DOFS_PER_ARM - 1] = arr[: _DOFS_PER_ARM - 1][::-1]
 
             with self._cmd_lock:
                 if arm_key == "left":
@@ -799,6 +808,7 @@ class XdofSimNode(Node):
             "control_decimation": params.get("control_decimation", 17),
             "camera_fps": params.get("camera_fps", 30.0),
             "cmd_topics": params.get("cmd_topics", {}),
+            "command_flip_joints": bool(params.get("command_flip_joints", False)),
             "viser_port": params.get("viser_port", 8765),
             "vr_port": params.get("vr_port", 8012),
         }
