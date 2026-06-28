@@ -162,7 +162,7 @@ def _post_multipart_bytes(
         raise RuntimeError(f"{url} returned HTTP {exc.code}: {detail}") from exc
 
 
-class CosmosPixelIDMChunkAgent:
+class CosmosTopCameraPixelIDMChunkAgent:
     use_joint_state_as_action = False
 
     def __init__(
@@ -173,16 +173,16 @@ class CosmosPixelIDMChunkAgent:
         prompt: str | None = None,
         source_hz: float = 10.0,
         command_hz: float = 30.0,
-        cosmos_video_fps: float = 16.0,
+        cosmos_video_fps: float = 10.0,
         validate_only: bool | None = None,
         image_key: str = "top_camera",
-        run_root: str = "~/Downloads/cosmos_pixel_idm_chunk_policy",
+        run_root: str = "~/Downloads/cosmos_top_camera_pixel_idm_chunk_policy",
         array_key: str = "predicted_actions",
         request_timeout_s: float = 900.0,
         num_latent_conditional_frames: int = 2,
         cosmos_width: int = 832,
         cosmos_height: int = 480,
-        cosmos_num_frames: int = 45,
+        cosmos_num_frames: int = 11,
         cosmos_num_inference_steps: int = 35,
         open_video_plan: bool | None = None,
         video_player_cmd: str | None = None,
@@ -209,7 +209,7 @@ class CosmosPixelIDMChunkAgent:
         ).rstrip("/")
         self.prompt = prompt or os.environ.get("COSMOS_PIXEL_IDM_PROMPT")
         if not self.prompt:
-            raise ValueError("CosmosPixelIDMChunkAgent requires a prompt or COSMOS_PIXEL_IDM_PROMPT")
+            raise ValueError("CosmosTopCameraPixelIDMChunkAgent requires a prompt or COSMOS_PIXEL_IDM_PROMPT")
 
         self.source_hz = float(source_hz)
         self.command_hz = float(command_hz)
@@ -259,7 +259,7 @@ class CosmosPixelIDMChunkAgent:
         self._plan_index = 0
         self._image_history: deque[np.ndarray] = deque(maxlen=4 * (self.num_latent_conditional_frames - 1) + 1)
         print(
-            "[CosmosPixelIDMChunkAgent] ready "
+            "[CosmosTopCameraPixelIDMChunkAgent] ready "
             f"validate_only={self.validate_only} source_hz={self.source_hz} command_hz={self.command_hz} "
             f"cosmos_url={self.cosmos_url} pixel_idm_url={self.pixel_idm_url} "
             f"cosmos_video={self.cosmos_width}x{self.cosmos_height}@{self.cosmos_video_fps}x{self.cosmos_num_frames} "
@@ -364,7 +364,7 @@ class CosmosPixelIDMChunkAgent:
             if self._planning or self._latest_obs is None:
                 return
             self._planning = True
-        thread = threading.Thread(target=self._planning_worker, name="CosmosPixelIDMChunkAgent_planner", daemon=True)
+        thread = threading.Thread(target=self._planning_worker, name="CosmosTopCameraPixelIDMChunkAgent_planner", daemon=True)
         thread.start()
 
     def _planning_worker(self) -> None:
@@ -395,7 +395,7 @@ class CosmosPixelIDMChunkAgent:
             history = history[-frames_to_extract:]
             _write_frame_video(conditioning_path, history, fps=self.cosmos_video_fps)
 
-            video_path = artifact_dir / "cosmos_plan.mp4"
+            video_path = artifact_dir / "cosmos_top_camera_plan.mp4"
             video_bytes = _post_multipart_bytes(
                 f"{self.cosmos_url}/v1/videos/sync",
                 fields={
@@ -468,15 +468,15 @@ class CosmosPixelIDMChunkAgent:
                 print(report.with_handoff(left_distance, right_distance).format(), flush=True)
             if self.validate_only and self.unsafe_sim_playback:
                 print(
-                    "[CosmosPixelIDMChunkAgent] unsafe_sim_playback=true; "
+                    "[CosmosTopCameraPixelIDMChunkAgent] unsafe_sim_playback=true; "
                     "bypassing hardware validation and commanding sim only "
                     f"(handoff left={left_distance:.6f}, right={right_distance:.6f})",
                     flush=True,
                 )
             elif self.validate_only:
-                print("[CosmosPixelIDMChunkAgent] validate_only=true; chunk will not command hardware", flush=True)
+                print("[CosmosTopCameraPixelIDMChunkAgent] validate_only=true; chunk will not command hardware", flush=True)
             print(
-                f"[CosmosPixelIDMChunkAgent] plan {plan_index} ready: "
+                f"[CosmosTopCameraPixelIDMChunkAgent] plan {plan_index} ready: "
                 f"{len(chunk)} command ticks in {time.monotonic() - t0:.2f}s "
                 f"video={video_path} actions={npz_path}",
                 flush=True,
@@ -488,7 +488,7 @@ class CosmosPixelIDMChunkAgent:
                 self._cursor = 0
                 self._last_error = None
         except Exception as exc:
-            print(f"[CosmosPixelIDMChunkAgent] planning failed: {exc}", flush=True)
+            print(f"[CosmosTopCameraPixelIDMChunkAgent] planning failed: {exc}", flush=True)
             traceback.print_exc()
             with self._lock:
                 self._last_error = str(exc)

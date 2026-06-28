@@ -1,21 +1,22 @@
 version: "1"
 
 session:
-  save_root: recordings/cosmos_pixel_idm_chunk_policy
+  save_root: recordings/cosmos_top_camera_pixel_idm_chunk_policy
   start_paused: true
   record_on_unpause: false
 
 nodes:
   - type: AgentNode
-    name: cosmos_pixel_idm_policy
-    agent_class: robots_realtime.agents.policy_learning.cosmos_pixel_idm_chunk_agent:CosmosPixelIDMChunkAgent
+    name: cosmos_top_camera_pixel_idm_policy
+    agent_class: robots_realtime.agents.policy_learning.cosmos_top_camera_pixel_idm_chunk_agent:CosmosTopCameraPixelIDMChunkAgent
     agent_kwargs:
       cosmos_url: http://127.0.0.1:8021
       pixel_idm_url: http://127.0.0.1:8022
       prompt:
       source_hz: 10
       command_hz: 30
-      cosmos_video_fps: 16
+      cosmos_video_fps: 10
+      cosmos_num_frames: 11
       image_key: top_camera
       validate_only:
       array_key: predicted_actions
@@ -38,7 +39,7 @@ nodes:
   - type: RobotNode
     name: yam_left
     robot_config: robot_configs/yam/xdof_hq/left_can_follow.yaml
-    cmd_topic: cosmos_pixel_idm_policy/left_pos
+    cmd_topic: cosmos_top_camera_pixel_idm_policy/left_pos
     poll_freq: 200
     ramp_duration_s: 1.5
     startup_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
@@ -47,7 +48,7 @@ nodes:
   - type: RobotNode
     name: yam_right
     robot_config: robot_configs/yam/xdof_hq/right_can_follow.yaml
-    cmd_topic: cosmos_pixel_idm_policy/right_pos
+    cmd_topic: cosmos_top_camera_pixel_idm_policy/right_pos
     poll_freq: 200
     ramp_duration_s: 1.5
     startup_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
@@ -69,7 +70,7 @@ nodes:
     up_axis: "+z"
     initial_camera_position: [-0.7, -0.31, 0.3]
     initial_camera_look_at: [0.45, -0.31, 0.3]
-    chunk_topic: cosmos_pixel_idm_policy/chunk
+    chunk_topic: cosmos_top_camera_pixel_idm_policy/chunk
     n_chunk_frames: 10
     chunk_frame_axes_length: 0.03
     urdfs:
@@ -93,5 +94,5 @@ nodes:
           position: [0.0, -0.61, 0.0]
           rotation: [1.0, 0.0, 0.0, 0.0]
     image_topics:
-      top: cosmos_pixel_idm_policy/image/top_camera
-      plan: cosmos_pixel_idm_policy/image/cosmos_plan
+      top: cosmos_top_camera_pixel_idm_policy/image/top_camera
+      plan: cosmos_top_camera_pixel_idm_policy/image/cosmos_plan

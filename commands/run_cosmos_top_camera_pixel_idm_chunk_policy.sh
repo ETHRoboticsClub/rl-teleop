@@ -61,10 +61,10 @@ export COSMOS_PIXEL_IDM_COSMOS_URL="$COSMOS_URL"
 export COSMOS_PIXEL_IDM_PIXEL_URL="$PIXEL_IDM_URL"
 if [[ "$EXECUTE" == "1" ]]; then
   export COSMOS_PIXEL_IDM_VALIDATE_ONLY=0
-  CONFIG="configs/yam/yam_bimanual_cosmos_pixel_idm_chunk_policy.yaml"
+  CONFIG="configs/yam/yam_bimanual_cosmos_top_camera_pixel_idm_chunk_policy.yaml"
 else
   export COSMOS_PIXEL_IDM_VALIDATE_ONLY=1
-  CONFIG="configs/yam/yam_bimanual_cosmos_pixel_idm_chunk_policy_sim.yaml"
+  CONFIG="configs/yam/yam_bimanual_cosmos_top_camera_pixel_idm_chunk_policy_sim.yaml"
 fi
 
 cd "$(dirname "$0")/.."

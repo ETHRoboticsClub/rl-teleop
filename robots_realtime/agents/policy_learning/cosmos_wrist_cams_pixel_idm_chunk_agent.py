@@ -143,7 +143,7 @@ def _post_vllm_video_sync(
     condition_video_keep: str,
     timeout_s: float,
 ) -> None:
-    boundary = f"----rlteleop-cosmos3-{time.time_ns()}"
+    boundary = f"----rlteleop-cosmos-wrist-cams-{time.time_ns()}"
 
     def add_field(parts: list[bytes], name: str, value: str) -> None:
         parts.extend(
@@ -229,7 +229,7 @@ def _video_player_command(path: Path, player_cmd: str | None) -> list[str] | Non
     return None
 
 
-class Cosmos3PixelIDMChunkAgent:
+class CosmosWristCamsPixelIDMChunkAgent:
     use_joint_state_as_action = False
 
     def __init__(
@@ -240,7 +240,7 @@ class Cosmos3PixelIDMChunkAgent:
         prompt: str | None = None,
         source_hz: float = 10.0,
         command_hz: float = 30.0,
-        cosmos_video_fps: float = 16.0,
+        cosmos_video_fps: float = 10.0,
         validate_only: bool | None = None,
         image_key: str = "top_camera",
         image_keys: dict[str, str] | None = None,
@@ -249,7 +249,7 @@ class Cosmos3PixelIDMChunkAgent:
         request_timeout_s: float = 900.0,
         num_latent_conditional_frames: int = 2,
         vllm_size: str = "640x480",
-        vllm_num_frames: int = 121,
+        vllm_num_frames: int = 11,
         vllm_num_inference_steps: int = 35,
         vllm_guidance_scale: float = 6.0,
         vllm_flow_shift: float = 10.0,
@@ -281,7 +281,7 @@ class Cosmos3PixelIDMChunkAgent:
         ).rstrip("/")
         self.prompt = prompt or os.environ.get("COSMOS_PIXEL_IDM_PROMPT")
         if not self.prompt:
-            raise ValueError("Cosmos3PixelIDMChunkAgent requires a prompt or COSMOS_PIXEL_IDM_PROMPT")
+            raise ValueError("CosmosWristCamsPixelIDMChunkAgent requires a prompt or COSMOS_PIXEL_IDM_PROMPT")
 
         self.source_hz = float(source_hz)
         self.command_hz = float(command_hz)
@@ -343,7 +343,7 @@ class Cosmos3PixelIDMChunkAgent:
         self._image_history: deque[np.ndarray] = deque(maxlen=4 * (self.num_latent_conditional_frames - 1) + 1)
         self._video_player_proc: subprocess.Popen[bytes] | None = None
         print(
-            "[Cosmos3PixelIDMChunkAgent] ready "
+            "[CosmosWristCamsPixelIDMChunkAgent] ready "
             f"validate_only={self.validate_only} source_hz={self.source_hz} command_hz={self.command_hz} "
             f"cosmos_url={self.cosmos_url} pixel_idm_url={self.pixel_idm_url} "
             f"open_video_plan={self.open_video_plan}",
@@ -435,7 +435,7 @@ class Cosmos3PixelIDMChunkAgent:
             if self._planning or self._latest_obs is None:
                 return
             self._planning = True
-        thread = threading.Thread(target=self._planning_worker, name="Cosmos3PixelIDMChunkAgent_planner", daemon=True)
+        thread = threading.Thread(target=self._planning_worker, name="CosmosWristCamsPixelIDMChunkAgent_planner", daemon=True)
         thread.start()
 
     def _planning_worker(self) -> None:
@@ -454,7 +454,7 @@ class Cosmos3PixelIDMChunkAgent:
             artifact_dir.mkdir(parents=True, exist_ok=True)
             image_path = artifact_dir / "cosmos_input.png"
             conditioning_path = artifact_dir / "cosmos_conditioning.mp4"
-            video_path = artifact_dir / "cosmos3_plan.mp4"
+            video_path = artifact_dir / "cosmos_wrist_cams_plan.mp4"
             action_path = artifact_dir / "pixel_idm_actions.npz"
             cv2.imwrite(str(image_path), cv2.cvtColor(obs["image"], cv2.COLOR_RGB2BGR))
             frames_to_extract = 4 * (self.num_latent_conditional_frames - 1) + 1
@@ -526,9 +526,9 @@ class Cosmos3PixelIDMChunkAgent:
                 )
             print(report.with_handoff(left_distance, right_distance).format(), flush=True)
             if self.validate_only:
-                print("[Cosmos3PixelIDMChunkAgent] validate_only=true; chunk will not command hardware", flush=True)
+                print("[CosmosWristCamsPixelIDMChunkAgent] validate_only=true; chunk will not command hardware", flush=True)
             print(
-                f"[Cosmos3PixelIDMChunkAgent] plan {plan_index} ready: "
+                f"[CosmosWristCamsPixelIDMChunkAgent] plan {plan_index} ready: "
                 f"{len(chunk)} command ticks in {time.monotonic() - t0:.2f}s "
                 f"video={video_path} actions={npz_path}",
                 flush=True,
@@ -540,7 +540,7 @@ class Cosmos3PixelIDMChunkAgent:
                 self._cursor = 0
                 self._last_error = None
         except Exception as exc:
-            print(f"[Cosmos3PixelIDMChunkAgent] planning failed: {exc}", flush=True)
+            print(f"[CosmosWristCamsPixelIDMChunkAgent] planning failed: {exc}", flush=True)
             traceback.print_exc()
             with self._lock:
                 self._last_error = str(exc)
@@ -552,12 +552,12 @@ class Cosmos3PixelIDMChunkAgent:
         if not self.open_video_plan:
             return
         if not video_path.exists():
-            print(f"[Cosmos3PixelIDMChunkAgent] video plan does not exist yet: {video_path}", flush=True)
+            print(f"[CosmosWristCamsPixelIDMChunkAgent] video plan does not exist yet: {video_path}", flush=True)
             return
         command = _video_player_command(video_path, self.video_player_cmd)
         if command is None:
             print(
-                "[Cosmos3PixelIDMChunkAgent] no video player found; install mpv/vlc or set "
+                "[CosmosWristCamsPixelIDMChunkAgent] no video player found; install mpv/vlc or set "
                 "COSMOS_PIXEL_IDM_VIDEO_PLAYER",
                 flush=True,
             )
@@ -567,15 +567,15 @@ class Cosmos3PixelIDMChunkAgent:
         try:
             proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as exc:
-            print(f"[Cosmos3PixelIDMChunkAgent] failed to open video plan with {command}: {exc}", flush=True)
+            print(f"[CosmosWristCamsPixelIDMChunkAgent] failed to open video plan with {command}: {exc}", flush=True)
             return
 
         with self._lock:
             self._video_player_proc = proc
-        print(f"[Cosmos3PixelIDMChunkAgent] opened video plan: {video_path}", flush=True)
+        print(f"[CosmosWristCamsPixelIDMChunkAgent] opened video plan: {video_path}", flush=True)
         if Path(command[0]).name == "xdg-open":
             print(
-                "[Cosmos3PixelIDMChunkAgent] xdg-open does not provide reliable loop/close control; "
+                "[CosmosWristCamsPixelIDMChunkAgent] xdg-open does not provide reliable loop/close control; "
                 "install mpv or vlc for that behavior",
                 flush=True,
             )
