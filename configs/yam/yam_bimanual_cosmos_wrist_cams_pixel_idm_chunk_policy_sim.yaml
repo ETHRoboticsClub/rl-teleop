@@ -58,17 +58,55 @@ nodes:
 
   - type: CameraNode
     name: camera_left
-    driver: RealSenseCamera
-    device_id: "218722271050"
-    resolution: VGA
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.4:1.0-video-index0
+    resolution: [640, 480]
     fps: 30
+    fourcc: MJPG
+    v4l2_controls:
+      brightness: 0
+      contrast: 28
+      saturation: 64
+      hue: 0
+      white_balance_automatic: 1
+      gamma: 100
+      gain: 0
+      power_line_frequency: 1
+      sharpness: 3
+      backlight_compensation: 0
+      auto_exposure: 1
+      exposure_dynamic_framerate: 1
+      exposure_time_absolute: 50
+    auto_exposure_enabled: true
+    auto_exposure_target: 120
+    auto_exposure_min: 20
+    auto_exposure_max: 130
 
   - type: CameraNode
     name: camera_right
-    driver: RealSenseCamera
-    device_id: "218622275506"
-    resolution: VGA
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.2:1.0-video-index0
+    resolution: [640, 480]
     fps: 30
+    fourcc: MJPG
+    v4l2_controls:
+      brightness: 0
+      contrast: 28
+      saturation: 64
+      hue: 0
+      white_balance_automatic: 1
+      gamma: 100
+      gain: 0
+      power_line_frequency: 1
+      sharpness: 3
+      backlight_compensation: 0
+      auto_exposure: 1
+      exposure_dynamic_framerate: 1
+      exposure_time_absolute: 50
+    auto_exposure_enabled: true
+    auto_exposure_target: 120
+    auto_exposure_min: 20
+    auto_exposure_max: 130
 
   - type: XdofSimNode
     name: yam

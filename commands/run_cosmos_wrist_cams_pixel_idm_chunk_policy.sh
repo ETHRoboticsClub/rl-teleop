@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       echo "Usage: $0 --prompt \"task prompt\" [--cosmos-url URL] [--pixel-idm-url URL] [--execute]"
-      echo "Cosmos defaults to a local vLLM-Omni server at http://127.0.0.1:8000."
+      echo "Cosmos defaults to the local EC2 tunnel at http://127.0.0.1:8021."
       echo "Default is validate-only MuJoCo dry-run; --execute starts the SocketCAN hardware config."
       exit 0
       ;;
