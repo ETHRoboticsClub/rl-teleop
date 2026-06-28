@@ -183,6 +183,7 @@ class CosmosTopCameraPixelIDMChunkAgent:
         cosmos_width: int = 832,
         cosmos_height: int = 480,
         cosmos_num_frames: int = 61,
+        cosmos_initial_num_frames: int | None = None,
         cosmos_num_inference_steps: int = 35,
         open_video_plan: bool | None = None,
         video_player_cmd: str | None = None,
@@ -228,11 +229,14 @@ class CosmosTopCameraPixelIDMChunkAgent:
         self.cosmos_width = int(os.environ.get("COSMOS_PIXEL_IDM_COSMOS_WIDTH", cosmos_width))
         self.cosmos_height = int(os.environ.get("COSMOS_PIXEL_IDM_COSMOS_HEIGHT", cosmos_height))
         self.cosmos_num_frames = int(cosmos_num_frames)
+        self.cosmos_initial_num_frames = None if cosmos_initial_num_frames is None else int(cosmos_initial_num_frames)
         self.cosmos_num_inference_steps = int(cosmos_num_inference_steps)
         if self.cosmos_width <= 0 or self.cosmos_height <= 0:
             raise ValueError("cosmos_width and cosmos_height must be positive")
         if self.cosmos_num_frames <= 0:
             raise ValueError("cosmos_num_frames must be positive")
+        if self.cosmos_initial_num_frames is not None and self.cosmos_initial_num_frames <= 0:
+            raise ValueError("cosmos_initial_num_frames must be positive")
         if self.cosmos_num_inference_steps <= 0:
             raise ValueError("cosmos_num_inference_steps must be positive")
         self.left_limits_path = left_limits_path
@@ -263,6 +267,7 @@ class CosmosTopCameraPixelIDMChunkAgent:
             f"validate_only={self.validate_only} source_hz={self.source_hz} command_hz={self.command_hz} "
             f"cosmos_url={self.cosmos_url} pixel_idm_url={self.pixel_idm_url} "
             f"cosmos_video={self.cosmos_width}x{self.cosmos_height}@{self.cosmos_video_fps}x{self.cosmos_num_frames} "
+            f"initial_num_frames={self.cosmos_initial_num_frames} "
             f"steps={self.cosmos_num_inference_steps} "
             f"unsafe_sim_playback={self.unsafe_sim_playback} "
             "plan_preview=viser",
@@ -380,6 +385,7 @@ class CosmosTopCameraPixelIDMChunkAgent:
         artifact_dir = self.run_root / time.strftime("%Y%m%d_%H%M%S") / f"plan_{plan_index:04d}"
         try:
             t0 = time.monotonic()
+            num_frames = self._num_frames_for_plan(plan_index)
             artifact_dir.mkdir(parents=True, exist_ok=True)
             image_path = artifact_dir / "cosmos_input.png"
             conditioning_path = artifact_dir / "cosmos_conditioning.mp4"
@@ -403,7 +409,7 @@ class CosmosTopCameraPixelIDMChunkAgent:
                     "width": str(self.cosmos_width),
                     "height": str(self.cosmos_height),
                     "fps": str(int(round(self.cosmos_video_fps))),
-                    "num_frames": str(self.cosmos_num_frames),
+                    "num_frames": str(num_frames),
                     "num_inference_steps": str(self.cosmos_num_inference_steps),
                 },
                 files={"input_reference": conditioning_path},
@@ -478,7 +484,7 @@ class CosmosTopCameraPixelIDMChunkAgent:
             print(
                 f"[CosmosTopCameraPixelIDMChunkAgent] plan {plan_index} ready: "
                 f"{len(chunk)} command ticks in {time.monotonic() - t0:.2f}s "
-                f"video={video_path} actions={npz_path}",
+                f"num_frames={num_frames} video={video_path} actions={npz_path}",
                 flush=True,
             )
 
@@ -495,6 +501,11 @@ class CosmosTopCameraPixelIDMChunkAgent:
         finally:
             with self._lock:
                 self._planning = False
+
+    def _num_frames_for_plan(self, plan_index: int) -> int:
+        if plan_index == 0 and self.cosmos_initial_num_frames is not None:
+            return self.cosmos_initial_num_frames
+        return self.cosmos_num_frames
 
     def _load_actions(self, npz_path: Path) -> np.ndarray:
         if not npz_path.exists():

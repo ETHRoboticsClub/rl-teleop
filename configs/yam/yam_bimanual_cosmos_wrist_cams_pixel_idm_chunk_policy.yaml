@@ -2,7 +2,7 @@ version: "1"
 
 session:
   save_root: recordings/cosmos_wrist_cams_pixel_idm_chunk_policy
-  start_paused: true
+  start_paused: false
   record_on_unpause: false
 
 nodes:
@@ -25,7 +25,8 @@ nodes:
       request_timeout_s: 900
       num_latent_conditional_frames: 2
       vllm_size: 960x960
-      vllm_num_frames: 61
+      vllm_num_frames: 11
+      vllm_initial_num_frames: 61
       vllm_num_inference_steps: 35
       vllm_guidance_scale: 6.0
       vllm_flow_shift: 10.0

@@ -268,6 +268,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
         num_latent_conditional_frames: int = 2,
         vllm_size: str = "640x480",
         vllm_num_frames: int = 61,
+        vllm_initial_num_frames: int | None = None,
         vllm_num_inference_steps: int = 35,
         vllm_guidance_scale: float = 6.0,
         vllm_flow_shift: float = 10.0,
@@ -318,6 +319,8 @@ class CosmosWristCamsPixelIDMChunkAgent:
             )
         if vllm_num_frames <= 0:
             raise ValueError(f"vllm_num_frames must be > 0, got {vllm_num_frames}")
+        if vllm_initial_num_frames is not None and vllm_initial_num_frames <= 0:
+            raise ValueError(f"vllm_initial_num_frames must be > 0, got {vllm_initial_num_frames}")
         if vllm_num_inference_steps <= 0:
             raise ValueError(f"vllm_num_inference_steps must be > 0, got {vllm_num_inference_steps}")
         if vllm_condition_video_keep not in {"first", "last"}:
@@ -327,6 +330,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
             )
         self.vllm_size = vllm_size
         self.vllm_num_frames = int(vllm_num_frames)
+        self.vllm_initial_num_frames = None if vllm_initial_num_frames is None else int(vllm_initial_num_frames)
         self.vllm_num_inference_steps = int(vllm_num_inference_steps)
         self.vllm_guidance_scale = float(vllm_guidance_scale)
         self.vllm_flow_shift = float(vllm_flow_shift)
@@ -368,6 +372,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
             "[CosmosWristCamsPixelIDMChunkAgent] ready "
             f"validate_only={self.validate_only} source_hz={self.source_hz} command_hz={self.command_hz} "
             f"cosmos_url={self.cosmos_url} pixel_idm_url={self.pixel_idm_url} "
+            f"num_frames={self.vllm_num_frames} initial_num_frames={self.vllm_initial_num_frames} "
             f"open_video_plan={self.open_video_plan}",
             flush=True,
         )
@@ -494,6 +499,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
         artifact_dir = self.run_root / time.strftime("%Y%m%d_%H%M%S") / f"plan_{plan_index:04d}"
         try:
             t0 = time.monotonic()
+            num_frames = self._num_frames_for_plan(plan_index)
             artifact_dir.mkdir(parents=True, exist_ok=True)
             image_path = artifact_dir / "cosmos_input.png"
             conditioning_path = artifact_dir / "cosmos_conditioning.mp4"
@@ -516,7 +522,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
                 input_reference=conditioning_path,
                 output_path=video_path,
                 size=self.vllm_size,
-                num_frames=self.vllm_num_frames,
+                num_frames=num_frames,
                 fps=self.cosmos_video_fps,
                 num_inference_steps=self.vllm_num_inference_steps,
                 guidance_scale=self.vllm_guidance_scale,
@@ -578,7 +584,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
             print(
                 f"[CosmosWristCamsPixelIDMChunkAgent] plan {plan_index} ready: "
                 f"{len(chunk)} command ticks in {time.monotonic() - t0:.2f}s "
-                f"video={video_path} actions={npz_path}",
+                f"num_frames={num_frames} video={video_path} actions={npz_path}",
                 flush=True,
             )
 
@@ -595,6 +601,11 @@ class CosmosWristCamsPixelIDMChunkAgent:
         finally:
             with self._lock:
                 self._planning = False
+
+    def _num_frames_for_plan(self, plan_index: int) -> int:
+        if plan_index == 0 and self.vllm_initial_num_frames is not None:
+            return self.vllm_initial_num_frames
+        return self.vllm_num_frames
 
     def _open_video_plan(self, video_path: Path) -> None:
         if not self.open_video_plan:
