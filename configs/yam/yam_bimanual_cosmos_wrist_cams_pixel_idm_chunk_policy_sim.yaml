@@ -53,7 +53,7 @@ nodes:
     name: camera_top
     driver: RealSenseCamera
     device_id: "203522250539"
-    resolution: VGA
+    resolution: HD720
     fps: 30
 
   - type: CameraNode
