@@ -101,6 +101,24 @@ def _write_frame_video(path: Path, frames_rgb: list[np.ndarray], *, fps: float) 
         writer.release()
 
 
+def _read_video_frames(path: Path) -> list[np.ndarray]:
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeError(f"could not open video for preview: {path}")
+    frames: list[np.ndarray] = []
+    try:
+        while True:
+            ok, frame_bgr = capture.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        capture.release()
+    if not frames:
+        raise RuntimeError(f"video preview had no frames: {path}")
+    return frames
+
+
 def _chunk_payload(chunk: np.ndarray, start: int = 0) -> dict[str, np.ndarray]:
     remaining = chunk[min(start, len(chunk) - 1) :]
     return {
@@ -336,6 +354,9 @@ class CosmosWristCamsPixelIDMChunkAgent:
         self._planning = False
         self._active_chunk: np.ndarray | None = None
         self._active_display_image: np.ndarray | None = None
+        self._plan_video_frames: list[np.ndarray] = []
+        self._plan_video_started_at = 0.0
+        self._plan_video_fps = self.cosmos_video_fps
         self._cursor = 0
         self._final_action: np.ndarray | None = None
         self._last_error: str | None = None
@@ -354,6 +375,8 @@ class CosmosWristCamsPixelIDMChunkAgent:
         with self._lock:
             self._active_chunk = None
             self._active_display_image = None
+            self._plan_video_frames = []
+            self._plan_video_started_at = 0.0
             self._cursor = 0
             self._final_action = None
             self._last_error = None
@@ -428,7 +451,20 @@ class CosmosWristCamsPixelIDMChunkAgent:
             out["_chunk"] = _chunk_payload(chunk, cursor)
         if display_image is not None:
             out["_images"] = {"top_camera": display_image}
+        plan_frame = self._current_plan_video_frame()
+        if plan_frame is not None:
+            out.setdefault("_images", {})["cosmos_plan"] = plan_frame
         return out
+
+    def _current_plan_video_frame(self) -> np.ndarray | None:
+        with self._lock:
+            frames = self._plan_video_frames
+            started_at = self._plan_video_started_at
+            fps = self._plan_video_fps
+        if not frames:
+            return None
+        idx = int(max(0.0, time.monotonic() - started_at) * max(1.0, fps)) % len(frames)
+        return frames[idx].copy()
 
     def _start_planning(self) -> None:
         with self._lock:
@@ -485,6 +521,11 @@ class CosmosWristCamsPixelIDMChunkAgent:
                 timeout_s=self.request_timeout_s,
             )
             video_fps = self.cosmos_video_fps
+            plan_video_frames = _read_video_frames(video_path)
+            with self._lock:
+                self._plan_video_frames = plan_video_frames
+                self._plan_video_started_at = time.monotonic()
+                self._plan_video_fps = video_fps
             self._open_video_plan(video_path)
 
             pixel_response = _post_json(

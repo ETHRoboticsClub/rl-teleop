@@ -33,7 +33,7 @@ nodes:
       vllm_negative_prompt: blurry, distorted, low quality
       vllm_guardrails: true
       vllm_condition_video_keep: first
-      open_video_plan: true
+      open_video_plan: false
       left_limits_path: robot_configs/yam/xdof_hq/left.yaml
       right_limits_path: robot_configs/yam/xdof_hq/right.yaml
       limit_tolerance: 0.05
@@ -155,3 +155,4 @@ nodes:
           rotation: [1.0, 0.0, 0.0, 0.0]
     image_topics:
       top: cosmos_wrist_cams_pixel_idm_policy/image/top_camera
+      plan: cosmos_wrist_cams_pixel_idm_policy/image/cosmos_plan
