@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROMPT=""
 EXECUTE=0
-COSMOS_URL="${COSMOS_PIXEL_IDM_COSMOS_URL:-http://127.0.0.1:8000}"
+COSMOS_URL="${COSMOS_PIXEL_IDM_COSMOS_URL:-http://127.0.0.1:8021}"
 PIXEL_IDM_URL="${COSMOS_PIXEL_IDM_PIXEL_URL:-http://127.0.0.1:8022}"
 
 while [[ $# -gt 0 ]]; do
