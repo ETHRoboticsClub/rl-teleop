@@ -56,7 +56,7 @@ def _resize_pad(image: np.ndarray, width: int, height: int) -> np.ndarray:
     scale = min(width / w, height / h)
     new_w = max(1, round(w * scale))
     new_h = max(1, round(h * scale))
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
     out = np.zeros((height, width, 3), dtype=np.uint8)
     y = (height - new_h) // 2
     x = (width - new_w) // 2
@@ -362,6 +362,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
         self._last_error: str | None = None
         self._plan_index = 0
         self._image_history: deque[np.ndarray] = deque(maxlen=4 * (self.num_latent_conditional_frames - 1) + 1)
+        self._last_history_t = 0.0
         self._video_player_proc: subprocess.Popen[bytes] | None = None
         print(
             "[CosmosWristCamsPixelIDMChunkAgent] ready "
@@ -382,6 +383,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
             self._last_error = None
             self._latest_obs = None
             self._planning = False
+            self._last_history_t = 0.0
         self._close_video_player()
 
     def close(self) -> None:
@@ -397,6 +399,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
         right_state = command_state_from_observation(obs.get("right", {}))
         if image is None or left_state is None or right_state is None:
             return {}
+        paused = bool(obs.get("_paused"))
 
         with self._lock:
             self._latest_obs = {
@@ -404,7 +407,11 @@ class CosmosWristCamsPixelIDMChunkAgent:
                 "left": left_state.copy(),
                 "right": right_state.copy(),
             }
-            self._image_history.append(image.copy())
+            history_period_s = 1.0 / self.cosmos_video_fps
+            now = time.monotonic()
+            if self._last_history_t == 0.0 or (now - self._last_history_t) >= history_period_s:
+                self._image_history.append(image.copy())
+                self._last_history_t = now
             planning = self._planning
             active = self._active_chunk
             cursor = self._cursor
@@ -415,13 +422,13 @@ class CosmosWristCamsPixelIDMChunkAgent:
             self._start_planning()
 
         if active is None:
-            if final_action is None or self.validate_only:
+            if final_action is None or self.validate_only or paused:
                 return self._meta_action(display_image, None)
             action = _command_from_row(final_action)
             action.update(self._meta_action(display_image, None))
             return action
 
-        if self.validate_only:
+        if self.validate_only or paused:
             return self._meta_action(display_image, active)
 
         with self._lock:

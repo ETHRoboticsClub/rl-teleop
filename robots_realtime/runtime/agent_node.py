@@ -135,7 +135,7 @@ class AgentNode(Node):
         return getattr(mod, cls_name)(**self._agent_kwargs)
 
     def step(self) -> None:
-        obs: dict = {"timestamp": time.time()}
+        obs: dict = {"timestamp": time.time(), "_paused": self._paused}
         for obs_key, topic in self._state_topics.items():
             data = self.get_latest(topic)
             if data is not None:
