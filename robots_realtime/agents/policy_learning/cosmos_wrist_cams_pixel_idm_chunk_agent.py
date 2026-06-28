@@ -267,7 +267,7 @@ class CosmosWristCamsPixelIDMChunkAgent:
         request_timeout_s: float = 900.0,
         num_latent_conditional_frames: int = 2,
         vllm_size: str = "640x480",
-        vllm_num_frames: int = 11,
+        vllm_num_frames: int = 61,
         vllm_num_inference_steps: int = 35,
         vllm_guidance_scale: float = 6.0,
         vllm_flow_shift: float = 10.0,

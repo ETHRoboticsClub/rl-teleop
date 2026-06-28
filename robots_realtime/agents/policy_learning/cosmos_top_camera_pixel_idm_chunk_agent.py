@@ -182,7 +182,7 @@ class CosmosTopCameraPixelIDMChunkAgent:
         num_latent_conditional_frames: int = 2,
         cosmos_width: int = 832,
         cosmos_height: int = 480,
-        cosmos_num_frames: int = 11,
+        cosmos_num_frames: int = 61,
         cosmos_num_inference_steps: int = 35,
         open_video_plan: bool | None = None,
         video_player_cmd: str | None = None,

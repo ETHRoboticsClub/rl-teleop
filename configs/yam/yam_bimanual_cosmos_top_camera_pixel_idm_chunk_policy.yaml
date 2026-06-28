@@ -16,7 +16,7 @@ nodes:
       source_hz: 10
       command_hz: 30
       cosmos_video_fps: 10
-      cosmos_num_frames: 11
+      cosmos_num_frames: 61
       image_key: top_camera
       validate_only:
       array_key: predicted_actions

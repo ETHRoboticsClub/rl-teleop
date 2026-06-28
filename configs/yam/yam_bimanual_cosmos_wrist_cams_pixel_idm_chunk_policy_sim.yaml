@@ -25,7 +25,7 @@ nodes:
       request_timeout_s: 900
       num_latent_conditional_frames: 2
       vllm_size: 960x960
-      vllm_num_frames: 11
+      vllm_num_frames: 61
       vllm_num_inference_steps: 35
       vllm_guidance_scale: 6.0
       vllm_flow_shift: 10.0
