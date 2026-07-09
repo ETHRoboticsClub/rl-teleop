@@ -43,12 +43,20 @@ uv run python -m robots_realtime.labeling.live_server --live --arm left \
 LIVE_PID=$!
 echo "live label backend → http://localhost:8791 (log: /tmp/live_label.log)"
 
-# 2) open viser + cockpit in Firefox once viser is up (background waiter)
+# Show the clickable cockpit link in the rr-session TUI (next to viser) and here.
+COCKPIT_TELEOP="${COCKPIT}#teleop"
+export RR_DASHBOARD_URL="$COCKPIT_TELEOP"
+echo "cockpit → $COCKPIT_TELEOP"
+
+# 2) open viser + cockpit in the browser once viser is up (background waiter).
+#    Try the rig's default browser first, then firefox/chrome; failures are non-fatal
+#    (the link above/in the TUI is clickable regardless).
 (
   for _ in $(seq 1 60); do
     curl -s -o /dev/null --max-time 1 "$VISER" && break || sleep 0.5
   done
-  firefox --new-window "$VISER" "$COCKPIT" >/dev/null 2>&1 &
+  ( xdg-open "$COCKPIT_TELEOP" || firefox --new-window "$VISER" "$COCKPIT_TELEOP" \
+    || google-chrome "$COCKPIT_TELEOP" ) >/dev/null 2>&1 &
 ) &
 
 cleanup() { kill "$LIVE_PID" 2>/dev/null || true; kill "${HTTP_PID:-}" 2>/dev/null || true; }

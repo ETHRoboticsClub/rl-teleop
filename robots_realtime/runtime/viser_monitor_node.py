@@ -199,7 +199,13 @@ class ViserMonitorNode(Node):
     # Surfaced on the session TUI (see tui.py:_endpoints_text).
     @property
     def web_endpoints(self) -> list[str]:
-        return [f"viser: http://localhost:{self._port}"]
+        eps = [f"viser: http://localhost:{self._port}"]
+        # The operator cockpit is served by record_kitting.sh, not this node; show its
+        # clickable link next to viser when the launcher exports RR_DASHBOARD_URL.
+        cockpit = os.environ.get("RR_DASHBOARD_URL")
+        if cockpit:
+            eps.append(f"cockpit: {cockpit}")
+        return eps
 
     # ------------------------------------------------------------------ #
     # Lifecycle
