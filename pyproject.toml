@@ -43,6 +43,8 @@ dependencies = [
     "openpi-client==0.1.2",
     "pyrealsense2>=2.55",
     "rerun-sdk",
+    "ruckig",
+    "easyocr",
 ]
 
 [project.scripts]
@@ -76,6 +78,12 @@ override-dependencies = [
     # dm_control>=1.0.30 only needs mujoco>=3.3.2, so 3.5.0 is fine for all.
     "mujoco>=3.5.0",
     "tyro>=1.0.1",
+]
+# ruckig 0.15.3's sdist uses the pre-0.10 `cmake.targets` key, which
+# scikit-build-core>=0.10 rejects. Pin the build backend below 0.10 so the
+# source build succeeds.
+build-constraint-dependencies = [
+    "scikit-build-core<0.10",
 ]
 
 [tool.setuptools.packages.find]

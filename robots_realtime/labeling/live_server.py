@@ -73,7 +73,8 @@ class CameraBridge:
         topics = sorted(set(id_to_topic.values()))
         self._sub = Subscriber(topics, host=host, port=port or DEFAULT_SUB_PORT)
 
-    def jpeg(self, cam_id: str) -> bytes | None:
+    def frame(self, cam_id: str):
+        """Latest RGB (H,W,3) uint8 frame for a cam id, or None."""
         # exact id → topic, else the 'default' topic so no panel is blank
         topic = self._id_to_topic.get(cam_id) or self._id_to_topic.get("default")
         if topic is None:
@@ -91,11 +92,31 @@ class CameraBridge:
                 frame = imgs.get("rgb")
                 if frame is None:
                     frame = next(iter(imgs.values()))
+        return frame
+
+    def jpeg(self, cam_id: str) -> bytes | None:
+        frame = self.frame(cam_id)
         return encode_frame_jpeg(frame) if frame is not None else None
 
 
+def _state_with_detections(labeler: LiveLabeler, detector) -> dict:
+    """labeler.state() augmented with live scan detections: each kit packet gets a
+    pixel bbox on the scan frame (from the detector, matched by part id) so the
+    cockpit can draw the 'pick this next' box on the actual packet. wh = scan size."""
+    st = labeler.state()
+    if detector is None:
+        return st
+    _dets, wh = detector.current()
+    st["wh"] = wh
+    for pk in st["packets"]:
+        bbox, conf = detector.bbox_for(pk.get("part"))
+        pk["bbox_px"] = bbox            # [x,y,w,h] in scan pixels, or None if not seen
+        pk["det_conf"] = conf
+    return st
+
+
 def _make_handler(labeler: LiveLabeler, cam_base: str | None,
-                  bridge: "CameraBridge | None" = None):
+                  bridge: "CameraBridge | None" = None, detector=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -118,7 +139,7 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
 
         def do_GET(self):
             if self.path == "/state":
-                self._json(labeler.state())
+                self._json(_state_with_detections(labeler, detector))
             elif self.path == "/events":
                 self._json(labeler.events)
             elif self.path.startswith("/cam/"):
@@ -202,10 +223,10 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
 
 class LiveLabelServer:
     def __init__(self, labeler: LiveLabeler, port: int = 8791, cam_base: str | None = None,
-                 bridge: "CameraBridge | None" = None, host: str = "127.0.0.1"):
+                 bridge: "CameraBridge | None" = None, host: str = "127.0.0.1", detector=None):
         self.labeler = labeler
         self._httpd = ThreadingHTTPServer((host, port),
-                                          _make_handler(labeler, cam_base, bridge))
+                                          _make_handler(labeler, cam_base, bridge, detector))
         self.port = port
 
     def serve_forever(self):
@@ -323,6 +344,12 @@ def main(argv=None):
     ap.add_argument("--speed", type=float, default=3.0)
     ap.add_argument("--open-ref", type=float, default=1.0)
     ap.add_argument("--closed-ref", type=float, default=0.0)
+    ap.add_argument("--detect", action="store_true",
+                    help="run the scan-cam packet detector (needs easyocr)")
+    ap.add_argument("--detect-period", type=float, default=2.0,
+                    help="seconds between scan-cam detection passes")
+    ap.add_argument("--detect-gpu", action="store_true",
+                    help="use GPU for OCR (leave off on the RTX 5090 — no torch kernels)")
     args = ap.parse_args(argv)
 
     labeler = LiveLabeler(open_ref=args.open_ref, closed_ref=args.closed_ref)
@@ -334,8 +361,23 @@ def main(argv=None):
         bridge = CameraBridge(id_to_topic, host="127.0.0.1")
         print(f"Camera bridge: {id_to_topic}")
 
+    # Packet detector: reads the scan cam, finds each kit packet's box + part id so
+    # the cockpit can draw the "pick this next" box. Optional — needs easyocr; if it
+    # is unavailable the cockpit falls back to kit-order highlighting.
+    detector = None
+    if bridge is not None and args.detect:
+        try:
+            from robots_realtime.labeling.detector import PacketDetector
+            detector = PacketDetector(
+                frame_source=lambda: bridge.frame("scan"),
+                known_source=lambda: [p.get("part") for p in labeler.packets if p.get("part")],
+                period_s=args.detect_period, gpu=args.detect_gpu).start()
+            print(f"Packet detector on the scan cam (period {args.detect_period}s, gpu={args.detect_gpu})")
+        except Exception as e:
+            print(f"Packet detector disabled ({type(e).__name__}: {e})")
+
     server = LiveLabelServer(labeler, port=args.port, cam_base=args.cam_base,
-                             bridge=bridge, host=args.host)
+                             bridge=bridge, host=args.host, detector=detector)
     server.start_background()
     print(f"Live label backend on http://{args.host}:{args.port}  (point the cockpit here)")
 

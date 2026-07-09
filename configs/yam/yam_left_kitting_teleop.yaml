@@ -92,7 +92,7 @@ nodes:
     name: camera_scan
     driver: RealSenseCamera
     device_id: "241222077246"
-    resolution: [640, 480]
+    resolution: [1280, 720]   # 720p so the scan-cam OCR can read the packet part numbers
     fps: 30
     enable_depth: false
 
