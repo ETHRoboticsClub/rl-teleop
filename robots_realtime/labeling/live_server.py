@@ -135,17 +135,28 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
                 self.send_error(404)
 
         def _proxy_cam(self, cam_id: str):
-            # 1) live bus bridge (single JPEG from the session's camera topics)
+            # 1) live bus bridge → MJPEG stream (multipart/x-mixed-replace) so an
+            #    <img> or a browser tab shows continuous live video, not a snapshot.
             if bridge is not None:
-                jpg = bridge.jpeg(cam_id)
-                if jpg is not None:
+                first = bridge.jpeg(cam_id)
+                if first is not None:
                     self.send_response(200)
-                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Type",
+                                     "multipart/x-mixed-replace; boundary=frame")
                     self._cors()
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("Content-Length", str(len(jpg)))
+                    self.send_header("Cache-Control", "no-store, private")
                     self.end_headers()
-                    self.wfile.write(jpg)
+                    try:
+                        while True:
+                            jpg = bridge.jpeg(cam_id)
+                            if jpg is not None:
+                                self.wfile.write(
+                                    b"--frame\r\nContent-Type: image/jpeg\r\n"
+                                    b"Content-Length: " + str(len(jpg)).encode()
+                                    + b"\r\n\r\n" + jpg + b"\r\n")
+                            time.sleep(1 / 15.0)      # ~15 fps
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
                     return
             # 2) optional MJPEG proxy fallback
             if not cam_base:

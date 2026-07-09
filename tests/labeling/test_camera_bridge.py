@@ -36,10 +36,11 @@ def test_cam_endpoint_serves_jpeg():
     srv.start_background()
     try:
         r = urllib.request.urlopen("http://127.0.0.1:8796/cam/top", timeout=2)
-        body = r.read()
-        assert r.headers["Content-Type"] == "image/jpeg"
+        assert "multipart/x-mixed-replace" in r.headers["Content-Type"]
         assert r.headers["Access-Control-Allow-Origin"] == "*"
-        assert body[:2] == b"\xff\xd8"
+        chunk = r.read(8192)                     # bounded read of the stream
+        r.close()
+        assert b"--frame" in chunk and b"\xff\xd8" in chunk   # boundary + JPEG
         # unknown cam id → 503 (no source)
         try:
             urllib.request.urlopen("http://127.0.0.1:8796/cam/nope", timeout=2)
