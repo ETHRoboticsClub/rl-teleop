@@ -54,8 +54,21 @@ uv run python -m robots_realtime.labeling.live_server --port 8791 \
 The cockpit polls `GET /state` and sees `ti` advance + packets flip to `placed`
 as grasps/places are detected. Confirmation stays batched per kit (design choice).
 
-## Prerequisites still to wire
-1. Cockpit stamps its events on rl-teleop's hardware clock (shared source).
+Live during real teleop:
+```bash
+uv run python -m robots_realtime.labeling.live_server --live --arm left \
+    --record-events recordings/<episode>
+```
+`--live` taps the running rl-teleop joint bus (`bus_feed`); `--record-events` writes
+`cockpit_events.jsonl` into the episode dir for the offline pass to fuse.
+
+Run a kitting session with the starter config:
+```bash
+uv run rr-session configs/yam/yam_left_kitting_teleop.yaml
+```
+
+## Prerequisites still to wire (need the rig / cockpit)
+1. Record a real kit with `yam_left_kitting_teleop.yaml`, then `label_episode` it.
 2. `compartments.json` = the 7 measured compartment rects in the robot base frame.
-3. `bus_feed` for the live server to subscribe to the real rl-teleop joint stream
-   (the replay/demo feed is wired and verified; the live-bus tap is the last hop).
+3. Cockpit stamps its events on rl-teleop's hardware clock, and supplies the OCR
+   part→compartment intent (the seed). Live-bus tap + event writeback are done.
