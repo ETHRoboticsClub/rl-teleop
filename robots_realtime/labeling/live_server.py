@@ -39,7 +39,49 @@ DEFAULT_KIT = [
 ]
 
 
-def _make_handler(labeler: LiveLabeler, cam_base: str | None):
+def encode_frame_jpeg(frame, quality: int = 80) -> bytes | None:
+    """RGB (H,W,3) uint8 → JPEG bytes (BGR-corrected for the browser)."""
+    import cv2
+    import numpy as np
+    arr = np.asarray(frame)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        return None
+    bgr = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return buf.tobytes() if ok else None
+
+
+class CameraBridge:
+    """Serve the running session's camera topics as single JPEGs at /cam/<id>.
+
+    During teleop the physical cameras are held by rr-session, so we can't open
+    /dev/video directly — we subscribe to the ``<name>/rgb`` topics on the ZMQ bus
+    ({"frame": (H,W,3) uint8}) and JPEG-encode the latest frame on request. The
+    cockpit's <img src=".../cam/<id>?t=..."> cache-buster re-fetches it live.
+    """
+
+    def __init__(self, id_to_topic: dict[str, str], host: str = "127.0.0.1",
+                 port: int | None = None):
+        from robots_realtime.runtime.transport.message_bus import DEFAULT_SUB_PORT
+        from robots_realtime.runtime.transport.subscriber import Subscriber
+        self._id_to_topic = dict(id_to_topic)
+        topics = sorted(set(id_to_topic.values()))
+        self._sub = Subscriber(topics, host=host, port=port or DEFAULT_SUB_PORT)
+
+    def jpeg(self, cam_id: str) -> bytes | None:
+        # exact id → topic, else the 'default' topic so no panel is blank
+        topic = self._id_to_topic.get(cam_id) or self._id_to_topic.get("default")
+        if topic is None:
+            return None
+        env = self._sub.get_latest(topic)
+        if not env:
+            return None
+        frame = (env.get("data") or {}).get("frame")
+        return encode_frame_jpeg(frame) if frame is not None else None
+
+
+def _make_handler(labeler: LiveLabeler, cam_base: str | None,
+                  bridge: "CameraBridge | None" = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -84,8 +126,21 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None):
                 self.send_error(404)
 
         def _proxy_cam(self, cam_id: str):
+            # 1) live bus bridge (single JPEG from the session's camera topics)
+            if bridge is not None:
+                jpg = bridge.jpeg(cam_id)
+                if jpg is not None:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self._cors()
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(jpg)))
+                    self.end_headers()
+                    self.wfile.write(jpg)
+                    return
+            # 2) optional MJPEG proxy fallback
             if not cam_base:
-                self.send_error(404); return
+                self.send_error(503); return
             try:
                 up = urllib.request.urlopen(f"{cam_base.rstrip('/')}/cam/{cam_id}", timeout=3)
             except Exception:
@@ -106,10 +161,11 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None):
 
 
 class LiveLabelServer:
-    def __init__(self, labeler: LiveLabeler, port: int = 8791, cam_base: str | None = None):
+    def __init__(self, labeler: LiveLabeler, port: int = 8791, cam_base: str | None = None,
+                 bridge: "CameraBridge | None" = None, host: str = "127.0.0.1"):
         self.labeler = labeler
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", port),
-                                          _make_handler(labeler, cam_base))
+        self._httpd = ThreadingHTTPServer((host, port),
+                                          _make_handler(labeler, cam_base, bridge))
         self.port = port
 
     def serve_forever(self):
@@ -218,6 +274,11 @@ def main(argv=None):
                     help="on exit, write cockpit_events.jsonl into this episode dir")
     ap.add_argument("--arm", default="left")
     ap.add_argument("--cam-base", default=None, help="proxy /cam/<id> to this base URL")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address (use 0.0.0.0 to reach it over Tailscale/LAN)")
+    ap.add_argument("--bus-cams", default=None,
+                    help="serve /cam/<id> from bus topics, e.g. "
+                         "'top=camera_top/rgb,ego=camera_top/rgb,left=camera_left/rgb'")
     ap.add_argument("--speed", type=float, default=3.0)
     ap.add_argument("--open-ref", type=float, default=1.0)
     ap.add_argument("--closed-ref", type=float, default=0.0)
@@ -225,9 +286,17 @@ def main(argv=None):
 
     labeler = LiveLabeler(open_ref=args.open_ref, closed_ref=args.closed_ref)
     labeler.seed(DEFAULT_KIT)
-    server = LiveLabelServer(labeler, port=args.port, cam_base=args.cam_base)
+
+    bridge = None
+    if args.bus_cams:
+        id_to_topic = dict(p.split("=", 1) for p in args.bus_cams.split(",") if "=" in p)
+        bridge = CameraBridge(id_to_topic, host="127.0.0.1")
+        print(f"Camera bridge: {id_to_topic}")
+
+    server = LiveLabelServer(labeler, port=args.port, cam_base=args.cam_base,
+                             bridge=bridge, host=args.host)
     server.start_background()
-    print(f"Live label backend on http://localhost:{args.port}  (point the cockpit here)")
+    print(f"Live label backend on http://{args.host}:{args.port}  (point the cockpit here)")
 
     def _finish():
         if args.record_events:
