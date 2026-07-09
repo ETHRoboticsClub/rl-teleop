@@ -36,7 +36,7 @@ fi
 #    default=camera_top/rgb so every cockpit panel shows something even before the
 #    exact per-camera id mapping is set.
 uv run python -m robots_realtime.labeling.live_server --live --arm left \
-    --host 0.0.0.0 --port 8791 --detect \
+    --host 0.0.0.0 --port 8791 --detect --detect-period 3.0 \
     --save-root recordings --auto-label \
     --bus-cams "default=camera_top/rgb,egocentric=camera_top/rgb,scan=camera_scan/rgb,wristL=camera_left/rgb,wristR=camera_left/rgb" \
     > /tmp/live_label.log 2>&1 &

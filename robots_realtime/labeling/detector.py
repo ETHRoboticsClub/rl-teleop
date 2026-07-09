@@ -188,6 +188,16 @@ class PacketDetector:
     def _ocr(self):
         if self._reader is None:
             import easyocr
+            # Cap CPU threads so the OCR doesn't grab all cores and starve the
+            # live-camera MJPEG streaming that shares this process (was freezing the
+            # cockpit). Leaves cores free for the HTTP streaming threads.
+            try:
+                import cv2
+                import torch
+                torch.set_num_threads(4)
+                cv2.setNumThreads(2)
+            except Exception:
+                pass
             self._reader = easyocr.Reader(["en"], gpu=self._gpu, verbose=False)
         return self._reader
 
