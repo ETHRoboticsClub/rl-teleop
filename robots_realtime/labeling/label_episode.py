@@ -150,3 +150,25 @@ def label_episode_dir(episode_dir: str | Path, arm: str = "left",
     if write:
         ann.save(episode_dir / "annotations.json")
     return ann
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="Label one recorded kitting episode.")
+    ap.add_argument("episode_dir")
+    ap.add_argument("--arm", default="left")
+    ap.add_argument("--open-ref", type=float, default=None, help="gripper open joint value")
+    ap.add_argument("--closed-ref", type=float, default=None, help="gripper closed joint value")
+    args = ap.parse_args(argv)
+    ann = label_episode_dir(args.episode_dir, arm=args.arm,
+                            gripper_open_ref=args.open_ref, gripper_closed_ref=args.closed_ref)
+    print(f"wrote {Path(args.episode_dir) / 'annotations.json'}")
+    print(f"  bags placed: {len(ann.place_events)}  grasp attempts: {len(ann.grasp_attempts)}"
+          f"  flags: {len(ann.flags)}")
+    for f in ann.flags:
+        print(f"  ⚠ {f.kind}: {f.detail}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
