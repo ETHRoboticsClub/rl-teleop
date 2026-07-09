@@ -368,9 +368,11 @@ def _run_label_episode(episode_dir: Path, arm: str) -> None:
     import subprocess
     import sys
     try:
+        # low priority (nice) so the labeler's OCR doesn't starve the live camera
+        # streaming at save time (that was freezing the cockpit).
         subprocess.Popen(
-            [sys.executable, "-m", "robots_realtime.labeling.label_episode",
-             str(episode_dir), "--arm", arm],
+            ["nice", "-n", "19", sys.executable, "-m",
+             "robots_realtime.labeling.label_episode", str(episode_dir), "--arm", arm],
             cwd=str(Path.cwd()),
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         print(f"[auto-label] {episode_dir.name} → annotations.json")
@@ -416,13 +418,15 @@ def record_watcher(save_root: str, labeler: LiveLabeler, arm: str,
                     except Exception as e:
                         print(f"[auto-label] compartments copy failed for {d}: {e}")
             t = track[key]
-            if auto_label and not t["labeled"] and meta.exists():
+            if not t["labeled"] and meta.exists():
                 m = meta.stat().st_mtime
                 if t["meta0"] is None:                 # first time meta appeared (start write)
                     t["meta0"] = m
                 elif m > t["meta0"] + 0.5:              # re-written at end_episode → episode saved
                     t["labeled"] = True
-                    _run_label_episode(d, arm)
+                    labeler.locked = False             # episode done → let the NEXT setup re-scan
+                    if auto_label:
+                        _run_label_episode(d, arm)
 
 
 def main(argv=None):
