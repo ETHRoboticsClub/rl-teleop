@@ -124,6 +124,20 @@ class LiveLabeler:
             self.events = [{"t": time.monotonic(), "type": "seed",
                             "packets": len(self.packets)}]
 
+    def advance(self) -> None:
+        """Operator manually confirmed the current placement (cockpit 'Placed'
+        button → POST /advance): mark the current packet placed and step ti."""
+        with self._lock:
+            if not self.seeded or self.ti >= len(self.packets):
+                return
+            p = self.packets[self.ti]
+            p["status"] = "placed"
+            self.events.append({"t": time.monotonic(), "type": "place_confirmed",
+                                "bag_id": p.get("bag_id", self.ti + 1),
+                                "comp": p.get("comp"), "outcome": "manual"})
+            self.ti = min(self.ti + 1, len(self.packets))
+            self.stage = "reach"
+
     def push(self, t: float, width_raw: float) -> None:
         with self._lock:
             if not self.seeded:

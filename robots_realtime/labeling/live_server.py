@@ -46,7 +46,12 @@ def encode_frame_jpeg(frame, quality: int = 80) -> bytes | None:
     arr = np.asarray(frame)
     if arr.ndim != 3 or arr.shape[2] != 3:
         return None
-    bgr = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGB2BGR)
+    # coerce to a clean uint8 C-contiguous buffer so cv2 never trips on an odd
+    # stride/dtype (the frame content itself is trusted — see wrist MJPEG note).
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+    arr = np.ascontiguousarray(arr)
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
     ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes() if ok else None
 
@@ -130,6 +135,9 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
                 except Exception:
                     kit = DEFAULT_KIT
                 labeler.seed(kit)
+                self._json(labeler.state())
+            elif self.path == "/advance":
+                labeler.advance()
                 self._json(labeler.state())
             else:
                 self.send_error(404)

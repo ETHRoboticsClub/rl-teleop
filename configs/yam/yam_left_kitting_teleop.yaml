@@ -94,7 +94,11 @@ nodes:
     device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.1:1.0-video-index0
     resolution: [640, 480]
     fps: 30
-    fourcc: MJPG
+    # NO MJPG: this cheap USB webcam ships truncated MJPEG frames under bandwidth
+    # pressure, which libjpeg decodes as a torn green-top/gray-bottom image in the
+    # cockpit wrist panels. Raw YUYV (640x480x2x30 ≈ 18 MB/s) fits USB2 and cannot
+    # truncate that way. If fps must drop for raw, lower fps here rather than re-add MJPG.
+    # fourcc: MJPG
     v4l2_controls:
       brightness: 0
       contrast: 28

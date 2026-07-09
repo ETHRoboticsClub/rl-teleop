@@ -16,9 +16,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 CONFIG="${1:-configs/yam/yam_left_kitting_teleop.yaml}"
-COCKPIT="file:///home/tommaso/Desktop/sorting-red-box/Buehler-Kitting-Cockpit.html"
+COCKPIT_DIR="/home/tommaso/Desktop/sorting-red-box"
+COCKPIT_PORT=8799
+# Serve over http (NOT file://): the cockpit fetches /cam + /state from the cam
+# server cross-origin; a file:// origin ("null") gets blocked, an http origin does not.
+COCKPIT="http://localhost:${COCKPIT_PORT}/Buehler-Kitting-Cockpit.html"
 VISER="http://localhost:8080"
 export DISPLAY="${DISPLAY:-:2}"          # the rig display (where viser auto-opens)
+
+# 0) serve the cockpit over http so its auto-connect to the cam server works.
+if ! curl -s -o /dev/null --max-time 1 "http://localhost:${COCKPIT_PORT}/"; then
+  ( cd "$COCKPIT_DIR" && python3 -m http.server "$COCKPIT_PORT" --bind 127.0.0.1 ) \
+      > /tmp/cockpit_http.log 2>&1 &
+  HTTP_PID=$!
+  echo "cockpit http server → ${COCKPIT} (log: /tmp/cockpit_http.log)"
+fi
 
 # 1) live label backend — /state + /cam JPEG from the running session's camera bus.
 #    default=camera_top/rgb so every cockpit panel shows something even before the
@@ -38,7 +50,7 @@ echo "live label backend → http://localhost:8791 (log: /tmp/live_label.log)"
   firefox --new-window "$VISER" "$COCKPIT" >/dev/null 2>&1 &
 ) &
 
-cleanup() { kill "$LIVE_PID" 2>/dev/null || true; }
+cleanup() { kill "$LIVE_PID" 2>/dev/null || true; kill "${HTTP_PID:-}" 2>/dev/null || true; }
 trap cleanup EXIT
 
 # 3) teleop session (TUI here: [r] start · [1] save · [d] discard · [space] pause · [q] quit)
