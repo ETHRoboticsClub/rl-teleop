@@ -31,7 +31,9 @@ def _ee_xy(fk, sub, topic):
     if not env:
         return None
     data = env.get("data") or {}
-    jp = data.get("joint_pos") or data.get("position")
+    jp = data.get("joint_pos")            # numpy array on the bus — avoid `or` (ambiguous truth)
+    if jp is None:
+        jp = data.get("position")
     if jp is None:
         return None
     arm = np.asarray(jp, float)[: C.N_ARM_JOINTS][None, :]
