@@ -21,8 +21,10 @@ def test_episode_kit_json_shape():
                       "name": None, "compartment": 3}
 
 
-def test_record_watcher_writes_kit_and_labels(tmp_path, monkeypatch):
-    # a scanned kit in the labeler
+def test_record_watcher_labels_on_end_not_start(tmp_path, monkeypatch):
+    """The real recorder writes session_meta.json at START and re-writes it at END.
+    The watcher must write kit.json at start but label only once meta is re-written —
+    NOT while recording is still in progress."""
     labeler = LiveLabeler()
     labeler.seed([{"bag_id": 1, "part": "UNN-10126-151", "name": "x", "comp": 5}])
 
@@ -35,16 +37,41 @@ def test_record_watcher_writes_kit_and_labels(tmp_path, monkeypatch):
                          args=(str(tmp_path), labeler, "left", True, stop), daemon=True)
     t.start()
 
-    # rr-session creates an episode dir (recording starts)
+    # rr-session: create dir AND write session_meta.json at START (this is the real order)
     ep = tmp_path / "20260709" / "episode_120000_abcd"
     ep.mkdir(parents=True)
-    time.sleep(1.4)
-    kit = json.loads((ep / "kit.json").read_text())   # watcher wrote the scanned kit
+    (ep / "session_meta.json").write_text('{"phase":"start"}')
+    time.sleep(1.6)
+    kit = json.loads((ep / "kit.json").read_text())    # kit written at start
     assert kit[0]["part_no"] == "UNN-10126-151" and kit[0]["compartment"] == 5
-    assert labeled == []                               # not labeled until session_meta
+    assert labeled == []                               # NOT labeled mid-recording (the bug)
 
-    # rr-session finishes the episode (session_meta.json appears)
+    # rr-session end_episode: re-write session_meta.json (mtime advances)
+    time.sleep(0.6)
+    (ep / "session_meta.json").write_text('{"phase":"end","t_end":1.0}')
+    time.sleep(1.6)
+    assert labeled == ["episode_120000_abcd"]          # labeled exactly once, at end
+    stop.set()
+
+
+def test_record_watcher_idempotent_on_restart(tmp_path, monkeypatch):
+    """A finished episode (already has annotations.json / kit.json) must not be
+    re-labeled or have its kit clobbered when the watcher (re)starts."""
+    labeler = LiveLabeler()
+    labeler.seed([{"bag_id": 1, "part": "NEW-00000-000", "comp": 1}])
+    ep = tmp_path / "20260709" / "episode_done"
+    ep.mkdir(parents=True)
     (ep / "session_meta.json").write_text("{}")
-    time.sleep(1.4)
-    assert labeled == ["episode_120000_abcd"]          # auto-label fired exactly once
+    (ep / "annotations.json").write_text("{}")
+    (ep / "kit.json").write_text('[{"bag_id":1,"part_no":"ORIG-11111-111"}]')
+
+    labeled: list[str] = []
+    monkeypatch.setattr("robots_realtime.labeling.live_server._run_label_episode",
+                        lambda d, arm: labeled.append(d.name))
+    stop = threading.Event()
+    threading.Thread(target=record_watcher,
+                     args=(str(tmp_path), labeler, "left", True, stop), daemon=True).start()
+    time.sleep(1.6)
+    assert labeled == []                                                  # not re-labeled
+    assert "ORIG-11111-111" in (ep / "kit.json").read_text()             # kit not clobbered
     stop.set()

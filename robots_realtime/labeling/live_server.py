@@ -380,37 +380,48 @@ def _run_label_episode(episode_dir: Path, arm: str) -> None:
 
 def record_watcher(save_root: str, labeler: LiveLabeler, arm: str,
                    auto_label: bool, stop=None) -> None:
-    """Watch save_root for episodes rr-session creates. On a NEW episode dir (record
-    just started) write kit.json = the scanned kit. When session_meta.json appears
-    (episode saved) run label_episode → annotations.json. Filesystem-coupled so the
-    labeler process and the recorder process stay decoupled."""
-    seen: dict[str, str] = {}
+    """Watch save_root for episodes rr-session creates, decoupled via the filesystem.
+
+    IMPORTANT timing: rr-session writes session_meta.json TWICE — once at episode
+    START (_make_episode_dir) and again at END (end_episode, on save). So "meta
+    exists" means recording is IN PROGRESS, not done. We label only when session_meta
+    is RE-WRITTEN (its mtime advances past what we first saw), which happens after the
+    mcap is flushed on save. A discarded episode is rmtree'd → never re-written → never
+    labeled. Idempotent across live_server restarts: an episode that already has
+    annotations.json / kit.json is not reprocessed."""
     root = Path(save_root)
+    track: dict[str, dict] = {}          # dir → {"meta0": float|None, "labeled": bool}
     while stop is None or not stop.is_set():
         time.sleep(1.0)
         for d in sorted(root.glob("*/episode_*")) if root.exists() else []:
             if not d.is_dir():
                 continue
             key, meta = str(d), d / "session_meta.json"
-            if key not in seen:
-                seen[key] = "recording"
-                try:
-                    (d / "kit.json").write_text(
-                        json.dumps(episode_kit_json(labeler.packets), indent=2))
-                    print(f"[auto-label] wrote {d.name}/kit.json ({len(labeler.packets)} bags)")
-                except Exception as e:
-                    print(f"[auto-label] kit.json write failed for {d}: {e}")
-                # Box calibration is one-time and shared; if a canonical compartments.json
-                # sits at the recordings root, copy it in so places get classified too.
+            if key not in track:
+                track[key] = {"meta0": (meta.stat().st_mtime if meta.exists() else None),
+                              "labeled": (d / "annotations.json").exists()}
+                # write the scanned kit ONCE, and never clobber an existing one (restart-safe)
+                if not (d / "kit.json").exists():
+                    try:
+                        (d / "kit.json").write_text(
+                            json.dumps(episode_kit_json(labeler.packets), indent=2))
+                        print(f"[auto-label] wrote {d.name}/kit.json ({len(labeler.packets)} bags)")
+                    except Exception as e:
+                        print(f"[auto-label] kit.json write failed for {d}: {e}")
+                # copy a canonical compartments.json (box calibration) in if present
                 canon = root / "compartments.json"
                 if canon.exists() and not (d / "compartments.json").exists():
                     try:
                         (d / "compartments.json").write_text(canon.read_text())
                     except Exception as e:
                         print(f"[auto-label] compartments copy failed for {d}: {e}")
-            if seen[key] == "recording" and meta.exists():
-                seen[key] = "done"
-                if auto_label:
+            t = track[key]
+            if auto_label and not t["labeled"] and meta.exists():
+                m = meta.stat().st_mtime
+                if t["meta0"] is None:                 # first time meta appeared (start write)
+                    t["meta0"] = m
+                elif m > t["meta0"] + 0.5:              # re-written at end_episode → episode saved
+                    t["labeled"] = True
                     _run_label_episode(d, arm)
 
 
