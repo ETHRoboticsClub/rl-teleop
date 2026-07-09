@@ -76,7 +76,16 @@ class CameraBridge:
         env = self._sub.get_latest(topic)
         if not env:
             return None
-        frame = (env.get("data") or {}).get("frame")
+        data = env.get("data") or {}
+        # CameraNode publishes {"images": {"rgb": (H,W,3) uint8}, ...}; older
+        # payloads used a bare {"frame": ...}.
+        frame = data.get("frame")
+        if frame is None:
+            imgs = data.get("images")
+            if isinstance(imgs, dict) and imgs:
+                frame = imgs.get("rgb")
+                if frame is None:
+                    frame = next(iter(imgs.values()))
         return encode_frame_jpeg(frame) if frame is not None else None
 
 
@@ -216,12 +225,13 @@ def bus_feed(labeler: LiveLabeler, arm: str = "left", host: str = "127.0.0.1",
             return None
         ts = env.get("ts")
         data = env.get("data") or {}
-        pos = data.get("joint_pos")
-        if pos is None:
-            pos = data.get("position")
-        if pos is None or ts is None:
+        # Follower publishes joint_pos (6 arm) + gripper_pos (1) as SEPARATE fields;
+        # the gripper is NOT joint_pos[6].
+        grip = data.get("gripper_pos")
+        if grip is None or ts is None:
             return None
-        return float(ts), float(pos[C.GRIPPER_JOINT_INDEX])
+        width = float(grip[0]) if hasattr(grip, "__len__") else float(grip)
+        return float(ts), width
 
     _feed_from_source(labeler, next_sample, stop=stop)
 
