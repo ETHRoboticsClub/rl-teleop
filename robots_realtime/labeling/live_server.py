@@ -135,30 +135,42 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
                 self.send_error(404)
 
         def _proxy_cam(self, cam_id: str):
-            # 1) live bus bridge → MJPEG stream (multipart/x-mixed-replace) so an
-            #    <img> or a browser tab shows continuous live video, not a snapshot.
+            # 1) live bus bridge. Firefox does NOT render multipart/x-mixed-replace
+            #    inside an <img>, so serve a SINGLE JPEG per request — the cockpit
+            #    re-polls with a ?t= cache-buster for live-ish video (works in all
+            #    browsers). ?stream=1 opts into MJPEG for chrome/direct viewing.
+            stream = self.path.split("?", 1)[1].startswith("stream=1") if "?" in self.path else False
+            cam_id = cam_id.split("?", 1)[0]
             if bridge is not None:
-                first = bridge.jpeg(cam_id)
-                if first is not None:
+                jpg = bridge.jpeg(cam_id)
+                if jpg is not None and not stream:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self._cors()
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(jpg)))
+                    self.end_headers()
+                    self.wfile.write(jpg)
+                    return
+                if jpg is not None and stream:
                     self.send_response(200)
                     self.send_header("Content-Type",
                                      "multipart/x-mixed-replace; boundary=frame")
-                    self._cors()
-                    self.send_header("Cache-Control", "no-store, private")
+                    self._cors(); self.send_header("Cache-Control", "no-store")
                     self.end_headers()
                     try:
                         while True:
-                            jpg = bridge.jpeg(cam_id)
-                            if jpg is not None:
+                            f = bridge.jpeg(cam_id)
+                            if f is not None:
                                 self.wfile.write(
                                     b"--frame\r\nContent-Type: image/jpeg\r\n"
-                                    b"Content-Length: " + str(len(jpg)).encode()
-                                    + b"\r\n\r\n" + jpg + b"\r\n")
-                            time.sleep(1 / 15.0)      # ~15 fps
+                                    b"Content-Length: " + str(len(f)).encode()
+                                    + b"\r\n\r\n" + f + b"\r\n")
+                            time.sleep(1 / 15.0)
                     except (BrokenPipeError, ConnectionResetError):
                         return
                     return
-            # 2) optional MJPEG proxy fallback
+            # 2) optional proxy fallback
             if not cam_base:
                 self.send_error(503); return
             try:

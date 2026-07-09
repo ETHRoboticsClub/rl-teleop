@@ -35,12 +35,16 @@ def test_cam_endpoint_serves_jpeg():
     srv = LiveLabelServer(lab, port=8796, bridge=_FakeBridge())
     srv.start_background()
     try:
-        r = urllib.request.urlopen("http://127.0.0.1:8796/cam/top", timeout=2)
-        assert "multipart/x-mixed-replace" in r.headers["Content-Type"]
+        # default = single JPEG (Firefox-safe); cockpit re-polls with ?t=
+        r = urllib.request.urlopen("http://127.0.0.1:8796/cam/top?t=1", timeout=2)
+        assert r.headers["Content-Type"] == "image/jpeg"
         assert r.headers["Access-Control-Allow-Origin"] == "*"
-        chunk = r.read(8192)                     # bounded read of the stream
-        r.close()
-        assert b"--frame" in chunk and b"\xff\xd8" in chunk   # boundary + JPEG
+        body = r.read()
+        assert body[:2] == b"\xff\xd8"           # a JPEG
+        # ?stream=1 opts into MJPEG
+        s = urllib.request.urlopen("http://127.0.0.1:8796/cam/top?stream=1", timeout=2)
+        assert "multipart/x-mixed-replace" in s.headers["Content-Type"]
+        assert b"--frame" in s.read(8192); s.close()
         # unknown cam id → 503 (no source)
         try:
             urllib.request.urlopen("http://127.0.0.1:8796/cam/nope", timeout=2)
