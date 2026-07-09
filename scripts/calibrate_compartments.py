@@ -86,7 +86,8 @@ def main(argv=None):
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(comps, indent=2))
+    # load_compartments reads data["compartments"], so wrap the list (not a bare list).
+    out.write_text(json.dumps({"frame": "robot_base", "compartments": comps}, indent=2))
     print(f"\nwrote {out}  (half-size {half*1000:.0f} mm). New recordings will classify places.")
     print("Backfill existing episodes:  for d in recordings/*/episode_*; do cp "
           f"{out} \"$d/\"; uv run python -m robots_realtime.labeling.label_episode \"$d\" --arm {args.arm}; done")
