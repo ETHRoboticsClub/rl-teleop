@@ -49,6 +49,14 @@ def read_positions(path: str | Path, node_name: str) -> tuple[np.ndarray, np.nda
             elif channel.topic in json_topics:
                 data = json.loads(msg.data)
                 pos = data.get("position") or data.get("joint_pos")
+                # The follower publishes the 6 arm joints in joint_pos and the gripper
+                # as a SEPARATE gripper_pos field — stitch it on as the 7th DoF (index 6)
+                # so the labeler's gripper index is valid (matches live.py bus_feed).
+                if pos is not None and len(pos) == 6:
+                    grip = data.get("gripper_pos")
+                    if grip is not None:
+                        g = grip[0] if isinstance(grip, (list, tuple)) else grip
+                        pos = list(pos) + [float(g)]
             if pos is None:
                 continue
             times.append(msg.log_time / 1e9)

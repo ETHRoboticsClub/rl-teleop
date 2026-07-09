@@ -350,6 +350,70 @@ def _demo_episode():
     return np.array(times), np.array(pos)
 
 
+def episode_kit_json(packets: list[dict]) -> list[dict]:
+    """Convert the live scanned kit → the kit.json shape label_episode reads
+    ([{bag_id, part_no, name, compartment}, ...]) so each bag's part identity is
+    saved with the recording and fused into annotations.json."""
+    return [{"bag_id": p.get("bag_id", i + 1),
+             "part_no": p.get("part"),
+             "name": p.get("name") or None,
+             "compartment": p.get("comp")}
+            for i, p in enumerate(packets)]
+
+
+def _run_label_episode(episode_dir: Path, arm: str) -> None:
+    """Fire label_episode as an isolated subprocess → writes annotations.json.
+    Isolated so a bad/incomplete episode (e.g. missing yam_<arm>.mcap) logs an
+    error instead of taking down the server."""
+    import subprocess
+    import sys
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "robots_realtime.labeling.label_episode",
+             str(episode_dir), "--arm", arm],
+            cwd=str(Path.cwd()),
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        print(f"[auto-label] {episode_dir.name} → annotations.json")
+    except Exception as e:
+        print(f"[auto-label] failed to launch labeler for {episode_dir}: {e}")
+
+
+def record_watcher(save_root: str, labeler: LiveLabeler, arm: str,
+                   auto_label: bool, stop=None) -> None:
+    """Watch save_root for episodes rr-session creates. On a NEW episode dir (record
+    just started) write kit.json = the scanned kit. When session_meta.json appears
+    (episode saved) run label_episode → annotations.json. Filesystem-coupled so the
+    labeler process and the recorder process stay decoupled."""
+    seen: dict[str, str] = {}
+    root = Path(save_root)
+    while stop is None or not stop.is_set():
+        time.sleep(1.0)
+        for d in sorted(root.glob("*/episode_*")) if root.exists() else []:
+            if not d.is_dir():
+                continue
+            key, meta = str(d), d / "session_meta.json"
+            if key not in seen:
+                seen[key] = "recording"
+                try:
+                    (d / "kit.json").write_text(
+                        json.dumps(episode_kit_json(labeler.packets), indent=2))
+                    print(f"[auto-label] wrote {d.name}/kit.json ({len(labeler.packets)} bags)")
+                except Exception as e:
+                    print(f"[auto-label] kit.json write failed for {d}: {e}")
+                # Box calibration is one-time and shared; if a canonical compartments.json
+                # sits at the recordings root, copy it in so places get classified too.
+                canon = root / "compartments.json"
+                if canon.exists() and not (d / "compartments.json").exists():
+                    try:
+                        (d / "compartments.json").write_text(canon.read_text())
+                    except Exception as e:
+                        print(f"[auto-label] compartments copy failed for {d}: {e}")
+            if seen[key] == "recording" and meta.exists():
+                seen[key] = "done"
+                if auto_label:
+                    _run_label_episode(d, arm)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8791)
@@ -375,6 +439,10 @@ def main(argv=None):
                     help="seconds between scan-cam detection passes")
     ap.add_argument("--detect-gpu", action="store_true",
                     help="use GPU for OCR (leave off on the RTX 5090 — no torch kernels)")
+    ap.add_argument("--save-root", default=None,
+                    help="rr-session recordings root; watch it to save kit.json + auto-label")
+    ap.add_argument("--auto-label", action="store_true",
+                    help="run label_episode on each saved episode → annotations.json")
     args = ap.parse_args(argv)
 
     labeler = LiveLabeler(open_ref=args.open_ref, closed_ref=args.closed_ref)
@@ -413,6 +481,15 @@ def main(argv=None):
             threading.Thread(target=_autoseed, daemon=True).start()
         except Exception as e:
             print(f"Packet detector disabled ({type(e).__name__}: {e})")
+
+    # Watch recordings: save the scanned kit.json into each new episode and (optionally)
+    # auto-run the offline labeler when the episode is saved, so every recording ends
+    # up with a complete annotations.json (part id + compartment + grasp/place).
+    if args.save_root:
+        threading.Thread(target=record_watcher,
+                         args=(args.save_root, labeler, args.arm, args.auto_label),
+                         daemon=True).start()
+        print(f"Watching {args.save_root} (kit.json + auto-label={args.auto_label})")
 
     server = LiveLabelServer(labeler, port=args.port, cam_base=args.cam_base,
                              bridge=bridge, host=args.host, detector=detector)
