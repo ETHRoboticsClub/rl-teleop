@@ -70,9 +70,17 @@ def compartment_at(x: float, y: float, compartments: list[Compartment],
 
 
 def classify_release(ee_xy: tuple[float, float], target_compartment: int | None,
-                     compartments: list[Compartment]) -> PlacementResult:
+                     compartments: list[Compartment],
+                     max_reach_m: float = 0.15) -> PlacementResult:
     x, y = ee_xy
     detected = compartment_at(x, y, compartments)
+    if detected is None and compartments:
+        # A deliberate placement can land just outside the calibrated rect. Fall back to
+        # the NEAREST compartment center (Voronoi) so real demonstrations aren't dropped;
+        # only leave it None if the release is implausibly far from any compartment.
+        nearest = min(compartments, key=lambda c: ((x - c.center[0]) ** 2 + (y - c.center[1]) ** 2))
+        if (x - nearest.center[0]) ** 2 + (y - nearest.center[1]) ** 2 <= max_reach_m ** 2:
+            detected = nearest.id
     in_region: bool | None = None
     offset: float | None = None
     if target_compartment is not None:

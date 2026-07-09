@@ -122,6 +122,7 @@ def build_annotations(
                            achieved_ee_pose=rp)
         if rp is not None and compartments:
             res = classify_release((rp[0], rp[1]), target_comp, compartments)
+            place.detected_compartment = res.detected_compartment   # where it actually landed
             place.in_target_region = res.in_target_region
             place.xy_offset_m = res.xy_offset_m
             place.release_height_m = rp[2]

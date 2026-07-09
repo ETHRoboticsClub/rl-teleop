@@ -111,7 +111,8 @@ class PlaceEvent:
     bag_id: int
     t: float
     target_compartment: int | None = None
-    achieved_ee_pose: Pose | None = None
+    detected_compartment: int | None = None  # compartment the release ACTUALLY landed in
+    achieved_ee_pose: Pose | None = None      # (the demonstrated sorting label)
     in_target_region: bool | None = None     # None = no region / not evaluable
     xy_offset_m: float | None = None
     release_height_m: float | None = None
