@@ -37,7 +37,7 @@ fi
 #    exact per-camera id mapping is set.
 uv run python -m robots_realtime.labeling.live_server --live --arm left \
     --host 0.0.0.0 --port 8791 \
-    --bus-cams "default=camera_top/rgb,egocentric=camera_top/rgb,scan=camera_top/rgb,wristL=camera_left/rgb,wristR=camera_left/rgb" \
+    --bus-cams "default=camera_top/rgb,egocentric=camera_top/rgb,scan=camera_scan/rgb,wristL=camera_left/rgb,wristR=camera_left/rgb" \
     > /tmp/live_label.log 2>&1 &
 LIVE_PID=$!
 echo "live label backend → http://localhost:8791 (log: /tmp/live_label.log)"
