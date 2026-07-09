@@ -115,6 +115,13 @@ def build_annotations(
                 ee_pose=c.grasp_pose, outcome=c.outcome,
                 regrasp_of=(i - 1) if i > 1 else None,   # 2nd+ attempt re-grasps prior
             ))
+        # Retargeting: the operator let it slip and re-grasped. Flag loudly so these
+        # demos can be filtered out of (or studied separately from) the clean set.
+        if len(attempts) > 1:
+            outs = ",".join(c.outcome for c in attempts[:-1])
+            flags.append(Flag("retargeting",
+                              f"bag {bag_id} re-grasped {len(attempts) - 1}x ({outs} → retarget) before place",
+                              t=terminal.t_close, bag_id=bag_id))
 
         # place event from the terminal grasp's release
         rp = terminal.release_pose

@@ -89,3 +89,20 @@ def test_unplaced_grasp_flagged():
     ann = build_annotations("ep", "left", 0, 10, cands)
     assert ann.place_events == []
     assert any(f.kind == "unplaced_grasp" for f in ann.flags)
+
+
+def test_retargeting_flagged():
+    """A slip that gets re-grasped and then placed = retargeting → flagged, and both
+    attempts recorded (regrasp chain), so clean vs retargeted demos are separable."""
+    cands = [_grasp(1, 2, outcome="slip"), _grasp(3, 4, outcome="success")]  # slip → re-grasp → place
+    ann = build_annotations("ep", "left", 0, 10, cands)
+    assert len(ann.place_events) == 1                       # one bag placed
+    assert len(ann.grasp_attempts) == 2                     # both attempts kept
+    assert ann.grasp_attempts[1].regrasp_of == 1           # 2nd re-grasps the 1st
+    rt = [f for f in ann.flags if f.kind == "retargeting"]
+    assert len(rt) == 1 and rt[0].bag_id == 1              # loudly flagged
+
+
+def test_clean_grasp_not_flagged():
+    ann = build_annotations("ep", "left", 0, 10, [_grasp(1, 2, outcome="success")])
+    assert [f.kind for f in ann.flags if f.kind == "retargeting"] == []   # single attempt = clean
