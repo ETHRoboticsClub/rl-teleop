@@ -124,9 +124,12 @@ def label_episode_dir(episode_dir: str | Path, arm: str = "left",
     episode_dir = Path(episode_dir)
     fk = ForwardKinematics(urdf_path)
 
-    times, positions = read_positions(episode_dir / f"yam_{arm}.mcap", f"yam_{arm}")
+    mcap = episode_dir / f"yam_{arm}.mcap"
+    if not mcap.exists():
+        raise RuntimeError(f"no yam_{arm}.mcap in {episode_dir.name} — incomplete episode, skipped")
+    times, positions = read_positions(mcap, f"yam_{arm}")
     if times.size == 0:
-        raise RuntimeError(f"no joint data in {episode_dir}/yam_{arm}.mcap")
+        raise RuntimeError(f"no joint data in {episode_dir.name}/yam_{arm}.mcap")
 
     commanded = None
     gello = episode_dir / f"gello_{arm}.mcap"
@@ -160,8 +163,12 @@ def main(argv=None):
     ap.add_argument("--open-ref", type=float, default=None, help="gripper open joint value")
     ap.add_argument("--closed-ref", type=float, default=None, help="gripper closed joint value")
     args = ap.parse_args(argv)
-    ann = label_episode_dir(args.episode_dir, arm=args.arm,
-                            gripper_open_ref=args.open_ref, gripper_closed_ref=args.closed_ref)
+    try:
+        ann = label_episode_dir(args.episode_dir, arm=args.arm,
+                                gripper_open_ref=args.open_ref, gripper_closed_ref=args.closed_ref)
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"⏭  skipped {Path(args.episode_dir).name}: {e}")  # clean skip, not a traceback
+        return 0
     print(f"wrote {Path(args.episode_dir) / 'annotations.json'}")
     print(f"  bags placed: {len(ann.place_events)}  grasp attempts: {len(ann.grasp_attempts)}"
           f"  flags: {len(ann.flags)}")
