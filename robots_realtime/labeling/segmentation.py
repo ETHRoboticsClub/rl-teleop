@@ -64,19 +64,27 @@ def _classify(hold_vals: np.ndarray, t_close: float, t_arr: np.ndarray,
               ee_z: np.ndarray | None) -> tuple[float, float, str, bool | None]:
     hold_norm = float(np.median(hold_vals))
     min_norm = float(np.min(hold_vals))
-    if hold_norm < C.GRIPPER_EMPTY_CLOSE:
-        outcome = "empty"
-    elif min_norm < hold_norm - C.GRIPPER_SLIP_DROP:
-        outcome = "slip"
-    else:
-        outcome = "success"
+    slipped = min_norm < hold_norm - C.GRIPPER_SLIP_DROP
 
+    # Did the end-effector lift during the hold? (bag picked up)
     lifted: bool | None = None
     if ee_z is not None and ee_z.size == t_arr.size:
         window = (t_arr >= t_close) & (t_arr <= t_close + C.LIFT_WINDOW_S)
         if window.any():
             z0 = float(np.interp(t_close, t_arr, ee_z))
             lifted = bool(float(np.max(ee_z[window])) - z0 >= C.MIN_LIFT_M)
+
+    # Flat kitting bags let the gripper close almost fully even when holding one, so a
+    # width-only test reads "empty" for real picks (no force sensor to tell them apart).
+    # A LIFT is unambiguous evidence the grasp held an object → it is never empty.
+    if lifted:
+        outcome = "slip" if slipped else "success"
+    elif hold_norm < C.GRIPPER_EMPTY_CLOSE:
+        outcome = "empty"
+    elif slipped:
+        outcome = "slip"
+    else:
+        outcome = "success"
     return hold_norm, min_norm, outcome, lifted
 
 

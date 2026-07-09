@@ -97,3 +97,20 @@ def test_still_closed_at_end():
     ivs = _detect(t, w)
     assert len(ivs) == 1
     assert ivs[0].t_open is None
+
+
+def test_lift_overrides_empty_for_flat_bags():
+    """A tight close (width reads 'empty') that LIFTS is a real grasp, not empty —
+    flat bags close nearly full, so the lift is the reliable evidence it held one."""
+    import numpy as np
+    from robots_realtime.labeling.segmentation import _classify
+    from robots_realtime.labeling import constants as C
+    t = np.linspace(0, 2.0, 40)
+    hold = np.full(20, C.GRIPPER_EMPTY_CLOSE * 0.3)      # very tight → width says "empty"
+    ee_z = np.concatenate([np.zeros(20), np.full(20, C.MIN_LIFT_M + 0.05)])  # clear lift
+    _, _, outcome, lifted = _classify(hold, float(t[0]), t, ee_z)
+    assert lifted is True and outcome == "success"       # lift wins over width-empty
+
+    # same tight close but NO lift → still empty
+    _, _, oc2, lifted2 = _classify(hold, float(t[0]), t, np.zeros(40))
+    assert lifted2 is False and oc2 == "empty"
