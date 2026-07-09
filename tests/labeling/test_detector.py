@@ -4,7 +4,36 @@ import numpy as np
 
 from robots_realtime.labeling.detector import (
     parse_part, match_sku, detect_blobs, PacketDetector, Detection,
+    kit_from_detections, normalize_prefix, _clean_dets,
 )
+
+
+def test_normalize_prefix():
+    assert normalize_prefix("UMM-10126-151") == "UNN-10126-151"   # UMM → UNN
+    assert normalize_prefix("MDO-11065-001") == "MDDY-11065-001"  # MDO → MDDY
+    assert normalize_prefix("UNN-10015-007") == "UNN-10015-007"   # already good
+
+
+def test_clean_dets_dedupes_thresholds_normalizes():
+    dets = [Detection([480, 157, 100, 56], "UMM-10126-000", 0.76),   # real packet
+            Detection([479, 157, 102, 56], "UMM-10426-000", 0.65),   # same packet twin
+            Detection([520, 680, 78, 32], "VSDA-02290-000", 0.36),   # noise < threshold
+            Detection([800, 590, 100, 64], "UMH-10015-007", 0.98)]   # another packet
+    out = _clean_dets(dets, min_conf=0.5)
+    assert sorted(d.part for d in out) == ["UNN-10015-007", "UNN-10126-000"]
+
+
+class _FakeReader:
+    """Stub easyocr: readtext returns fixed (box, text, conf) triples."""
+    def __init__(self, results):
+        self._results = results
+
+    def readtext(self, _img):
+        return self._results
+
+
+def _word(txt, x, y, w=40, h=20, conf=0.9):
+    return ([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], txt, conf)
 
 
 def test_parse_part():
@@ -60,6 +89,44 @@ def test_bbox_for_prefers_highest_conf():
     bbox, conf = det.bbox_for("UNN-10015-007")
     assert bbox == [5, 5, 20, 20] and conf == 0.9
     assert det.bbox_for("MISSING") == (None, 0.0)
+
+
+def test_detect_once_reads_all_packets_generically():
+    # two real packets + one order-number noise line (10 digits, no adjacent prefix)
+    results = [
+        _word("UNN", 100, 100), _word("10126", 145, 100), _word("151", 205, 100),
+        _word("MDDY", 100, 300), _word("11065", 150, 300), _word("001", 210, 300),
+        _word("3050765961", 100, 500),   # noise — not a 5-digit middle, ignored
+    ]
+    det = PacketDetector(lambda: None, lambda: None)
+    det._reader = _FakeReader(results)
+    dets = det.detect_once(np.zeros((600, 640, 3), np.uint8), None)
+    assert sorted(d.part for d in dets) == ["MDDY-11065-001", "UNN-10126-151"]
+
+
+def test_detect_once_needs_prefix_near_middle():
+    # a 5-digit number with NO letter prefix nearby is not a part number
+    det = PacketDetector(lambda: None, lambda: None)
+    det._reader = _FakeReader([_word("48291", 100, 100), _word("77310", 400, 400)])
+    assert det.detect_once(np.zeros((480, 640, 3), np.uint8), None) == []
+
+
+def test_kit_from_detections_grouped_and_ordered():
+    dets = [Detection([300, 50, 40, 20], "UNN-10015-007", 0.9),    # top row, right
+            Detection([100, 50, 40, 20], "UNN-10126-151", 0.9),    # top row, left
+            Detection([100, 300, 40, 20], "UNN-10015-007", 0.9)]   # lower row, dup part
+    kit = kit_from_detections(dets)
+    assert [k["part"] for k in kit] == ["UNN-10126-151", "UNN-10015-007", "UNN-10015-007"]
+    assert kit[0]["comp"] == 1      # first distinct part
+    assert kit[1]["comp"] == 2      # second distinct part
+    assert kit[2]["comp"] == 2      # duplicate shares its part's compartment
+
+
+def test_bbox_for_matches_by_middle_despite_suffix_flicker():
+    det = PacketDetector(lambda: None, lambda: None)
+    det._dets = [Detection([1, 2, 3, 4], "UNN-10015-000", 0.8)]   # suffix misread as 000
+    bbox, _conf = det.bbox_for("UNN-10015-007")                   # kit wants -007
+    assert bbox == [1, 2, 3, 4]                                   # matched on middle 10015
 
 
 def test_detect_once_falls_back_when_ocr_unavailable():

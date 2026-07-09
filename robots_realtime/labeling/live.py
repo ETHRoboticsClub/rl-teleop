@@ -106,6 +106,7 @@ class LiveLabeler:
     packets: list[dict] = field(default_factory=list)
     ti: int = 0
     seeded: bool = False
+    locked: bool = False   # once the operator records, freeze the scanned kit (stop auto-reseed)
     events: list[dict] = field(default_factory=list)   # live cockpit_events
     stage: str = "idle"
 
@@ -170,6 +171,7 @@ class LiveLabeler:
         with self._lock:
             return {
                 "seeded": self.seeded,
+                "locked": self.locked,
                 "packets": [{"part": p.get("part"), "name": p.get("name"),
                              "comp": p.get("comp"), "bbox": p.get("bbox"),
                              "status": p.get("status", "pending")}

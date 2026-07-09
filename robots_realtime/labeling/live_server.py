@@ -101,17 +101,34 @@ class CameraBridge:
 
 def _state_with_detections(labeler: LiveLabeler, detector) -> dict:
     """labeler.state() augmented with live scan detections: each kit packet gets a
-    pixel bbox on the scan frame (from the detector, matched by part id) so the
-    cockpit can draw the 'pick this next' box on the actual packet. wh = scan size."""
+    pixel bbox on the scan frame so the cockpit can draw the 'pick this next' box on
+    the actual packet. When several packets share a part id (e.g. two UNN-16022-009),
+    the physical detections are assigned to the kit entries POSITIONALLY so each entry
+    boxes a distinct packet, not the same one twice. wh = scan size."""
+    from collections import defaultdict
+    from robots_realtime.labeling.detector import parse_part
     st = labeler.state()
     if detector is None:
         return st
-    _dets, wh = detector.current()
+    dets, wh = detector.current()
     st["wh"] = wh
+    by_mid: dict[str, list] = defaultdict(list)     # 5-digit middle → detections (stable order)
+    for d in dets:
+        p = parse_part(d.part or "")
+        if p:
+            by_mid[p[1]].append(d)
+    for lst in by_mid.values():
+        lst.sort(key=lambda d: (d.bbox[1], d.bbox[0]))
+    used: dict[str, int] = defaultdict(int)
     for pk in st["packets"]:
-        bbox, conf = detector.bbox_for(pk.get("part"))
-        pk["bbox_px"] = bbox            # [x,y,w,h] in scan pixels, or None if not seen
-        pk["det_conf"] = conf
+        p = parse_part(pk.get("part") or "")
+        lst = by_mid.get(p[1], []) if p else []
+        i = used[p[1]] if p else 0
+        d = lst[i] if i < len(lst) else (lst[-1] if lst else None)
+        if p and i < len(lst):
+            used[p[1]] += 1
+        pk["bbox_px"] = d.bbox if d else None
+        pk["det_conf"] = d.conf if d else 0.0
     return st
 
 
@@ -151,12 +168,20 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
             if self.path == "/seed":
                 n = int(self.headers.get("Content-Length", 0) or 0)
                 raw = self.rfile.read(n) if n else b""
-                try:
-                    kit = json.loads(raw)["packets"] if raw else DEFAULT_KIT
-                except Exception:
-                    kit = DEFAULT_KIT
-                labeler.seed(kit)
-                self._json(labeler.state())
+                kit = None
+                if raw:
+                    try:
+                        kit = json.loads(raw)["packets"]
+                    except Exception:
+                        kit = None
+                if kit is None and detector is not None:
+                    # operator started recording → freeze the kit as the scan sees it NOW
+                    from robots_realtime.labeling.detector import kit_from_detections
+                    dets, _wh = detector.current()
+                    kit = kit_from_detections(dets) or None
+                labeler.seed(kit if kit is not None else DEFAULT_KIT)
+                labeler.locked = True
+                self._json(_state_with_detections(labeler, detector))
             elif self.path == "/advance":
                 labeler.advance()
                 self._json(labeler.state())
@@ -367,12 +392,25 @@ def main(argv=None):
     detector = None
     if bridge is not None and args.detect:
         try:
-            from robots_realtime.labeling.detector import PacketDetector
+            from robots_realtime.labeling.detector import PacketDetector, kit_from_detections
             detector = PacketDetector(
                 frame_source=lambda: bridge.frame("scan"),
-                known_source=lambda: [p.get("part") for p in labeler.packets if p.get("part")],
+                known_source=lambda: None,          # free-read EVERY packet on the table
                 period_s=args.detect_period, gpu=args.detect_gpu).start()
             print(f"Packet detector on the scan cam (period {args.detect_period}s, gpu={args.detect_gpu})")
+
+            # Auto-seed the kit from the scan: the pick-list = the packets actually on the
+            # table (not a fixed list). Re-seed while idle so the box always reflects reality;
+            # once the operator starts recording, POST /seed locks in the scanned kit.
+            def _autoseed():
+                while True:
+                    time.sleep(args.detect_period)
+                    dets, _wh = detector.current()
+                    if dets and not labeler.locked:
+                        kit = kit_from_detections(dets)
+                        if kit and [p["part"] for p in kit] != [p.get("part") for p in labeler.packets]:
+                            labeler.seed(kit)
+            threading.Thread(target=_autoseed, daemon=True).start()
         except Exception as e:
             print(f"Packet detector disabled ({type(e).__name__}: {e})")
 
