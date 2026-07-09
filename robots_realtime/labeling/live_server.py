@@ -124,6 +124,59 @@ class LiveLabelServer:
         self._httpd.shutdown()
 
 
+def _feed_from_source(labeler: LiveLabeler, next_sample, stop=None,
+                      poll_s: float = 0.005) -> None:
+    """Pump (ts, gripper_width) from ``next_sample()`` into the labeler until
+    stop is set. ``next_sample`` returns (ts, width) or None when nothing new.
+    Deduplicates on ts so the latest-per-topic subscriber isn't re-pushed."""
+    last_ts = None
+    while stop is None or not stop.is_set():
+        s = next_sample()
+        if s is not None:
+            ts, width = s
+            if ts != last_ts:
+                last_ts = ts
+                labeler.push(float(ts), float(width))
+        time.sleep(poll_s)
+
+
+def bus_feed(labeler: LiveLabeler, arm: str = "left", host: str = "127.0.0.1",
+             port: int | None = None, stop=None) -> None:
+    """Subscribe to the live rl-teleop joint stream and drive the labeler.
+
+    The follower publishes ``yam_{arm}/joint_state`` = {"joint_pos": [...7...]}
+    (gripper at index 6) on the ZMQ XPUB/XSUB broker. This taps it live so the
+    cockpit shows each grasp/place labeled as it happens.
+    """
+    from robots_realtime.runtime.transport.message_bus import DEFAULT_SUB_PORT
+    from robots_realtime.runtime.transport.subscriber import Subscriber
+
+    topic = f"yam_{arm}/joint_state"
+    sub = Subscriber([topic], host=host, port=port or DEFAULT_SUB_PORT)
+
+    def next_sample():
+        env = sub.get_latest(topic)
+        if env is None:
+            return None
+        ts = env.get("ts")
+        data = env.get("data") or {}
+        pos = data.get("joint_pos")
+        if pos is None:
+            pos = data.get("position")
+        if pos is None or ts is None:
+            return None
+        return float(ts), float(pos[C.GRIPPER_JOINT_INDEX])
+
+    _feed_from_source(labeler, next_sample, stop=stop)
+
+
+def write_cockpit_events(labeler: LiveLabeler, path: str | Path) -> None:
+    """Persist the live place/grasp events as cockpit_events.jsonl so the
+    offline labeler can fuse intent (part → compartment) later."""
+    lines = [json.dumps(e) for e in labeler.events]
+    Path(path).write_text("\n".join(lines) + ("\n" if lines else ""))
+
+
 def replay_feed(labeler: LiveLabeler, times, positions, realtime: bool = True,
                 speed: float = 1.0) -> None:
     """Push a joint timeline into the labeler, optionally pacing in real time."""
@@ -157,8 +210,12 @@ def _demo_episode():
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8791)
+    ap.add_argument("--live", action="store_true",
+                    help="tap the running rl-teleop joint bus (real teleop)")
     ap.add_argument("--replay", type=str, default=None,
-                    help="episode dir to replay (yam_left.mcap); omit for a synthetic demo")
+                    help="episode dir to replay (yam_left.mcap)")
+    ap.add_argument("--record-events", type=str, default=None,
+                    help="on exit, write cockpit_events.jsonl into this episode dir")
     ap.add_argument("--arm", default="left")
     ap.add_argument("--cam-base", default=None, help="proxy /cam/<id> to this base URL")
     ap.add_argument("--speed", type=float, default=3.0)
@@ -172,20 +229,31 @@ def main(argv=None):
     server.start_background()
     print(f"Live label backend on http://localhost:{args.port}  (point the cockpit here)")
 
-    if args.replay:
-        from robots_realtime.labeling.mcap_io import read_positions
-        times, positions = read_positions(Path(args.replay) / f"yam_{args.arm}.mcap", f"yam_{args.arm}")
-    else:
-        times, positions = _demo_episode()
+    def _finish():
+        if args.record_events:
+            write_cockpit_events(labeler, Path(args.record_events) / "cockpit_events.jsonl")
+            print(f"wrote {args.record_events}/cockpit_events.jsonl ({len(labeler.events)} events)")
+        s = labeler.state()
+        print(f"Final: {s['done']}/{s['total']} placed")
 
-    print(f"Feeding {len(times)} samples (speed x{args.speed})... watch ti advance in the cockpit.")
-    replay_feed(labeler, times, positions, realtime=True, speed=args.speed)
-    print("Feed done. Final:", labeler.state()["done"], "/", labeler.state()["total"])
-    # keep serving so the cockpit can still read the final state
     try:
-        while True:
-            time.sleep(1)
+        if args.live:
+            print("Tapping the live rl-teleop joint bus... teleoperate now.")
+            bus_feed(labeler, arm=args.arm)          # blocks until Ctrl+C
+        else:
+            if args.replay:
+                from robots_realtime.labeling.mcap_io import read_positions
+                times, positions = read_positions(
+                    Path(args.replay) / f"yam_{args.arm}.mcap", f"yam_{args.arm}")
+            else:
+                times, positions = _demo_episode()
+            print(f"Feeding {len(times)} samples (speed x{args.speed})...")
+            replay_feed(labeler, times, positions, realtime=True, speed=args.speed)
+            _finish()
+            while True:                              # keep serving final state
+                time.sleep(1)
     except KeyboardInterrupt:
+        _finish()
         server.shutdown()
 
 
