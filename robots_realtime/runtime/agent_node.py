@@ -29,11 +29,14 @@ Subscribed topics: state_topics.values() + image_topics.values()
 from __future__ import annotations
 
 import importlib
+import logging
 import time
 
 import numpy as np
 
 from robots_realtime.runtime.node import Node, NodeRole
+
+logger = logging.getLogger(__name__)
 
 
 class AgentNode(Node):
@@ -78,6 +81,7 @@ class AgentNode(Node):
         normalize_gripper: bool = False,
         gripper_open_deg: float = 85.0,
         gripper_closed_deg: float = 5.0,
+        safety: dict | None = None,
         writer=None,
         **kwargs,
     ) -> None:
@@ -111,10 +115,19 @@ class AgentNode(Node):
         self._normalize_gripper = normalize_gripper
         self._gripper_open_deg = gripper_open_deg
         self._gripper_closed_deg = gripper_closed_deg
+        # Command-space safety guardrails (bounding box + speed cap). Parsed/validated in
+        # setup() so a bad real-hardware config fails closed *before* any command is sent.
+        self._safety_params = safety
+        self._guardrails: dict = {}
+        self._clamp_counts: dict = {}
+        self._last_clamp_log = 0.0
 
     # ------------------------------------------------------------------
 
     def setup(self) -> None:
+        # Build + validate safety guardrails first so an invalid real-hardware config
+        # fails closed before the agent resets or any command is published.
+        self._build_guardrails()
         if self._agent is None:
             if self._agent_class is None:
                 raise RuntimeError(
@@ -123,6 +136,29 @@ class AgentNode(Node):
             self._agent = self._build_agent()
         if hasattr(self._agent, "reset"):
             self._agent.reset()
+
+    def _build_guardrails(self) -> None:
+        from robots_realtime.runtime.safety import (
+            BoundingBoxGuardrail,
+            SpeedLimitGuardrail,
+            build_safety_config,
+        )
+
+        cfg = build_safety_config(self._safety_params)
+        self._guardrails = {}
+        if cfg is None:
+            return
+        for arm_key, arm in cfg.arms.items():
+            chain = []
+            # Order: speed cap first, bounding box last, so the final command is inside
+            # the box even after the speed limiter moved it. (Cartesian reject slots
+            # between these once added.)
+            if arm.speed_limit is not None:
+                chain.append(SpeedLimitGuardrail(arm.speed_limit, arm_key))
+            if arm.bounding_box is not None:
+                chain.append(BoundingBoxGuardrail(arm.bounding_box, arm_key))
+            if chain:
+                self._guardrails[arm_key] = chain
 
     def _build_agent(self):
         ref = self._agent_class
@@ -184,13 +220,13 @@ class AgentNode(Node):
                 pos = arm_action["pos"] if isinstance(arm_action, dict) else arm_action
                 self.publish(
                     "joint_pos",
-                    {"joint_pos": self._process_pos(pos)},
+                    {"joint_pos": self._finalize_pos(pos, self._arm_key)},
                     ts=ts,
                 )
         elif "pos" in action:
             self.publish(
                 "joint_pos",
-                {"joint_pos": self._process_pos(action["pos"])},
+                {"joint_pos": self._finalize_pos(action["pos"], "default")},
                 ts=ts,
             )
         else:
@@ -200,7 +236,7 @@ class AgentNode(Node):
                 if isinstance(arm_action, dict) and "pos" in arm_action:
                     self.publish(
                         "joint_pos",
-                        {"joint_pos": self._process_pos(arm_action["pos"])},
+                        {"joint_pos": self._finalize_pos(arm_action["pos"], arm_keys[0])},
                         ts=ts,
                     )
             else:
@@ -209,9 +245,13 @@ class AgentNode(Node):
                     if isinstance(arm_action, dict) and "pos" in arm_action:
                         self.publish(
                             f"{key}_pos",
-                            {"joint_pos": self._process_pos(arm_action["pos"])},
+                            {"joint_pos": self._finalize_pos(arm_action["pos"], key)},
                             ts=ts,
                         )
+
+    def _finalize_pos(self, pos, arm_key: str) -> np.ndarray:
+        """Normalize the gripper, then apply the safety guardrails for this arm."""
+        return self._apply_safety(self._process_pos(pos), arm_key)
 
     def _process_pos(self, pos) -> np.ndarray:
         pos = np.asarray(pos, dtype=np.float32)
@@ -220,6 +260,28 @@ class AgentNode(Node):
             pos = pos.copy()
             pos[-1] = float(np.clip((pos[-1] - self._gripper_closed_deg) / span, 0.0, 1.0))
         return pos
+
+    def _apply_safety(self, pos: np.ndarray, arm_key: str) -> np.ndarray:
+        """Run the per-arm guardrail chain (speed cap -> bounding box). Clamp, never drop."""
+        chain = self._guardrails.get(arm_key) or self._guardrails.get("default")
+        if not chain:
+            return pos
+        out = np.asarray(pos, dtype=np.float64)
+        for guardrail in chain:
+            out, event = guardrail.apply(out)
+            if event is not None:
+                self._record_clamp(event)
+        return out.astype(np.float32)
+
+    def _record_clamp(self, event) -> None:
+        """Count clamp events; log at most ~1 Hz so telemetry can't stall the loop."""
+        self._clamp_counts[event.guardrail] = self._clamp_counts.get(event.guardrail, 0) + 1
+        now = time.monotonic()
+        if now - self._last_clamp_log > 1.0:
+            self._last_clamp_log = now
+            logger.warning(
+                "[%s] %s (total %d)", self.name, event, self._clamp_counts[event.guardrail]
+            )
 
     def cleanup(self) -> None:
         if self._agent is not None and hasattr(self._agent, "close"):
@@ -240,4 +302,5 @@ class AgentNode(Node):
             "normalize_gripper": params.get("normalize_gripper", False),
             "gripper_open_deg": params.get("gripper_open_deg", 85.0),
             "gripper_closed_deg": params.get("gripper_closed_deg", 5.0),
+            "safety": params.get("safety"),
         }
