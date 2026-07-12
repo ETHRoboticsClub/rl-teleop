@@ -311,6 +311,9 @@ class DynamixelGelloLeaderAgent(Agent):
         self._ticks_to_rad = (2.0 * np.pi) / self.ticks_per_rev
         self._last_stale_log = 0.0
         self._last_pos = np.zeros(NUM_ARM_JOINTS + (1 if self.include_gripper else 0), dtype=np.float32)
+        # Per-step delta limiter is seeded lazily on the first good read so the first
+        # command establishes the reference instead of ramping up from the zero seed.
+        self._delta_seeded = False
 
         self._reader = reader or _DynamixelPositionReader(
             port=port,
@@ -369,12 +372,34 @@ class DynamixelGelloLeaderAgent(Agent):
             pos = arm_rad
         return pos.astype(np.float32)
 
+    def _limit_delta(self, pos: np.ndarray) -> np.ndarray:
+        """Rate-limit the per-step change of the arm joints to ``max_delta_rad``.
+
+        The reference is the last *emitted* command, so a spurious large jump (a
+        corrupted read, or a ±pi wrap glitch in ``_map_arm_ticks``) ramps toward the
+        target over several steps instead of snapping the follower straight there. The
+        gripper element (normalized [0, 1], not a radian) is left untouched. Disabled
+        when ``max_delta_rad <= 0``.
+        """
+        if not (self.max_delta_rad > 0 and np.isfinite(self.max_delta_rad)):
+            return pos
+        if not self._delta_seeded or self._last_pos.shape != pos.shape:
+            # First command (or a command-width change) seeds the reference un-clamped.
+            return pos
+        limited = pos.copy()
+        ref = self._last_pos[:NUM_ARM_JOINTS]
+        delta = np.clip(pos[:NUM_ARM_JOINTS] - ref, -self.max_delta_rad, self.max_delta_rad)
+        limited[:NUM_ARM_JOINTS] = ref + delta
+        return limited
+
     def act(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         try:
             ticks = np.asarray(self._reader.get_positions(), dtype=np.float64)
             pos = self._positions_to_action(ticks)
             if np.all(np.isfinite(pos)):
+                pos = self._limit_delta(pos)
                 self._last_pos = pos
+                self._delta_seeded = True
             else:
                 logger.warning("DynamixelGelloLeaderAgent[%s]: non-finite action from reader", self.port)
                 pos = self._last_pos

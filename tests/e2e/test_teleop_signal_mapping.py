@@ -259,26 +259,49 @@ def test_read_failure_reuses_last_command():
     np.testing.assert_array_equal(after, good)
 
 
-# ── Dead safety param: max_delta_rad is accepted but never applied ─────────────
+# ── Safety: max_delta_rad per-step jump cap ────────────────────────────────────
 
 
-def test_max_delta_rad_is_currently_not_enforced():
-    """Documents the dead param WS4 (teleop speed cap) will fix.
-
-    A huge tick jump should be clamped by a per-step limit — but max_delta_rad is not
-    wired in, so the output jump is unbounded today. This test asserts the (unsafe)
-    status quo so the WS4 change flips it deliberately.
-    """
+def test_max_delta_rad_clamps_a_large_jump():
+    """A huge single-step tick jump is rate-limited to max_delta_rad, not passed raw."""
     reader = _Reader(_baseline_ticks())
     agent = _agent(reader, robot_name="left", max_delta_rad=0.01)
-    _pos(agent)
+    base = _pos(agent)  # seeds the reference at 0 rad
 
     jumped = _baseline_ticks()
     jumped[0] += 800  # ~1.2 rad jump, far beyond max_delta_rad=0.01
     reader.set(jumped)
     after = _pos(agent)
-    step = abs(after[0] - 0.0)
-    assert step > 0.5, "max_delta_rad appears to be enforced now — update WS4 expectations"
+
+    # Joint 0 advances by at most one max_delta_rad step toward the target.
+    assert abs(after[0] - base[0]) == pytest.approx(0.01, abs=1e-6)
+    # Untouched joints do not move.
+    np.testing.assert_allclose(after[1:N], base[1:N], atol=1e-6)
+
+
+def test_max_delta_rad_ramps_toward_target_over_steps():
+    """Repeated clamping walks the reference toward the leader (ramp, not a hard stop)."""
+    reader = _Reader(_baseline_ticks())
+    agent = _agent(reader, robot_name="left", max_delta_rad=0.05)
+    _pos(agent)
+
+    jumped = _baseline_ticks()
+    jumped[0] += 800
+    reader.set(jumped)
+    outs = [_pos(agent)[0] for _ in range(4)]
+    # Each step advances ~0.05 rad; monotonic ramp toward the (positive) target.
+    assert outs == sorted(outs)
+    assert outs[1] - outs[0] == pytest.approx(0.05, abs=1e-6)
+
+
+def test_max_delta_rad_does_not_clamp_first_command():
+    """The first read seeds the reference and is emitted un-clamped (matches the follower)."""
+    ticks = _baseline_ticks()
+    ticks[0] += 800  # first command is already far from the zero seed
+    reader = _Reader(ticks)
+    agent = _agent(reader, robot_name="left", max_delta_rad=0.01)
+    first = _pos(agent)[0]
+    assert abs(first) > 0.5  # not throttled down to 0.01 on the very first step
 
 
 # ── CI-only: other leader mappings ─────────────────────────────────────────────

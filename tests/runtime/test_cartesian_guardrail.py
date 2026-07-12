@@ -75,6 +75,28 @@ def test_reset_fails_closed_when_current_pose_outside_box():
         g.reset(np.array([5.0, 0, 0, 0, 0, 0]))  # x=5 outside the box
 
 
+def test_apply_without_reset_seeds_from_first_in_box_command():
+    """When reset() was never called, the first in-box command seeds the hold state
+    and subsequent out-of-box commands are held (no fail-open)."""
+    g = CartesianWorkspaceRejectGuardrail(_cfg(), FK, arm="left")  # no reset()
+    out, ev = g.apply(np.array([0.5, 0, 0, 0, 0, 0, 0]))  # in box → seed + pass
+    np.testing.assert_allclose(out[:6], [0.5, 0, 0, 0, 0, 0])
+    assert ev is None
+
+    out, ev = g.apply(np.array([5.0, 0, 0, 0, 0, 0, 0]))  # out of box → hold
+    np.testing.assert_allclose(out[:6], [0.5, 0, 0, 0, 0, 0])
+    assert ev is not None
+    assert g.reject_count == 1
+
+
+def test_apply_without_reset_fails_closed_when_first_command_out_of_box():
+    """Regression: starting outside the box used to fail *open* (pass unbounded). With
+    no safe reference to hold, apply() must fail closed (loud) instead."""
+    g = CartesianWorkspaceRejectGuardrail(_cfg(), FK, arm="left")  # no reset()
+    with pytest.raises(CartesianConfigError):
+        g.apply(np.array([5.0, 0, 0, 0, 0, 0, 0]))  # x=5 outside the box
+
+
 def test_does_not_mutate_input():
     g = _g()
     cmd = np.array([9.0] * 7)

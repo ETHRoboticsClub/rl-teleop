@@ -94,12 +94,21 @@ class CartesianWorkspaceRejectGuardrail:
         candidate = out[valid]
 
         if self._last_safe is None or self._last_safe.shape != candidate.shape:
-            # No hold state yet — accept if in box and seed, else we cannot hold, so we
-            # still publish the candidate (bounding box / motor limits remain downstream).
+            # No safe reference yet. Seed from the first in-box command. If the very
+            # first command is already outside the box we have no safe pose to hold and
+            # cannot project it back in without IK — fail closed (loud) rather than
+            # passing an unbounded command through. This mirrors reset()'s "cannot start
+            # guarded teleop" contract for the path where reset() was never called with
+            # the follower state (e.g. the leader-side AgentNode).
             if self._in_box(self._xyz(candidate)):
                 self._last_safe = candidate.copy()
                 self._holding = False
-            return out, None
+                return out, None
+            raise CartesianConfigError(
+                f"[{self._arm}] cannot start guarded teleop: the first command's "
+                "end-effector is outside the Cartesian workspace box (no safe pose to "
+                "hold — move the leader inside the workspace before starting)"
+            )
 
         if self._in_box(self._xyz(candidate)):
             if self._holding:
