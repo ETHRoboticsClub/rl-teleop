@@ -136,10 +136,6 @@ class SafetyConfig:
     def arm(self, arm_key: str) -> ArmSafety | None:
         return self.arms.get(arm_key)
 
-    @property
-    def any_enabled(self) -> bool:
-        return any(a.bounding_box or a.speed_limit for a in self.arms.values())
-
 
 def build_safety_config(params: dict | None) -> SafetyConfig | None:
     """Build a :class:`SafetyConfig` from a YAML ``safety:`` dict, or ``None`` if absent.

@@ -265,7 +265,6 @@ class Session:
         self._episode_dir: Path | None = None
         self._episode_start_time: float | None = None
         self._recording_lock = threading.Lock()
-        self._recording_error: str = ""
         # Set when a critical node dies mid-session; the CLI exits non-zero on it.
         self._fatal_reason: str | None = None
 
@@ -317,10 +316,14 @@ class Session:
         # Authoritative bring-up: each host now reports whether its hardware actually
         # opened. A critical node's failure aborts the whole session loudly; an optional
         # node's failure is logged and surfaced (alive=False) but the session continues.
+        # Phase one — bring every node's hardware up. Nodes do NOT actuate yet (they wait
+        # for GO below), so a critical failure aborts before any motor is commanded.
+        started_hosts: list = []
         critical_failures: list[tuple[str, str]] = []
         for host in self._hosts:
             result = host.send_start()
             if result.ok:
+                started_hosts.append(host)
                 continue
             if host.critical:
                 logger.error(
@@ -340,11 +343,23 @@ class Session:
         if critical_failures:
             self._abort_startup(critical_failures)
 
+        # Install signal handlers and start the liveness monitor BEFORE any node
+        # actuates, so the whole actuation window is covered (Ctrl-C works, and a node
+        # that dies the instant it starts running is detected).
         self._setup_signal_handlers()
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop, daemon=True, name="SessionMonitor"
         )
         self._monitor_thread.start()
+
+        # Phase two — every critical node is up; release them all to begin actuating.
+        for host in started_hosts:
+            try:
+                host.send_go()
+            except Exception as exc:
+                logger.error(
+                    "Failed to signal GO to node '%s': %s", host.node_name, exc
+                )
 
         if self._auto_record_duration is not None:
             t = threading.Thread(
@@ -453,17 +468,14 @@ class Session:
         # Delegate recording to all hosts. A failure here is loud: if a node cannot
         # start recording (crashed, device gone), the operator must know the episode is
         # not fully captured rather than believing it is.
-        failed = []
         for host in self._hosts:
             try:
                 host.start_recording(save_dir)
             except Exception as exc:
-                failed.append(host.node_name)
                 logger.error(
                     "Node '%s' failed to start recording into %s: %s",
                     host.node_name, save_dir, exc,
                 )
-        self._recording_error = "; ".join(failed) if failed else ""
 
         if self._episode_timeout is not None:
             self._episode_timeout_timer = threading.Timer(

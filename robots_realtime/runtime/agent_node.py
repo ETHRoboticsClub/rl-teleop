@@ -121,6 +121,11 @@ class AgentNode(Node):
         self._guardrails: dict = {}
         self._clamp_counts: dict = {}
         self._last_clamp_log = 0.0
+        # Per-arm guardrail state: which arms have been seeded (reset() called once) and
+        # the last command that passed the chain (held if a later command is non-finite).
+        self._seeded_arms: set = set()
+        self._last_safe_cmd: dict = {}
+        self._last_nonfinite_log = 0.0
 
     # ------------------------------------------------------------------
 
@@ -289,16 +294,52 @@ class AgentNode(Node):
         return pos
 
     def _apply_safety(self, pos: np.ndarray, arm_key: str) -> np.ndarray:
-        """Run the per-arm guardrail chain (speed cap -> bounding box). Clamp, never drop."""
+        """Run the per-arm guardrail chain (speed cap -> cartesian -> bounding box).
+
+        Clamp, never drop. A non-finite command fails closed (held/refused) before it can
+        reach the chain, since ``np.clip`` preserves NaN and the speed limiter would latch
+        it forever.
+        """
         chain = self._guardrails.get(arm_key) or self._guardrails.get("default")
         if not chain:
-            return pos
+            return np.asarray(pos, dtype=np.float32)
         out = np.asarray(pos, dtype=np.float64)
+        if not np.isfinite(out).all():
+            self._log_nonfinite(arm_key)
+            held = self._last_safe_cmd.get(arm_key)
+            if held is not None and held.shape == out.shape:
+                return held.astype(np.float32)
+            raise RuntimeError(
+                f"[{self.name}] non-finite command for arm '{arm_key}' with no prior "
+                "safe command to hold — refusing to publish"
+            )
+        # Seed the stateful guardrails once, from the first command, at a defined point so
+        # the fail-closed 'start outside the box' check (cartesian) and the speed-limit
+        # reference actually run — reset() is otherwise never called. NOTE: on a leader-side
+        # AgentNode the reference is the first *commanded* pose, not the follower's measured
+        # joints (the leader does not subscribe to follower feedback).
+        if arm_key not in self._seeded_arms:
+            for guardrail in chain:
+                reset = getattr(guardrail, "reset", None)
+                if callable(reset):
+                    reset(out)
+            self._seeded_arms.add(arm_key)
         for guardrail in chain:
             out, event = guardrail.apply(out)
             if event is not None:
                 self._record_clamp(event)
+        self._last_safe_cmd[arm_key] = out.copy()
         return out.astype(np.float32)
+
+    def _log_nonfinite(self, arm_key: str) -> None:
+        """Log a non-finite command at most ~1 Hz so telemetry can't stall the loop."""
+        now = time.monotonic()
+        if now - self._last_nonfinite_log > 1.0:
+            self._last_nonfinite_log = now
+            logger.error(
+                "[%s] non-finite command for arm '%s' — holding last safe command",
+                self.name, arm_key,
+            )
 
     def _record_clamp(self, event) -> None:
         """Count clamp events; log at most ~1 Hz so telemetry can't stall the loop."""

@@ -311,9 +311,23 @@ class DynamixelGelloLeaderAgent(Agent):
         self._ticks_to_rad = (2.0 * np.pi) / self.ticks_per_rev
         self._last_stale_log = 0.0
         self._last_pos = np.zeros(NUM_ARM_JOINTS + (1 if self.include_gripper else 0), dtype=np.float32)
-        # Per-step delta limiter is seeded lazily on the first good read so the first
-        # command establishes the reference instead of ramping up from the zero seed.
-        self._delta_seeded = False
+        # Per-step delta limiter: reuse the shared SpeedLimitGuardrail so the per-step
+        # clamp math lives in one place (runtime.safety.guardrails), rather than a second
+        # hand-rolled copy. It seeds its reference lazily on the first command (returned
+        # un-clamped) and only touches the arm joints — the gripper element passes through.
+        if self.max_delta_rad > 0 and np.isfinite(self.max_delta_rad):
+            from robots_realtime.runtime.safety.config import SpeedLimitConfig
+            from robots_realtime.runtime.safety.guardrails import SpeedLimitGuardrail
+
+            self._speed_limit = SpeedLimitGuardrail(
+                SpeedLimitConfig(
+                    max_step_rad=self.max_delta_rad,
+                    position_indices=tuple(range(NUM_ARM_JOINTS)),
+                ),
+                arm=self.robot_name,
+            )
+        else:
+            self._speed_limit = None
 
         self._reader = reader or _DynamixelPositionReader(
             port=port,
@@ -375,22 +389,17 @@ class DynamixelGelloLeaderAgent(Agent):
     def _limit_delta(self, pos: np.ndarray) -> np.ndarray:
         """Rate-limit the per-step change of the arm joints to ``max_delta_rad``.
 
-        The reference is the last *emitted* command, so a spurious large jump (a
-        corrupted read, or a ±pi wrap glitch in ``_map_arm_ticks``) ramps toward the
-        target over several steps instead of snapping the follower straight there. The
-        gripper element (normalized [0, 1], not a radian) is left untouched. Disabled
-        when ``max_delta_rad <= 0``.
+        Delegates to the shared :class:`SpeedLimitGuardrail`, whose reference is the last
+        *emitted* command, so a spurious large jump (a corrupted read, or a ±pi wrap glitch
+        in ``_map_arm_ticks``) ramps toward the target over several steps instead of
+        snapping the follower straight there. The first command seeds the reference and is
+        returned un-clamped; the gripper element (normalized [0, 1], not a radian) is left
+        untouched. Disabled when ``max_delta_rad <= 0``.
         """
-        if not (self.max_delta_rad > 0 and np.isfinite(self.max_delta_rad)):
+        if self._speed_limit is None:
             return pos
-        if not self._delta_seeded or self._last_pos.shape != pos.shape:
-            # First command (or a command-width change) seeds the reference un-clamped.
-            return pos
-        limited = pos.copy()
-        ref = self._last_pos[:NUM_ARM_JOINTS]
-        delta = np.clip(pos[:NUM_ARM_JOINTS] - ref, -self.max_delta_rad, self.max_delta_rad)
-        limited[:NUM_ARM_JOINTS] = ref + delta
-        return limited
+        limited, _ = self._speed_limit.apply(pos)
+        return limited.astype(np.float32)
 
     def act(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -399,7 +408,6 @@ class DynamixelGelloLeaderAgent(Agent):
             if np.all(np.isfinite(pos)):
                 pos = self._limit_delta(pos)
                 self._last_pos = pos
-                self._delta_seeded = True
             else:
                 logger.warning("DynamixelGelloLeaderAgent[%s]: non-finite action from reader", self.port)
                 pos = self._last_pos

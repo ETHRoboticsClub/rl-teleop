@@ -329,8 +329,12 @@ class Node(ABC):
 _CTRL_READY = b"READY"
 _CTRL_STOP  = b"STOP"
 _CTRL_OK    = b"OK"
+_CTRL_GO    = b"GO"
 # Bring-up handshake: the START reply reports whether setup() (hardware open)
 # succeeded, so the Session can fail loudly at startup instead of running a dead node.
+# Two-phase startup: START only brings hardware up; the node then waits for GO before
+# it begins actuating, so the Session can bring every critical node up and abort on a
+# failure before any node has started commanding motors.
 _CTRL_SETUP_OK       = b"SETUP_OK"
 _CTRL_SETUP_ERR_PREF = b"SETUP_ERROR:"
 
@@ -354,7 +358,8 @@ def _host_worker(
 
     Control loop runs in a background thread while node.run() executes in the
     main thread.  The control loop handles:
-        START               — signal main thread to start node.run()
+        START               — bring the node's hardware up (no actuation yet)
+        GO                  — release the brought-up node to begin its run loop
         STOP                — call node.stop(), break out of control loop
         START_RECORDING:<d> — call node.start_recording(d)
         STOP_RECORDING      — call node.stop_recording()
@@ -384,8 +389,10 @@ def _host_worker(
     # Signal that the process is alive and the control socket is bound.
     ready_event.set()
 
-    # Event to signal the main thread that it should bring the node up + run.
+    # Event to signal the main thread that it should bring the node up.
     start_event = threading.Event()
+    # Event to release the brought-up node into its run loop (set by GO command).
+    go_event = threading.Event()
     # Event to signal that we should stop (set by STOP command)
     stop_event = threading.Event()
     # Bring-up handshake state: the main thread runs node.bringup() (opening hardware)
@@ -411,13 +418,18 @@ def _host_worker(
                 else:
                     detail = str(bringup_result["detail"]).encode("utf-8", "replace")[:1000]
                     ctrl.send(_CTRL_SETUP_ERR_PREF + detail)
+            elif msg == _CTRL_GO:
+                # Phase two: release the (already brought-up) node into its run loop.
+                go_event.set()
+                ctrl.send(_CTRL_OK)
             elif msg == _CTRL_STOP:
                 ctrl.send(_CTRL_OK)
                 node.stop()
                 stop_event.set()
-                # Unblock the main thread if STOP arrived before/instead of START.
+                # Unblock the main thread if STOP arrived before/instead of START or GO.
                 start_event.set()
                 bringup_done.set()
+                go_event.set()
                 break
             elif msg.startswith(b"START_RECORDING:"):
                 save_dir = msg[len(b"START_RECORDING:"):].decode()
@@ -491,7 +503,12 @@ def _host_worker(
         ctx.destroy(linger=0)
         return
 
-    # Bring-up succeeded — run the loop, guaranteeing cleanup on exit.
+    # Bring-up succeeded, but do not actuate yet: wait for the Session's GO. The Session
+    # only sends GO once every critical node has come up, so a bring-up failure aborts
+    # startup before any node has begun commanding motors.
+    go_event.wait()
+
+    # Run the loop, guaranteeing cleanup on exit.
     try:
         if not stop_event.is_set():
             node.run_loop()
@@ -513,7 +530,8 @@ class ProcessHost:
     Usage:
         host = ProcessHost(my_node)
         host.start()           # spawns subprocess, waits for ready
-        host.send_start()      # tells the node to begin its loop
+        host.send_start()      # brings the node's hardware up (no actuation yet)
+        host.send_go()         # releases the node into its run loop
         ...
         host.start_recording(save_dir)  # delegate recording to node
         host.stop_recording()           # stop recording in node
@@ -596,6 +614,21 @@ class ProcessHost:
             return SetupResult(node=self._node.name, ok=False, detail=detail)
         # Back-compat: an older worker replies b"OK".
         return SetupResult(node=self._node.name, ok=True)
+
+    def send_go(self, timeout: float = 5.0) -> None:
+        """Release a successfully-brought-up node into its run loop (startup phase two).
+
+        Sent only after every critical node has come up, so no node actuates while the
+        session might still abort. GO is a local event set, so the reply is immediate.
+        """
+        assert self._ctrl is not None
+        self._ctrl.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
+        try:
+            self._ctrl.send(_CTRL_GO)
+            self._ctrl.recv()
+        finally:
+            if self._ctrl is not None:
+                self._ctrl.setsockopt(zmq.RCVTIMEO, -1)
 
     def start_recording(self, save_dir: str) -> None:
         """Tell the node subprocess to start recording into save_dir."""
