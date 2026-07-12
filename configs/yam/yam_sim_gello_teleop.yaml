@@ -15,6 +15,25 @@ nodes:
       joint_signs: [-1, -1, -1, -1, -1, -1]
     arm_key: left
     loop_mode: flat_out
+    # Command-space safety guardrails (applied before the command is published).
+    # sim_teleop values are explicit + generous QA numbers; a real rig sets
+    # is_real_hardware: true and fails closed until site-specific limits are filled.
+    safety:
+      command_source: sim_teleop
+      arms:
+        left:  # matches arm_key
+          bounding_box:
+            min: [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
+            max: [3.14, 3.14, 3.14, 3.14, 3.14, 3.14]
+          speed_limit:
+            max_step_rad: 0.15          # per-step joint-delta cap (teleop speed limit)
+          cartesian_workspace:
+            min_xyz: [-0.5, -1.0, 0.2]  # model-frame metres (not joint space)
+            max_xyz: [1.0, 1.0, 1.5]
+            reentry_max_step_rad: 0.05
+            fk_xml_path: robots_realtime/sim/models/yam_bimanual_scene.xml
+            fk_joint_names: [left_joint1, left_joint2, left_joint3, left_joint4, left_joint5, left_joint6]
+            fk_site_name: left_tcp_site
 
   - type: AgentNode
     name: gello_right
@@ -26,6 +45,22 @@ nodes:
       joint_signs: [-1, -1, -1, -1, -1, -1]
     arm_key: right
     loop_mode: flat_out
+    safety:
+      command_source: sim_teleop
+      arms:
+        right:  # matches arm_key
+          bounding_box:
+            min: [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
+            max: [3.14, 3.14, 3.14, 3.14, 3.14, 3.14]
+          speed_limit:
+            max_step_rad: 0.15
+          cartesian_workspace:
+            min_xyz: [-0.5, -1.0, 0.2]
+            max_xyz: [1.0, 1.0, 1.5]
+            reentry_max_step_rad: 0.05
+            fk_xml_path: robots_realtime/sim/models/yam_bimanual_scene.xml
+            fk_joint_names: [right_joint1, right_joint2, right_joint3, right_joint4, right_joint5, right_joint6]
+            fk_site_name: right_tcp_site
 
   - type: XdofSimNode
     name: yam
