@@ -164,6 +164,10 @@ def _load_from_yaml(
     for node_params in nodes_cfg:
         node_params = dict(node_params)  # copy to avoid mutation
         type_name: str = node_params.pop("type")
+        # critical: false marks an optional node whose bring-up failure degrades (loud
+        # banner) instead of aborting the session. Set on the instance post-construction
+        # so every node type honours it without needing the kwarg in its __init__.
+        critical: bool = bool(node_params.pop("critical", True))
         node_cls = _resolve_node_cls(type_name)
 
         # Build constructor kwargs via classmethod
@@ -184,6 +188,7 @@ def _load_from_yaml(
                 f"Failed to instantiate {type_name} with kwargs {kwargs}: {e}"
             ) from e
 
+        node._critical = critical
         nodes.append(node)
 
     from robots_realtime.runtime.session import Session

@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 
@@ -79,6 +80,7 @@ class Node(ABC):
         pinned_cpu: int | None = None,
         realtime_priority: int | None = None,
         require_realtime: bool = False,
+        critical: bool = True,
     ) -> None:
         if name is not None:
             self.name = name
@@ -91,6 +93,10 @@ class Node(ABC):
         self._pinned_cpu = pinned_cpu
         self._realtime_priority = realtime_priority
         self._require_realtime = require_realtime
+        # critical=True (default): if this node fails to bring up hardware, the whole
+        # session aborts loudly. critical=False: an optional node whose failure is
+        # logged and surfaced but does not tear down the session.
+        self._critical = bool(critical)
 
         # Injected writer — stored for pickling; passed to Publisher in run()
         self._writer = writer  # Writer | None
@@ -160,6 +166,11 @@ class Node(ABC):
     def is_paused(self) -> bool:
         return self._paused
 
+    @property
+    def critical(self) -> bool:
+        """If True, a bring-up failure aborts the whole session (see __init__)."""
+        return getattr(self, "_critical", True)
+
     # ------------------------------------------------------------------
     # Transport helpers (available inside step())
     # ------------------------------------------------------------------
@@ -222,7 +233,13 @@ class Node(ABC):
     # Main loop (called by ProcessHost worker)
     # ------------------------------------------------------------------
 
-    def run(self) -> None:
+    def bringup(self) -> None:
+        """Create transport and open hardware. Raises on any acquisition failure.
+
+        Split out of run() so ProcessHost can run it as an authoritative handshake:
+        the START reply reflects whether hardware actually came up, so a locked/busy
+        device aborts the session at startup instead of silently crashing the node.
+        """
         self._apply_scheduling()
         self._publisher = Publisher(
             node_name=self.name,
@@ -243,13 +260,20 @@ class Node(ABC):
         self._step_count = 0
         self._last_stats_t = time.perf_counter()
 
+    def run_loop(self) -> None:
+        """Run the node's step loop until stopped. Assumes bringup() has succeeded."""
+        if self.subscriber_driven:
+            self._run_subscriber_driven()
+        elif self.poll_freq is None:
+            self._run_flat_out()
+        else:
+            self._run_fixed_rate()
+
+    def run(self) -> None:
+        """Bring up, run the loop, then clean up. Kept for callers outside ProcessHost."""
+        self.bringup()
         try:
-            if self.subscriber_driven:
-                self._run_subscriber_driven()
-            elif self.poll_freq is None:
-                self._run_flat_out()
-            else:
-                self._run_fixed_rate()
+            self.run_loop()
         finally:
             self.cleanup()
             if self._publisher:
@@ -305,6 +329,19 @@ class Node(ABC):
 _CTRL_READY = b"READY"
 _CTRL_STOP  = b"STOP"
 _CTRL_OK    = b"OK"
+# Bring-up handshake: the START reply reports whether setup() (hardware open)
+# succeeded, so the Session can fail loudly at startup instead of running a dead node.
+_CTRL_SETUP_OK       = b"SETUP_OK"
+_CTRL_SETUP_ERR_PREF = b"SETUP_ERROR:"
+
+
+@dataclass
+class SetupResult:
+    """Outcome of a node's bring-up, returned by ProcessHost.send_start()."""
+
+    node: str
+    ok: bool
+    detail: str = ""
 
 
 def _host_worker(
@@ -347,10 +384,15 @@ def _host_worker(
     # Signal that the process is alive and the control socket is bound.
     ready_event.set()
 
-    # Event to signal the main thread that it should start node.run()
+    # Event to signal the main thread that it should bring the node up + run.
     start_event = threading.Event()
     # Event to signal that we should stop (set by STOP command)
     stop_event = threading.Event()
+    # Bring-up handshake state: the main thread runs node.bringup() (opening hardware)
+    # and records the outcome here; the control thread waits for it before replying to
+    # START, so ProcessHost.send_start() learns whether hardware actually came up.
+    bringup_done = threading.Event()
+    bringup_result: dict = {"ok": False, "detail": ""}
 
     def _watch_ctrl():
         """Persistent control loop — handles multiple commands."""
@@ -361,12 +403,21 @@ def _host_worker(
                 break
 
             if msg == b"START":
-                ctrl.send(_CTRL_OK)
+                # Kick off bring-up on the main thread, then reply with its result.
                 start_event.set()
+                bringup_done.wait()
+                if bringup_result["ok"]:
+                    ctrl.send(_CTRL_SETUP_OK)
+                else:
+                    detail = str(bringup_result["detail"]).encode("utf-8", "replace")[:1000]
+                    ctrl.send(_CTRL_SETUP_ERR_PREF + detail)
             elif msg == _CTRL_STOP:
                 ctrl.send(_CTRL_OK)
                 node.stop()
                 stop_event.set()
+                # Unblock the main thread if STOP arrived before/instead of START.
+                start_event.set()
+                bringup_done.set()
                 break
             elif msg.startswith(b"START_RECORDING:"):
                 save_dir = msg[len(b"START_RECORDING:"):].decode()
@@ -400,11 +451,56 @@ def _host_worker(
     ctrl_thread = threading.Thread(target=_watch_ctrl, daemon=True, name="CtrlWatcher")
     ctrl_thread.start()
 
-    # Block main thread until START arrives
+    # Block main thread until START (or STOP) arrives.
     start_event.wait()
 
-    if not stop_event.is_set():
-        node.run()
+    if stop_event.is_set():
+        # STOP arrived before we started — nothing was brought up.
+        ctrl_thread.join(timeout=2.0)
+        ctx.destroy(linger=0)
+        return
+
+    # Bring the node up (opens hardware). Report success/failure back to the control
+    # thread so the START reply is authoritative. A failure here means a locked/busy
+    # device, a missing arm, etc. — the Session turns that into a loud abort.
+    try:
+        node.bringup()
+        bringup_result["ok"] = True
+    except BaseException as exc:  # must capture *any* bring-up failure to report it
+        import traceback
+
+        bringup_result["ok"] = False
+        bringup_result["detail"] = f"{type(exc).__name__}: {exc}"
+        try:
+            sys.stderr.write(
+                f"Node '{node.name}' bring-up FAILED:\n{traceback.format_exc()}"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+    finally:
+        bringup_done.set()
+
+    if not bringup_result["ok"]:
+        # Release anything partially opened, then exit — the Session will tear us down.
+        try:
+            node.cleanup()
+        except Exception:
+            pass
+        ctrl_thread.join(timeout=2.0)
+        ctx.destroy(linger=0)
+        return
+
+    # Bring-up succeeded — run the loop, guaranteeing cleanup on exit.
+    try:
+        if not stop_event.is_set():
+            node.run_loop()
+    finally:
+        node.cleanup()
+        if node._publisher:
+            node._publisher.close()
+        if node._subscriber:
+            node._subscriber.close()
 
     # Wait for the control thread to finish
     ctrl_thread.join(timeout=2.0)
@@ -431,6 +527,27 @@ class ProcessHost:
         self._proc: mp.Process | None = None
         self._ctx = zmq.Context.instance()
         self._ctrl: zmq.Socket | None = None
+        # Set when send_start() saw a bring-up failure/timeout — the REQ socket is then
+        # out of sync, so teardown must go straight to killing the process.
+        self._setup_failed = False
+
+    @property
+    def critical(self) -> bool:
+        """Whether a bring-up failure of this host should abort the whole session."""
+        return getattr(self._node, "critical", True)
+
+    def kill(self) -> None:
+        """Force-tear-down a host whose bring-up failed (no clean control handshake)."""
+        if self._ctrl is not None:
+            self._ctrl.close(linger=0)
+            self._ctrl = None
+        if self._proc is not None:
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=2.0)
+            if self._proc.is_alive():
+                self._proc.kill()
+            self._proc = None
 
     def start(self, timeout: float = 10.0, log_path: Path | None = None) -> None:
         """Spawn subprocess and wait until its control socket is bound."""
@@ -447,11 +564,38 @@ class ProcessHost:
         self._ctrl = self._ctx.socket(zmq.REQ)
         self._ctrl.connect(self._ctrl_addr)
 
-    def send_start(self) -> None:
-        """Tell the node subprocess to begin its loop."""
+    def send_start(self, timeout: float = 30.0) -> SetupResult:
+        """Tell the node to bring up hardware; return whether it succeeded.
+
+        Blocks until the node reports its bring-up result (or ``timeout`` seconds
+        elapse — a hung setup() is treated as a loud failure, not an indefinite hang).
+        On failure the control socket is left unusable, so the caller must tear the
+        host down with ``kill()`` rather than ``stop()``.
+        """
         assert self._ctrl is not None
         self._ctrl.send(b"START")
-        self._ctrl.recv()
+        self._ctrl.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
+        try:
+            reply = self._ctrl.recv()
+        except zmq.ZMQError:
+            self._setup_failed = True
+            return SetupResult(
+                node=self._node.name,
+                ok=False,
+                detail=f"bring-up timed out after {timeout:.0f}s (setup() did not return)",
+            )
+        finally:
+            if self._ctrl is not None:
+                self._ctrl.setsockopt(zmq.RCVTIMEO, -1)
+
+        if reply == _CTRL_SETUP_OK:
+            return SetupResult(node=self._node.name, ok=True)
+        if reply.startswith(_CTRL_SETUP_ERR_PREF):
+            detail = reply[len(_CTRL_SETUP_ERR_PREF):].decode("utf-8", "replace")
+            self._setup_failed = True
+            return SetupResult(node=self._node.name, ok=False, detail=detail)
+        # Back-compat: an older worker replies b"OK".
+        return SetupResult(node=self._node.name, ok=True)
 
     def start_recording(self, save_dir: str) -> None:
         """Tell the node subprocess to start recording into save_dir."""
@@ -479,6 +623,10 @@ class ProcessHost:
         self._ctrl.recv()
 
     def stop(self, timeout: float = 8.0) -> None:
+        if self._setup_failed:
+            # Control socket is out of sync after a failed bring-up — kill directly.
+            self.kill()
+            return
         if self._ctrl is not None:
             self._ctrl.setsockopt(zmq.RCVTIMEO, 2000)  # 2 s receive timeout
             self._ctrl.send(_CTRL_STOP)

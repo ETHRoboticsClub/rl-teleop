@@ -200,6 +200,29 @@ def _log_text(tagged_lines: list[tuple[str, str, bool]], n_lines: int) -> Text:
     return out
 
 
+def _alert_banner(session) -> "Text | None":
+    """A loud red banner when a node is dead or a critical failure occurred.
+
+    Makes device failures impossible to miss during a live demo instead of leaving a
+    quietly-0 Hz row that reads as healthy at a glance.
+    """
+    dead = [st.name for st in session.node_statuses() if not st.alive]
+    fatal = getattr(session, "fatal_reason", None)
+    if not dead and not fatal:
+        return None
+    banner = Text()
+    if fatal:
+        banner.append(f"  ⛔ SESSION FAILURE: {fatal}\n", style="bold white on red")
+    if dead:
+        reasons = []
+        for st in session.node_statuses():
+            if not st.alive:
+                why = getattr(st, "fatal_reason", "") or "not running"
+                reasons.append(f"{st.name} ({why})")
+        banner.append("  ⚠ DEAD NODES: " + " | ".join(reasons), style="bold red")
+    return banner
+
+
 def _render(session, n_log_lines: int = 8) -> Panel:
     log_dir = getattr(session, "log_dir", None)
     tagged_lines, err_nodes = _scan_log_tail(log_dir, n_log_lines)
@@ -211,6 +234,10 @@ def _render(session, n_log_lines: int = 8) -> Panel:
     from rich.rule import Rule
 
     content = Table.grid(expand=True)
+    alert = _alert_banner(session)
+    if alert is not None:
+        content.add_row(alert)
+        content.add_row(Rule(style="red"))
     content.add_row(node_table)
 
     instructions_text = _instructions_text(session)
@@ -229,7 +256,8 @@ def _render(session, n_log_lines: int = 8) -> Panel:
         content.add_row(Text(f"  logs: {log_dir}", style="dim"))
         content.add_row(_log_text(tagged_lines, n_lines=n_log_lines))
 
-    return Panel(content, title="[bold]robots_realtime[/bold]", border_style="dim")
+    border = "red" if alert is not None else "dim"
+    return Panel(content, title="[bold]robots_realtime[/bold]", border_style=border)
 
 
 # ── Keyboard reader ───────────────────────────────────────────────────────────

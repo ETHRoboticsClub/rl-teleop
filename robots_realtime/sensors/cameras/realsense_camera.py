@@ -170,7 +170,23 @@ class RealSenseCamera(CameraDriver):
                     raise
 
         if last_exc is not None:
-            raise last_exc
+            # Retries exhausted. If this looks like the device is busy/locked, re-raise as
+            # a DeviceBusyError so the failure names the camera and reason instead of a
+            # bare pyrealsense2 RuntimeError.
+            from robots_realtime.runtime.preflight import (
+                DeviceBusyError,
+                DeviceReason,
+                classify_os_error,
+            )
+
+            reason = classify_os_error(last_exc)
+            if reason is DeviceReason.UNKNOWN and self._is_retryable_open_error(last_exc):
+                reason = DeviceReason.BUSY
+            raise DeviceBusyError(
+                self.device_id or "auto (first RealSense)",
+                reason,
+                detail=str(last_exc),
+            ) from last_exc
 
     @staticmethod
     def _is_retryable_open_error(exc: Exception) -> bool:

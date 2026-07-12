@@ -14,6 +14,7 @@ class FakeSession:
     def __init__(self) -> None:
         self.events: list[str] = []
         self.save_root = "recordings"
+        self.fatal_reason = None
 
     def start(self) -> None:
         self.events.append("start")

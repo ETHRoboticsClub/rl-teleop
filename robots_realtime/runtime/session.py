@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import signal
 import subprocess
 import threading
@@ -35,6 +36,24 @@ from robots_realtime.runtime.transport.serialization import unpack
 
 
 _HZ_WINDOW = 30
+
+logger = logging.getLogger(__name__)
+
+
+class SessionStartupError(RuntimeError):
+    """Raised when one or more critical nodes fail to bring up their hardware.
+
+    Carries the per-node failure details so the CLI can print exactly which device
+    failed and why (busy / locked / missing) instead of leaving a green TUI over a
+    dead node.
+    """
+
+    def __init__(self, failures: list[tuple[str, str]]) -> None:
+        self.failures = failures  # list of (node_name, detail)
+        lines = "\n".join(f"  - {name}: {detail}" for name, detail in failures)
+        super().__init__(
+            "Session aborted — critical node(s) failed to start:\n" + lines
+        )
 
 
 def _run_git(args: list[str], cwd: Path, timeout: float = 2.0) -> str | None:
@@ -125,6 +144,9 @@ class NodeStatus:
     alive: bool = True
     pub_hz: float = 0.0
     step_hz: float = 0.0
+    # Set when the node died / failed to start; surfaced by the TUI and CLI so the
+    # operator sees *why* instead of a silent 0 Hz.
+    fatal_reason: str = ""
     _timestamps: dict[str, deque] = field(default_factory=dict, repr=False)
 
     @property
@@ -235,6 +257,9 @@ class Session:
         self._episode_dir: Path | None = None
         self._episode_start_time: float | None = None
         self._recording_lock = threading.Lock()
+        self._recording_error: str = ""
+        # Set when a critical node dies mid-session; the CLI exits non-zero on it.
+        self._fatal_reason: str | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -279,14 +304,33 @@ class Session:
         # self._paused=True and skip command_joint_pos.
         if self._start_paused:
             self._is_paused = True
-            for host in self._hosts:
-                try:
-                    host.pause()
-                except Exception:
-                    pass
+            self._broadcast_control("pause")
 
+        # Authoritative bring-up: each host now reports whether its hardware actually
+        # opened. A critical node's failure aborts the whole session loudly; an optional
+        # node's failure is logged and surfaced (alive=False) but the session continues.
+        critical_failures: list[tuple[str, str]] = []
         for host in self._hosts:
-            host.send_start()
+            result = host.send_start()
+            if result.ok:
+                continue
+            if host.critical:
+                logger.error(
+                    "Critical node '%s' failed to start: %s", result.node, result.detail
+                )
+                critical_failures.append((result.node, result.detail))
+            else:
+                logger.error(
+                    "Optional node '%s' failed to start (continuing without it): %s",
+                    result.node,
+                    result.detail,
+                )
+                if result.node in self._status:
+                    self._status[result.node].alive = False
+                    self._status[result.node].fatal_reason = result.detail
+
+        if critical_failures:
+            self._abort_startup(critical_failures)
 
         self._setup_signal_handlers()
         self._monitor_thread = threading.Thread(
@@ -301,6 +345,20 @@ class Session:
                 daemon=True,
             )
             t.start()
+
+    def _abort_startup(self, failures: list[tuple[str, str]]) -> None:
+        """Tear everything down and raise loudly after a critical bring-up failure."""
+        self._stop_event.set()
+        for host in self._hosts:
+            try:
+                host.stop()
+            except Exception as exc:  # teardown is best-effort; the raise below is the point
+                logger.warning("Error stopping host during startup abort: %s", exc)
+        try:
+            self._bus.stop()
+        except Exception as exc:
+            logger.warning("Error stopping bus during startup abort: %s", exc)
+        raise SessionStartupError(failures)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -329,6 +387,11 @@ class Session:
     @property
     def is_recording(self) -> bool:
         return self._is_recording
+
+    @property
+    def fatal_reason(self) -> str | None:
+        """Non-None when a critical node died mid-session; the CLI exits non-zero on it."""
+        return self._fatal_reason
 
     @property
     def episode_start_time(self) -> float | None:
@@ -379,12 +442,20 @@ class Session:
             self._episode_start_time = time.time()
             self._is_recording = True
 
-        # Delegate recording to all hosts
+        # Delegate recording to all hosts. A failure here is loud: if a node cannot
+        # start recording (crashed, device gone), the operator must know the episode is
+        # not fully captured rather than believing it is.
+        failed = []
         for host in self._hosts:
             try:
                 host.start_recording(save_dir)
-            except Exception:
-                pass
+            except Exception as exc:
+                failed.append(host.node_name)
+                logger.error(
+                    "Node '%s' failed to start recording into %s: %s",
+                    host.node_name, save_dir, exc,
+                )
+        self._recording_error = "; ".join(failed) if failed else ""
 
         if self._episode_timeout is not None:
             self._episode_timeout_timer = threading.Timer(
@@ -442,8 +513,11 @@ class Session:
     def _safe_stop_recording(host) -> None:
         try:
             host.stop_recording()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error(
+                "Node '%s' failed to stop recording (data may be incomplete): %s",
+                getattr(host, "node_name", "?"), exc,
+            )
 
     def toggle_recording(self) -> None:
         if self._is_recording:
@@ -460,32 +534,36 @@ class Session:
     def is_paused(self) -> bool:
         return getattr(self, "_is_paused", False)
 
+    def _broadcast_control(self, action: str) -> None:
+        """Send a control call (pause/resume) to every host, logging any failure.
+
+        Failures used to be silently swallowed — a host that ignored a pause left the
+        arms live while the operator believed they were held. Now it is logged loudly.
+        """
+        for host in self._hosts:
+            try:
+                getattr(host, action)()
+            except Exception as exc:
+                logger.warning("Host '%s' %s() failed: %s", host.node_name, action, exc)
+
     def pause(self) -> None:
         if getattr(self, "_is_paused", False):
             return
         self._is_paused = True
-        for host in self._hosts:
-            try:
-                host.pause()
-            except Exception:
-                pass
+        self._broadcast_control("pause")
 
     def resume(self) -> None:
         if not getattr(self, "_is_paused", False):
             return
         self._is_paused = False
-        for host in self._hosts:
-            try:
-                host.resume()
-            except Exception:
-                pass
+        self._broadcast_control("resume")
         # Optional: prime recording when the operator unpauses. Lets a policy
         # eval config capture every rollout from the instant of handoff.
         if self._record_on_unpause and not self._is_recording:
             try:
                 self.start_episode()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("Failed to auto-start episode on unpause: %s", exc)
 
     def toggle_pause(self) -> None:
         if self.is_paused:
@@ -561,8 +639,17 @@ class Session:
         sock.setsockopt(zmq.SUBSCRIBE, b"")
 
         node_names = set(self._status)
+        hosts_by_name = {h.node_name: h for h in self._hosts}
+        last_liveness_check = 0.0
 
         while not self._stop_event.is_set():
+            # Poll process liveness (~4 Hz) so a node that dies mid-session (device
+            # yanked, driver crash) is surfaced loudly instead of silently going 0 Hz.
+            now_mono = time.monotonic()
+            if now_mono - last_liveness_check > 0.25:
+                last_liveness_check = now_mono
+                self._check_node_liveness(hosts_by_name)
+
             while sock.poll(0):
                 try:
                     parts = sock.recv_multipart(zmq.NOBLOCK)
@@ -612,6 +699,31 @@ class Session:
             time.sleep(0.005)
 
         sock.close(linger=0)
+
+    def _check_node_liveness(self, hosts_by_name: dict) -> None:
+        """Flag nodes whose subprocess has died; abort the session if one was critical.
+
+        Only detects live→dead transitions (each node is flagged once). A dead critical
+        node sets ``_fatal_reason`` and the stop event so the operator's session tears
+        down loudly with a non-zero exit instead of running on with a missing arm/camera.
+        """
+        for name, host in hosts_by_name.items():
+            status = self._status.get(name)
+            if status is None or not status.alive:
+                continue  # already flagged, or unknown
+            proc = getattr(host, "_proc", None)
+            if proc is not None and not proc.is_alive():
+                status.alive = False
+                if not status.fatal_reason:
+                    status.fatal_reason = f"node process exited (code {proc.exitcode})"
+                logger.error(
+                    "Node '%s' died mid-session: %s", name, status.fatal_reason
+                )
+                if getattr(host, "critical", True):
+                    self._fatal_reason = (
+                        f"critical node '{name}' died: {status.fatal_reason}"
+                    )
+                    self._stop_event.set()
 
     def _auto_record_timer(self, duration: float) -> None:
         # Brief warmup so ZMQ sockets connect and nodes start publishing

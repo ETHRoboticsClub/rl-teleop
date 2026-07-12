@@ -118,7 +118,14 @@ def main() -> None:
         from pathlib import Path
         session._save_root = Path(args.save_root)
 
-    session.start()
+    from robots_realtime.runtime.session import SessionStartupError
+
+    try:
+        session.start()
+    except SessionStartupError as e:
+        # A critical device could not be acquired (busy/locked/missing). Fail loudly.
+        print(f"\nSESSION STARTUP FAILED\n{e}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         if args.no_tui:
@@ -129,6 +136,11 @@ def main() -> None:
             run_tui(session)
     finally:
         session.stop()
+
+    if session.fatal_reason:
+        # A critical node died mid-session — surface it and exit non-zero.
+        print(f"\nSESSION ABORTED: {session.fatal_reason}", file=sys.stderr)
+        os._exit(1)
 
     os._exit(0)
 

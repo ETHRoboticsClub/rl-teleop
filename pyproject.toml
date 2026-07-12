@@ -141,6 +141,16 @@ ignore = ["dependencies/**", "robots_realtime/scripts/**"]
 reportMissingImports = "none"
 reportAttributeAccessIssue = "none"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "sim: tests that run against the MuJoCo sim (no hardware, but needs mujoco)",
+    "real: tests that require real hardware (CAN bus + motors + cameras) — excluded in CI",
+    "e2e: end-to-end tests that drive a full session / node graph",
+    "safety: safety-guardrail tests (workspace + speed limits) in sim",
+    "slow: slower tests (bring-up timeouts, long loops)",
+]
+
 [tool.coverage.report]
 exclude_also = [
     "raise NotImplementedError",

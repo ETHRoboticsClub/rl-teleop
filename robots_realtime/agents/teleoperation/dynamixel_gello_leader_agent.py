@@ -61,7 +61,25 @@ class _DynamixelPositionReader:
         self._port_handler = dynamixel_sdk.PortHandler(port)
         self._packet_handler = dynamixel_sdk.PacketHandler(float(protocol_version))
         if not self._port_handler.openPort():
-            raise RuntimeError(f"Failed to open Dynamixel port {port}")
+            # This is the failure that killed a live demo: another SSH session held the
+            # leader's serial port. Fail loudly, naming the port and the holder, instead
+            # of a generic "Failed to open".
+            from robots_realtime.runtime.preflight import (
+                DeviceBusyError,
+                DeviceReason,
+                describe_holders,
+            )
+
+            if not os.path.exists(port):
+                raise DeviceBusyError(port, DeviceReason.MISSING)
+            holders = describe_holders(port)
+            reason = DeviceReason.BUSY if holders else DeviceReason.UNKNOWN
+            raise DeviceBusyError(
+                port,
+                reason,
+                holders,
+                detail="failed to open Dynamixel serial port (busy or permission?)",
+            )
         if not self._port_handler.setBaudRate(self._baudrate):
             self._port_handler.closePort()
             raise RuntimeError(f"Failed to set Dynamixel baudrate {self._baudrate} on {port}")

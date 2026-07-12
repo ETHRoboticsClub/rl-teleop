@@ -34,6 +34,9 @@ class OpencvCamera(CameraDriver):
     auto_exposure_speed: float = 0.25
     auto_exposure_period_s: float = 0.5
     name: Optional[str] = None
+    # Bound the read-retry window so a device that stops delivering frames (unplugged,
+    # grabbed by another process) surfaces loudly instead of hanging the node forever.
+    read_retry_timeout_s: float = 2.0
 
     def __repr__(self) -> str:
         return f"OpencvCamera(device_path={self.device_path!r}, name={self.name!r}, resolution={self.resolution}, fps={self.fps})"
@@ -43,6 +46,27 @@ class OpencvCamera(CameraDriver):
         self._exposure: Optional[int] = None
         self._apply_v4l2_controls()
         self.cap = cv2.VideoCapture(self.device_path)
+        if not self.cap.isOpened():
+            # Fail loudly instead of returning a dead capture object that would silently
+            # yield empty frames forever (the old behaviour). Name the device and, if it
+            # is held by another process, who holds it.
+            from robots_realtime.runtime.preflight import (
+                DeviceBusyError,
+                DeviceReason,
+                describe_holders,
+            )
+
+            resolved = self._resolved_device_path()
+            if not Path(resolved).exists():
+                raise DeviceBusyError(self.device_path, DeviceReason.MISSING)
+            holders = describe_holders(self.device_path)
+            reason = DeviceReason.BUSY if holders else DeviceReason.UNKNOWN
+            raise DeviceBusyError(
+                self.device_path,
+                reason,
+                holders,
+                detail="cv2.VideoCapture could not open the device",
+            )
         if self.fourcc:
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.fourcc))
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
@@ -137,7 +161,13 @@ class OpencvCamera(CameraDriver):
         try:
             ret, frame = self.cap.read()
             capture_time_ms = time.time() * 1000
+            deadline = time.monotonic() + self.read_retry_timeout_s
             while not ret:
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"{self}: no frame for {self.read_retry_timeout_s:.1f}s — "
+                        "camera stopped delivering (unplugged or held by another process?)"
+                    )
                 # If read failed, retry and update capture time
                 ret, frame = self.cap.read()
                 capture_time_ms = time.time() * 1000
