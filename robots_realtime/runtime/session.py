@@ -242,6 +242,14 @@ class Session:
         self._record_node_names: list[str] = record_node_names or all_node_names
 
         self._bus = MessageBus(pub_port=pub_port, sub_port=sub_port)
+        # Propagate the bus ports to the nodes so they publish/subscribe on the same
+        # ports as the bus. Without this a Session built with explicit ports would leave
+        # its nodes on the default ports and no messages would flow.
+        for host in self._hosts:
+            node = getattr(host, "_node", None)
+            if node is not None:
+                node._pub_port = self._pub_port
+                node._sub_port = self._sub_port
 
         self._status: dict[str, NodeStatus] = {
             name: NodeStatus(name=name) for name in all_node_names

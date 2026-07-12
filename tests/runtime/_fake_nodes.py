@@ -66,3 +66,50 @@ class HangNode(Node):
 
     def step(self) -> None:
         pass
+
+
+class ScriptedLeaderNode(Node):
+    """A stand-in leader: publishes a fixed target joint command at a fixed rate."""
+
+    poll_freq = 100.0
+
+    def __init__(self, name: str, target, critical: bool = True) -> None:
+        super().__init__(name=name, critical=critical)
+        self._target = list(target)
+
+    def setup(self) -> None:
+        pass
+
+    def step(self) -> None:
+        import numpy as np
+
+        self.publish("joint_pos", {"joint_pos": np.asarray(self._target, dtype=np.float32)})
+
+
+class SimFollowerNode(Node):
+    """A follower: applies commands from ``cmd_topic`` to a MujocoSimRobot and
+    republishes the realized joint state — the follower half of a teleop loop."""
+
+    subscriber_driven = True
+    poll_freq = 100.0
+    published_topics = ["joint_state"]
+
+    def __init__(self, name: str, cmd_topic: str, xml_path: str, critical: bool = True) -> None:
+        self.subscribed_topics = [cmd_topic]
+        super().__init__(name=name, critical=critical)
+        self._cmd_topic = cmd_topic
+        self._xml_path = xml_path
+        self._robot = None
+
+    def setup(self) -> None:
+        from robots_realtime.robots.mujoco_sim_robot import MujocoSimRobot
+
+        self._robot = MujocoSimRobot(xml_path=self._xml_path, render=False)
+
+    def step(self) -> None:
+        import numpy as np
+
+        cmd = self.get_latest(self._cmd_topic)
+        if cmd is not None:
+            self._robot.command_joint_pos(np.asarray(cmd["joint_pos"], dtype=np.float64))
+        self.publish("joint_state", self._robot.get_observations())
