@@ -114,10 +114,15 @@ class SpeedLimitConfig:
 
 @dataclass(frozen=True)
 class ArmSafety:
-    """All guardrail configs for one arm."""
+    """All guardrail configs for one arm.
+
+    ``cartesian`` is the raw ``cartesian_workspace`` dict (parsed + FK-built by AgentNode,
+    which owns the mujoco dependency) — kept unparsed here to avoid an import cycle.
+    """
 
     bounding_box: BoundingBoxConfig | None = None
     speed_limit: SpeedLimitConfig | None = None
+    cartesian: dict | None = None
 
 
 @dataclass
@@ -178,7 +183,10 @@ def build_safety_config(params: dict | None) -> SafetyConfig | None:
         if arm_cfg.get("speed_limit") is not None:
             default_idx = bbox.position_indices if bbox else tuple(range(6))
             speed = SpeedLimitConfig.from_dict(arm_cfg["speed_limit"], arm_key, default_idx)
-        arms[str(arm_key)] = ArmSafety(bounding_box=bbox, speed_limit=speed)
+        cartesian = arm_cfg.get("cartesian_workspace")
+        arms[str(arm_key)] = ArmSafety(
+            bounding_box=bbox, speed_limit=speed, cartesian=cartesian
+        )
 
     cfg = SafetyConfig(command_source=source, is_real_hardware=is_real, arms=arms)
 

@@ -14,6 +14,11 @@ Existing lower-level safety (motor/joint-limit clipping in the robot drivers) re
 authoritative after these filters.
 """
 
+from robots_realtime.runtime.safety.cartesian import (
+    CartesianConfigError,
+    CartesianWorkspaceConfig,
+    CartesianWorkspaceRejectGuardrail,
+)
 from robots_realtime.runtime.safety.config import (
     ArmSafety,
     BoundingBoxConfig,
@@ -33,6 +38,9 @@ __all__ = [
     "ArmSafety",
     "BoundingBoxConfig",
     "BoundingBoxGuardrail",
+    "CartesianConfigError",
+    "CartesianWorkspaceConfig",
+    "CartesianWorkspaceRejectGuardrail",
     "ClampEvent",
     "CommandSource",
     "SafetyConfig",

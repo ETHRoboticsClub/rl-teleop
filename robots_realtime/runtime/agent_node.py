@@ -150,15 +150,42 @@ class AgentNode(Node):
             return
         for arm_key, arm in cfg.arms.items():
             chain = []
-            # Order: speed cap first, bounding box last, so the final command is inside
-            # the box even after the speed limiter moved it. (Cartesian reject slots
-            # between these once added.)
+            # Order: speed cap first, Cartesian workspace reject next, bounding box last,
+            # so the final published command is inside every limit.
             if arm.speed_limit is not None:
                 chain.append(SpeedLimitGuardrail(arm.speed_limit, arm_key))
+            if arm.cartesian is not None:
+                chain.append(self._build_cartesian_guardrail(arm.cartesian, arm_key))
             if arm.bounding_box is not None:
                 chain.append(BoundingBoxGuardrail(arm.bounding_box, arm_key))
             if chain:
                 self._guardrails[arm_key] = chain
+
+    def _build_cartesian_guardrail(self, cartesian: dict, arm_key: str):
+        """Parse the cartesian_workspace dict and build its FK-backed guardrail.
+
+        Parsing happens here (not in safety.config) so the mujoco FK dependency stays out
+        of the config module and validation still runs in setup(), before actuation.
+        """
+        from robots_realtime.runtime.safety.cartesian import (
+            CartesianConfigError,
+            CartesianWorkspaceConfig,
+            CartesianWorkspaceRejectGuardrail,
+        )
+        from robots_realtime.runtime.safety.fk import make_mujoco_fk
+
+        ws = CartesianWorkspaceConfig.from_dict(cartesian, arm_key)
+        for key in ("fk_xml_path", "fk_joint_names", "fk_site_name"):
+            if key not in cartesian:
+                raise CartesianConfigError(
+                    f"[{arm_key}] cartesian_workspace: requires '{key}' to build FK"
+                )
+        fk = make_mujoco_fk(
+            cartesian["fk_xml_path"],
+            list(cartesian["fk_joint_names"]),
+            cartesian["fk_site_name"],
+        )
+        return CartesianWorkspaceRejectGuardrail(ws, fk, arm_key)
 
     def _build_agent(self):
         ref = self._agent_class
