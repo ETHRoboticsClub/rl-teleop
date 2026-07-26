@@ -33,10 +33,42 @@ from robots_realtime.labeling import constants as C
 from robots_realtime.labeling.live import LiveLabeler
 
 DEFAULT_KIT = [
-    {"bag_id": 1, "part": "UNN-10126-151", "name": "Flügelmutter M8", "comp": 5, "bbox": [0.30, 0.55, 0.10, 0.10]},
-    {"bag_id": 2, "part": "UNN-10015-007", "name": "Sechskantschraube", "comp": 3, "bbox": [0.55, 0.55, 0.10, 0.10]},
-    {"bag_id": 3, "part": "DNN-15122-009", "name": "Sechskant", "comp": 1, "bbox": [0.20, 0.30, 0.10, 0.10]},
+    {"bag_id": 1, "part": "UNN-10126-151", "name": "Flügelmutter M8", "comp": 1, "bbox": [0.30, 0.55, 0.10, 0.10]},
+    {"bag_id": 2, "part": "UNN-10015-007", "name": "Sechskantschraube", "comp": 6, "bbox": [0.55, 0.55, 0.10, 0.10]},
+    {"bag_id": 3, "part": "MDDY-11065-001", "name": "Kappe", "comp": 5, "bbox": [0.20, 0.30, 0.10, 0.10]},
 ]
+
+# Closed SKU catalog for the CURRENT kit + each SKU's fixed physical compartment.
+#   - SKU set  mirrors yams-sorting-robot/configs/sorting.yaml (parts_to_cell keys).
+#   - comp ids are the cockpit's calibrated 7-cell box (const ASSIGN in
+#     Buehler-Kitting-Cockpit.html) — NOT the uncalibrated [row,col] grid in grid.yaml.
+# This is the single place to edit when the kit changes. Wiring it into the detector's
+# known_source turns on catalog-snapping (kills UNN→DNN / -009→-000 misreads); using it
+# as comp_of routes every read to its real compartment instead of first-seen order.
+KIT_CATALOG = {
+    "UNN-16022-009": 7,   # Blindniet D4.0x12.5 Al
+    "UNN-10015-007": 6,   # Sechskantschraube M6x10
+    "MDDY-11065-001": 5,  # Kappe
+    "UNN-10015-231": 4,   # Sechskantflanschschraube M6
+    "UNN-10126-151": 1,   # Flügelmutter M8 nichtrostend
+}
+KNOWN_SKUS = list(KIT_CATALOG)
+KIT_NAMES = {
+    "UNN-16022-009": "Blindniet D4.0x12.5 Al",
+    "UNN-10015-007": "Sechskantschraube M6x10",
+    "MDDY-11065-001": "Kappe",
+    "UNN-10015-231": "Sechskantflanschschraube M6",
+    "UNN-10126-151": "Flügelmutter M8 nichtrostend",
+}
+
+
+def scanned_kit(dets):
+    """kit_from_detections with the current kit's fixed compartments + display names."""
+    from robots_realtime.labeling.detector import kit_from_detections
+    kit = kit_from_detections(dets, comp_of=KIT_CATALOG)
+    for p in kit:
+        p["name"] = KIT_NAMES.get(p.get("part"), "")
+    return kit
 
 
 def encode_frame_jpeg(frame, quality: int = 80) -> bytes | None:
@@ -102,31 +134,47 @@ class CameraBridge:
 def _state_with_detections(labeler: LiveLabeler, detector) -> dict:
     """labeler.state() augmented with live scan detections: each kit packet gets a
     pixel bbox on the scan frame so the cockpit can draw the 'pick this next' box on
-    the actual packet. When several packets share a part id (e.g. two UNN-16022-009),
-    the physical detections are assigned to the kit entries POSITIONALLY so each entry
-    boxes a distinct packet, not the same one twice. wh = scan size."""
-    from collections import defaultdict
+    the actual packet.
+
+    Assignment matches each kit entry to a DISTINCT physical detection, claimed so no
+    two entries share one box. Priority:
+      1. exact part id  (middle AND suffix) — the suffix is the discriminator that tells
+         UNN-10015-007 from UNN-10015-231; matching on it prevents same-middle packets
+         from getting their boxes/identities swapped (→ wrong compartment shown).
+      2. same middle only — fallback when the suffix wasn't read or doesn't line up.
+    An entry with no distinct detection left gets NO box (a wrong box is worse than none).
+    wh = scan size."""
     from robots_realtime.labeling.detector import parse_part
     st = labeler.state()
     if detector is None:
         return st
     dets, wh = detector.current()
     st["wh"] = wh
-    by_mid: dict[str, list] = defaultdict(list)     # 5-digit middle → detections (stable order)
-    for d in dets:
-        p = parse_part(d.part or "")
-        if p:
-            by_mid[p[1]].append(d)
-    for lst in by_mid.values():
-        lst.sort(key=lambda d: (d.bbox[1], d.bbox[0]))
-    used: dict[str, int] = defaultdict(int)
+    try:
+        st["det"] = detector.status()      # mode/margin/gamma/boxes → keep the debug panel honest
+    except Exception:
+        pass
+    parsed = [(parse_part(d.part or ""), d) for d in dets]      # (parsed_id_or_None, Detection)
+    claimed = [False] * len(parsed)
+
+    def _take(pred) -> "Detection | None":
+        # claim the first unclaimed detection satisfying pred, in stable top-to-bottom,
+        # left-to-right order (so the positional fallback is deterministic).
+        cands = sorted((j for j, (p, d) in enumerate(parsed) if not claimed[j] and pred(p, d)),
+                       key=lambda j: (parsed[j][1].bbox[1], parsed[j][1].bbox[0]))
+        if not cands:
+            return None
+        claimed[cands[0]] = True
+        return parsed[cands[0]][1]
+
     for pk in st["packets"]:
-        p = parse_part(pk.get("part") or "")
-        lst = by_mid.get(p[1], []) if p else []
-        i = used[p[1]] if p else 0
-        d = lst[i] if i < len(lst) else (lst[-1] if lst else None)
-        if p and i < len(lst):
-            used[p[1]] += 1
+        kp = parse_part(pk.get("part") or "")
+        d = None
+        if kp:
+            mid, suf = kp[1], kp[2]
+            d = _take(lambda p, _d: bool(p) and p[1] == mid and p[2] == suf)   # 1) exact id
+            if d is None:
+                d = _take(lambda p, _d: bool(p) and p[1] == mid)               # 2) middle-only
         pk["bbox_px"] = d.bbox if d else None
         pk["det_conf"] = d.conf if d else 0.0
     return st
@@ -176,15 +224,37 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
                         kit = None
                 if kit is None and detector is not None:
                     # operator started recording → freeze the kit as the scan sees it NOW
-                    from robots_realtime.labeling.detector import kit_from_detections
                     dets, _wh = detector.current()
-                    kit = kit_from_detections(dets) or None
+                    kit = scanned_kit(dets) or None
                 labeler.seed(kit if kit is not None else DEFAULT_KIT)
                 labeler.locked = True
                 self._json(_state_with_detections(labeler, detector))
             elif self.path == "/advance":
                 labeler.advance()
                 self._json(labeler.state())
+            elif self.path.startswith("/recalc"):
+                # manual re-scan: drop held/merged/stale boxes and detect fresh right now
+                if detector is not None:
+                    detector.recalibrate_now()
+                self._json({"ok": detector is not None,
+                            **(detector.status() if detector is not None else {})})
+            elif self.path.startswith("/autotune"):
+                # sweep exposure to match the current lighting, pick the best, re-scan
+                self._json(detector.autotune() if detector is not None
+                           else {"ok": False, "reason": "no detector"})
+            elif self.path.startswith("/trackmode"):
+                # switch the box tracker: /trackmode?m=ocr|contour|sam
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                m = (q.get("m") or ["ocr"])[0]
+                self._json(detector.set_mode(m) if detector is not None
+                           else {"ok": False, "reason": "no detector"})
+            elif self.path.startswith("/margin"):
+                # grow/shrink every mode's box: /margin?px=20  (wider/narrower buttons)
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                px = int((q.get("px") or ["0"])[0])
+                self._json(detector.set_margin(px) if detector is not None else {"ok": False})
             else:
                 self.send_error(404)
 
@@ -400,8 +470,9 @@ def record_watcher(save_root: str, labeler: LiveLabeler, arm: str,
                 continue
             key, meta = str(d), d / "session_meta.json"
             if key not in track:
+                already = (d / "annotations.json").exists()
                 track[key] = {"meta0": (meta.stat().st_mtime if meta.exists() else None),
-                              "labeled": (d / "annotations.json").exists()}
+                              "labeled": already}
                 # write the scanned kit ONCE, and never clobber an existing one (restart-safe)
                 if not (d / "kit.json").exists():
                     try:
@@ -417,6 +488,20 @@ def record_watcher(save_root: str, labeler: LiveLabeler, arm: str,
                         (d / "compartments.json").write_text(canon.read_text())
                     except Exception as e:
                         print(f"[auto-label] compartments copy failed for {d}: {e}")
+                # BACKFILL saved-but-unlabeled episodes. If an episode was saved while this
+                # watcher was down, it never sees the meta-rewrite trigger below (meta0 is
+                # initialized to its already-final mtime, so `m > meta0 + 0.5` can never
+                # fire) → stuck unlabeled forever. Catch it here: meta present + a SETTLED
+                # mcap (finished writing >20s ago) + no annotations = saved, not recording.
+                # The staleness guard is what keeps this from labeling an in-flight recording
+                # (whose mcap is either absent-until-save or actively growing).
+                mcap = d / f"yam_{arm}.mcap"
+                if (auto_label and not already and meta.exists() and mcap.exists()
+                        and mcap.stat().st_size > 0
+                        and time.time() - mcap.stat().st_mtime > 20.0):
+                    print(f"[auto-label] backfill saved-but-unlabeled {d.name}")
+                    track[key]["labeled"] = True
+                    _run_label_episode(d, arm)
             t = track[key]
             if not t["labeled"] and meta.exists():
                 m = meta.stat().st_mtime
@@ -454,6 +539,8 @@ def main(argv=None):
                     help="seconds between scan-cam detection passes")
     ap.add_argument("--detect-gpu", action="store_true",
                     help="use GPU for OCR (leave off on the RTX 5090 — no torch kernels)")
+    ap.add_argument("--detect-mode", default="contour", choices=["ocr", "contour", "sam"],
+                    help="box tracker: ocr (heuristic) | contour (watershed, default) | sam (FastSAM)")
     ap.add_argument("--save-root", default=None,
                     help="rr-session recordings root; watch it to save kit.json + auto-label")
     ap.add_argument("--auto-label", action="store_true",
@@ -478,9 +565,11 @@ def main(argv=None):
             from robots_realtime.labeling.detector import PacketDetector, kit_from_detections
             detector = PacketDetector(
                 frame_source=lambda: bridge.frame("scan"),
-                known_source=lambda: None,          # free-read EVERY packet on the table
-                period_s=args.detect_period, gpu=args.detect_gpu).start()
-            print(f"Packet detector on the scan cam (period {args.detect_period}s, gpu={args.detect_gpu})")
+                known_source=lambda: KNOWN_SKUS,    # snap every read to the closed kit catalog
+                period_s=args.detect_period, gpu=args.detect_gpu,
+                mode=args.detect_mode).start()      # default 'contour' (best in testing)
+            print(f"Packet detector on the scan cam (period {args.detect_period}s, "
+                  f"mode={args.detect_mode}, gpu={args.detect_gpu})")
 
             # Auto-seed the kit from the scan: the pick-list = the packets actually on the
             # table (not a fixed list). Re-seed while idle so the box always reflects reality;
@@ -490,7 +579,7 @@ def main(argv=None):
                     time.sleep(args.detect_period)
                     dets, _wh = detector.current()
                     if dets and not labeler.locked:
-                        kit = kit_from_detections(dets)
+                        kit = scanned_kit(dets)
                         if kit and [p["part"] for p in kit] != [p.get("part") for p in labeler.packets]:
                             labeler.seed(kit)
             threading.Thread(target=_autoseed, daemon=True).start()

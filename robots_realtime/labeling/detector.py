@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -41,7 +42,9 @@ def parse_part(part_id: str) -> tuple[str, str, str] | None:
 
 # Real Bühler part-id prefixes on the packets. OCR frequently mangles these (UNN → UMM /
 # UMH / UMN / UNM; MDDY → MDO / MD / MDOT) so we snap each read to the nearest real prefix.
-KNOWN_PREFIXES = ["UNN", "DNN", "MDDY"]
+# NOTE: "DNN" is NOT a real prefix (it came from an old synthetic DEFAULT_KIT). Keeping it
+# here made real UNN reads snap to the phantom DNN — the exact UNN→DNN misread we saw live.
+KNOWN_PREFIXES = ["UNN", "MDDY"]
 
 
 def _edit_dist(a: str, b: str) -> int:
@@ -60,6 +63,25 @@ def normalize_prefix(part: str) -> str:
     pre, mid, suf = p
     best = min(KNOWN_PREFIXES, key=lambda k: _edit_dist(pre, k))
     return f"{best}-{mid}-{suf}"
+
+
+def snap_to_catalog(part: str, known) -> str:
+    """Snap a raw part read to the nearest SKU in the closed catalog ``known``.
+
+    The 5-digit MIDDLE is the field OCR reads most reliably, so we first restrict
+    to catalog SKUs that share the read middle, then pick the smallest edit
+    distance on the full id — that repairs prefix/suffix slips (UNN→DNN, -009→-000)
+    without inventing a SKU. If the middle itself was misread, we fall back to the
+    nearest SKU over the whole catalog. No catalog → return the read unchanged."""
+    if not known:
+        return part
+    p = parse_part(part)
+    if not p:
+        return part
+    _pre, mid, _suf = p
+    same_middle = [k for k in known if (parse_part(k) or (None, None, None))[1] == mid]
+    pool = same_middle or list(known)
+    return min(pool, key=lambda k: _edit_dist(part, k))
 
 
 @dataclass
@@ -161,6 +183,35 @@ def _clean_dets(dets: list["Detection"], min_conf: float,
     return kept
 
 
+def _key(ctr) -> tuple[int, int]:
+    """Hashable pixel key for a centroid (used to map a digit centroid → its seed label)."""
+    return (int(round(ctr[0])), int(round(ctr[1])))
+
+
+def _region_bbox_by_label(labels: np.ndarray, k: int | None) -> list[int] | None:
+    """Bounding box [x,y,w,h] of all pixels with value k in a watershed/label image."""
+    if k is None:
+        return None
+    ys, xs = np.where(labels == k)
+    if len(xs) == 0:
+        return None
+    x0, y0 = int(xs.min()), int(ys.min())
+    return [x0, y0, int(xs.max()) - x0, int(ys.max()) - y0]
+
+
+def _smallest_mask_containing(masks, ctr) -> list[int] | None:
+    """Among SAM (x,y,w,h,mask) instances covering the centroid, the smallest one's box —
+    smallest = the individual bag, not a big multi-bag blob."""
+    cx, cy = int(ctr[0]), int(ctr[1])
+    best, best_area = None, None
+    for (x, y, w, h, m) in masks:
+        if 0 <= cy < m.shape[0] and 0 <= cx < m.shape[1] and m[cy, cx] > 0.5:
+            area = w * h
+            if best_area is None or area < best_area:
+                best, best_area = [x, y, w, h], area
+    return best
+
+
 class PacketDetector:
     """Detects packets on the scan camera and reads their part ids.
 
@@ -170,11 +221,30 @@ class PacketDetector:
     """
 
     def __init__(self, frame_source, known_source, period_s: float = 2.0,
-                 gpu: bool = False, ttl_cycles: int = 4, min_conf: float = 0.5):
+                 gpu: bool = False, hold_seconds: float = 5.0, min_conf: float = 0.5,
+                 mode: str = "ocr", margin: int = 0):
         self._frame_source = frame_source          # () -> np.ndarray | None
         self._known_source = known_source          # () -> list[str] | None
         self._period = period_s
-        self._ttl_cycles = ttl_cycles              # hold a box this many missed cycles
+        # BOX GEOMETRY is pluggable so we can A/B/C the tracker live from the cockpit. The
+        # OCR read (identity + where the digits are) feeds all modes; only how the BOX is
+        # derived differs. Switch with /trackmode:
+        #   "ocr"     — expand the part-number's OCR text box onto the bag (the original,
+        #               zero-dep heuristic that worked well).
+        #   "contour" — classical CV: threshold the bag silhouette on the dark mat and
+        #               watershed-split touching bags, seeded by each read's digit centroid.
+        #   "sam"     — FastSAM point-prompted at each digit centroid → precise bag mask.
+        # `margin` grows every mode's final box by N px/side (the cockpit wider/narrower).
+        self._mode = mode if mode in ("ocr", "contour", "sam") else "ocr"
+        self._margin = margin
+        self._sam_model = None
+        self._bag_thresh = 60          # brightness that separates bag (translucent) from black mat
+        self._gamma = 1.0              # base OCR exposure; /autotune picks the best for the light
+        # Hold a box this long (WALL-CLOCK) after it was last seen, then drop it. Kept in
+        # seconds, NOT cycles, so raising period_s (to ease CPU) never silently lingers a
+        # stale box longer — the two knobs are decoupled. A box older than this over a
+        # scene that has changed (packet picked/occluded) is the "random box" bug.
+        self._hold_seconds = hold_seconds
         self.min_conf = min_conf                   # drop OCR reads below this confidence
         self._lock = threading.Lock()
         self._dets: list[Detection] = []
@@ -182,8 +252,11 @@ class PacketDetector:
         self._reader = None
         self._gpu = gpu
         self._stop = threading.Event()
+        self._kick = threading.Event()   # wake the loop early (manual recalc)
+        self._reset = False              # drop held boxes + reset expected on next cycle
         self._expected = 0             # high-water mark of packets seen (recalibration target)
         self._recalibrate = True       # sweep exposure/gamma when we come up short
+        self._vote_window = 15         # per-packet reads kept for the temporal identity vote
 
     def _ocr(self):
         if self._reader is None:
@@ -237,41 +310,156 @@ class PacketDetector:
                     bd, best = d, c
             return best
 
-        # Read EVERY packet: a Bühler part number is PREFIX MIDDLE(5) SUFFIX(3) printed on
-        # one line. Anchor on each 5-digit middle that has a letter prefix right next to it
-        # (this rejects order-number noise, which has no adjacent prefix).
-        dets: list[Detection] = []
+        # First pass: which reads are real part numbers (5-digit middle WITH a letter prefix
+        # next to it, which rejects order-number noise). Collect their digit centroids so the
+        # region-based trackers (contour/sam) can segment one bag per read in a single pass.
+        hits = []   # (mid, mconf, mbb, mctr, suf)
         for (mid, mconf, mbb, mctr) in mids:
             pre = nearest(pres, mctr, maxd=max(140, 3 * mbb[2]))
             if pre is None:
-                continue                                   # no prefix → not a part number
+                continue
             suf = nearest(sufs, mctr, maxd=max(140, 3 * mbb[2]))
+            hits.append((mid, mconf, mbb, mctr, pre, suf))
+
+        centroids = [h[3] for h in hits]
+        boxer = self._make_boxer(frame, centroids)   # mode-specific box(dbb, dctr) -> [x,y,w,h]
+
+        dets: list[Detection] = []
+        for (mid, mconf, mbb, mctr, pre, suf) in hits:
+            # Keep the RAW read here (prefix normalized later in _clean_dets). Catalog
+            # snapping is deferred to the temporal vote (_vote): if we snapped per-frame,
+            # a garbage suffix on one frame would collapse two same-middle SKUs (007/231)
+            # before the vote ever saw the frames that read the suffix correctly.
             part = f"{pre[0]}-{mid}-{(suf[0] if suf else '000')}"
-            mx, my = mbb[2], mbb[3]                         # expand the middle-number box onto the packet
-            box = [max(0, mbb[0] - mx), max(0, mbb[1] - my), mbb[2] + 2 * mx, mbb[3] + 3 * my]
-            box[2] = min(box[2], W - box[0]); box[3] = min(box[3], H - box[1])
-            if known:                                       # optional: snap to catalog SKU
-                snap, _ = match_sku([(pre[0], pre[1]), (mid, mconf)] +
-                                    ([(suf[0], suf[1])] if suf else []), known)
-                if snap:
-                    part = snap
+            box = boxer(mbb, mctr)
             dets.append(Detection([int(v) for v in box], part, round(mconf, 2)))
         return _clean_dets(dets, self.min_conf)
+
+    # ---- pluggable box trackers (switch live via /trackmode) ----------------------------
+
+    def _make_boxer(self, frame, centroids):
+        """Return a per-read box(dbb, dctr) -> [x,y,w,h] for the current mode. Region modes
+        (contour/sam) segment the whole frame ONCE here, then assign the region under each
+        digit centroid; any read with no region falls back to the OCR heuristic box."""
+        H, W = frame.shape[:2]
+
+        def _clamp_expand(box):                             # apply margin, clamp to frame
+            x, y, w, h = box
+            m = self._margin
+            x = max(0, x - m); y = max(0, y - m)
+            w = min(W - x, w + 2 * m); h = min(H - y, h + 2 * m)
+            return [int(x), int(y), int(w), int(h)]
+
+        def _ocr_box(dbb, _dctr):
+            """The original heuristic: expand the 5-digit box onto the bag (left/up 1x,
+            right 2x, down 3x — the number sits top-left on the label)."""
+            mx, my = dbb[2], dbb[3]
+            box = [max(0, dbb[0] - mx), max(0, dbb[1] - my), dbb[2] + 2 * mx, dbb[3] + 3 * my]
+            box[2] = min(box[2], W - box[0]); box[3] = min(box[3], H - box[1])
+            return _clamp_expand(box)
+
+        if self._mode == "ocr" or not centroids:
+            return _ocr_box
+
+        try:
+            if self._mode == "contour":
+                labels, idx_of = self._segment_contour(frame, centroids)
+
+                def _contour_box(dbb, dctr):
+                    box = _region_bbox_by_label(labels, idx_of.get(_key(dctr)))
+                    return _clamp_expand(box) if box else _ocr_box(dbb, dctr)
+                return _contour_box
+
+            if self._mode == "sam":
+                masks = self._segment_sam(frame)            # list of (x,y,w,h,mask)
+
+                def _sam_box(dbb, dctr):
+                    box = _smallest_mask_containing(masks, dctr)
+                    return _clamp_expand(box) if box else _ocr_box(dbb, dctr)
+                return _sam_box
+        except Exception as e:                              # any tracker failure → safe default
+            print(f"[detector] mode '{self._mode}' failed ({type(e).__name__}: {e}); using ocr")
+        return _ocr_box
+
+    def _segment_contour(self, frame, centroids):
+        """Watershed the bag silhouettes on the dark mat, seeded by one marker per digit
+        centroid, so touching bags are split at their seam. Returns (labels, {key→seed})."""
+        import cv2
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if frame.ndim == 3 else frame
+        _, bag = cv2.threshold(gray, self._bag_thresh, 255, cv2.THRESH_BINARY)
+        bag = cv2.morphologyEx(bag, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
+        markers = np.zeros(gray.shape, np.int32)
+        idx_of = {}
+        for k, (cx, cy) in enumerate(centroids, start=2):   # 1 is reserved for background
+            cv2.circle(markers, (int(cx), int(cy)), 6, k, -1)
+            idx_of[_key((cx, cy))] = k
+        markers[bag == 0] = 1                               # mat is background
+        cv2.watershed(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), markers)
+        return markers, idx_of
+
+    def _sam(self):
+        if self._sam_model is None:
+            from ultralytics import FastSAM
+            self._sam_model = FastSAM("FastSAM-s.pt")       # ~23MB, auto-downloads once
+        return self._sam_model
+
+    def _segment_sam(self, frame):
+        """FastSAM 'segment everything', returned as (x,y,w,h,mask) per instance. We assign
+        the smallest mask under each digit centroid, so each bag gets its own tight box."""
+        # Force CPU: the RTX 5090 (sm_120) has no kernels in this torch build, so 'cuda'
+        # crashes/falls back anyway. ~1s/frame on CPU is fine at the scan's slow rate.
+        res = self._sam()(frame, device="cpu", retina_masks=True,
+                          imgsz=1024, conf=0.4, iou=0.9, verbose=False)
+        out = []
+        masks = res[0].masks if res else None
+        if masks is not None:
+            for m in masks.data.cpu().numpy():
+                ys, xs = np.where(m > 0.5)
+                if len(xs):
+                    out.append((int(xs.min()), int(ys.min()),
+                                int(xs.max() - xs.min()), int(ys.max() - ys.min()), m))
+        return out
+
+    def _vote(self, entry: dict, known) -> "Detection":
+        """Collapse a packet's recent reads into ONE identity by weighted majority vote.
+
+        Per-frame OCR jitters the prefix/suffix, so a single frame is untrustworthy; a
+        vote over the last _vote_window reads (weighted by that frame's OCR confidence)
+        is stable. The winning raw read is then snapped to the closed catalog. The
+        emitted confidence is the vote AGREEMENT (winner weight / total) — a real
+        trust signal, unlike the saturated per-frame OCR score, so a split/uncertain
+        packet gets a low conf and is dropped by the min_conf gate (abstain, not
+        mis-route)."""
+        tally: dict[str, float] = {}
+        for part, conf in entry["reads"]:
+            if part:
+                tally[part] = tally.get(part, 0.0) + max(float(conf), 0.05)
+        if not tally:
+            return Detection(list(entry["bbox"]), None, 0.0)
+        total = sum(tally.values())
+        winner = max(tally, key=lambda k: tally[k])
+        agree = tally[winner] / total
+        return Detection(list(entry["bbox"]), snap_to_catalog(winner, known), round(agree, 2))
 
     def _loop(self):
         # Spatial tracker: one entry per PHYSICAL packet (keyed by box POSITION, not the
         # part text — OCR jitters the prefix/suffix across passes, so text keys would
-        # accumulate duplicates of the same packet). Each position keeps its highest-conf
-        # reading; a packet holds its box for _ttl_cycles of misses (arm occlusion) then
-        # drops once it's been gone a while (picked / removed).
-        held: list[list] = []          # [Detection, age]
+        # accumulate duplicates of the same packet). Each position keeps a WINDOW of its
+        # recent reads and reports the vote winner (see _vote); a packet holds its box for
+        # _hold_seconds after it was last seen (rides out arm occlusion) then drops once
+        # it's been gone that long (picked / removed).
+        held: list[dict] = []          # {"bbox": [x,y,w,h], "reads": deque, "seen": monotonic}
         while not self._stop.is_set():
+            if self._reset:                        # manual /recalc: forget everything, re-scan clean
+                held = []
+                self._expected = 0
+                self._reset = False
             frame = self._frame_source()
             known = self._known_source() or None
             if frame is not None:
                 try:
                     frame = np.asarray(frame)
-                    fresh = self.detect_once(frame, known)
+                    fresh = self.detect_once(frame, known, gamma=self._gamma)
                     # Auto-recalibrate: if we found fewer packets than we've seen before,
                     # a packet is likely washed out / too dark — sweep software exposure
                     # (gamma) and merge whatever extra reads that surfaces.
@@ -283,8 +471,8 @@ class PacketDetector:
                     self._expected = max(self._expected, len(fresh))
                     used = [False] * len(fresh)
 
-                    def _near(det):
-                        cx, cy = det.bbox[0] + det.bbox[2] / 2, det.bbox[1] + det.bbox[3] / 2
+                    def _near(bbox):
+                        cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
                         for i, f in enumerate(fresh):
                             if used[i]:
                                 continue
@@ -293,27 +481,36 @@ class PacketDetector:
                                 return i
                         return -1
 
-                    new_held: list[list] = []
-                    for det, age in held:
-                        i = _near(det)
+                    now = time.monotonic()
+                    new_held: list[dict] = []
+                    for entry in held:
+                        i = _near(entry["bbox"])
                         if i >= 0:
                             used[i] = True
                             f = fresh[i]
-                            new_held.append([f if f.conf >= det.conf else det, 0])
-                        elif age + 1 < self._ttl_cycles:
-                            new_held.append([det, age + 1])        # hold last-good
+                            entry["bbox"] = f.bbox                  # latest position
+                            entry["reads"].append((f.part, f.conf))  # one more vote for this packet
+                            entry["seen"] = now
+                            new_held.append(entry)
+                        elif now - entry["seen"] < self._hold_seconds:
+                            new_held.append(entry)                 # hold last-good until it ages out
                     for i, f in enumerate(fresh):
-                        if not used[i]:
-                            new_held.append([f, 0])                # newly seen packet
+                        if not used[i]:                            # newly seen packet
+                            reads = deque(maxlen=self._vote_window)
+                            reads.append((f.part, f.conf))
+                            new_held.append({"bbox": f.bbox, "reads": reads, "seen": now})
                     held = new_held
+                    voted = [self._vote(e, known) for e in held]
                     with self._lock:
                         # final box-dedupe guard: the tracker can hold two co-located
                         # entries if a cycle briefly saw a packet twice; collapse them.
-                        self._dets = _clean_dets([d for (d, _age) in held], self.min_conf)
+                        self._dets = _clean_dets(voted, self.min_conf)
                         self._wh = [int(frame.shape[1]), int(frame.shape[0])]
                 except Exception:
                     pass
-            self._stop.wait(self._period)
+            # sleep until the next cycle OR until a manual recalc kicks us awake
+            if self._kick.wait(self._period):
+                self._kick.clear()
 
     def start(self) -> "PacketDetector":
         threading.Thread(target=self._loop, daemon=True).start()
@@ -321,6 +518,64 @@ class PacketDetector:
 
     def stop(self):
         self._stop.set()
+
+    # ---- runtime controls (driven by the cockpit debug panel) --------------------------
+
+    def recalibrate_now(self) -> None:
+        """Drop all held boxes and re-scan from scratch on the next (immediate) cycle.
+        Use after moving/adding bags so stale or merged boxes clear at once."""
+        self._reset = True
+        self._kick.set()
+
+    def set_mode(self, mode: str) -> dict:
+        """Switch the box tracker: 'ocr' | 'contour' | 'sam'. Applies on the next cycle.
+        For 'sam', warm the model now so the first cycle isn't a multi-second stall (and so
+        we can report if the weights/deps are missing)."""
+        if mode not in ("ocr", "contour", "sam"):
+            return {"ok": False, "reason": f"unknown mode {mode!r}", "mode": self._mode}
+        warm = None
+        if mode == "sam":
+            try:
+                self._sam()
+            except Exception as e:
+                return {"ok": False, "reason": f"sam unavailable: {type(e).__name__}: {e}",
+                        "mode": self._mode}
+        self._mode = mode
+        self.recalibrate_now()
+        return {"ok": True, "mode": self._mode, **({"warm": warm} if warm else {})}
+
+    def set_margin(self, margin: int) -> dict:
+        """Grow/shrink every mode's box by N px per side (cockpit wider/narrower)."""
+        self._margin = int(margin)
+        self._kick.set()
+        return {"ok": True, "margin": self._margin}
+
+    def autotune(self, gammas=(0.4, 0.55, 0.7, 0.85, 1.0, 1.3, 1.7, 2.2)) -> dict:
+        """Find the OCR exposure (gamma) best suited to the CURRENT lighting: sweep gamma,
+        run a detection pass at each, and keep the one that reads the MOST distinct valid
+        part numbers (ties → gamma closest to 1.0). Sets self._gamma and forces a re-scan.
+        Returns the chosen gamma, its read count, and the full sweep for the debug panel."""
+        frame = self._frame_source()
+        if frame is None:
+            return {"ok": False, "reason": "no scan frame"}
+        frame = np.asarray(frame)
+        sweep = []
+        best_g, best_n = self._gamma, -1
+        for g in gammas:
+            dets = self.detect_once(frame, self._known_source() or None, gamma=g)
+            n = len({d.part for d in dets if d.part})
+            sweep.append({"gamma": round(g, 2), "reads": n})
+            if n > best_n or (n == best_n and abs(g - 1.0) < abs(best_g - 1.0)):
+                best_g, best_n = g, n
+        self._gamma = best_g
+        self.recalibrate_now()
+        return {"ok": True, "gamma": round(best_g, 2), "reads": best_n, "sweep": sweep}
+
+    def status(self) -> dict:
+        with self._lock:
+            n = len(self._dets)
+        return {"gamma": round(self._gamma, 2), "boxes": n,
+                "mode": self._mode, "margin": self._margin}
 
     def current(self) -> tuple[list[Detection], list[int]]:
         with self._lock:
@@ -344,18 +599,30 @@ class PacketDetector:
         return best.bbox, best.conf
 
 
-def kit_from_detections(dets: list["Detection"], max_comp: int = 7) -> list[dict]:
+def kit_from_detections(dets: list["Detection"], max_comp: int = 7,
+                        comp_of: dict[str, int] | None = None) -> list[dict]:
     """Build the pick-list from what the scan cam actually sees: one entry per
-    detected packet, ordered top-to-bottom then left-to-right, with a "grouped"
-    part→compartment rule (identical parts share a compartment, assigned in
-    first-seen order, capped at ``max_comp``)."""
+    detected packet, ordered top-to-bottom then left-to-right.
+
+    Compartment assignment:
+      - ``comp_of`` given → route each SKU to its FIXED physical compartment (the
+        box calibration). This is the correct path: a jittery read never reshuffles
+        the whole numbering, and the pick target matches the real box.
+      - ``comp_of`` None → fall back to the legacy "grouped, first-seen" rule
+        (identical parts share a compartment, numbered in first-seen order)."""
     dets = _clean_dets(dets, 0.0)      # box-dedupe guard: never two entries per packet
     ordered = sorted(dets, key=lambda d: (d.bbox[1] // 120, d.bbox[0]))
-    comp_of: dict[str, int] = {}
+    seen: dict[str, int] = {}
     kit = []
     for i, d in enumerate(ordered):
-        if d.part and d.part not in comp_of:
-            comp_of[d.part] = min(len(comp_of) + 1, max_comp)
+        comp = None
+        if d.part:
+            if comp_of is not None:
+                comp = comp_of.get(d.part)         # fixed physical compartment for this SKU
+            else:
+                if d.part not in seen:
+                    seen[d.part] = min(len(seen) + 1, max_comp)
+                comp = seen[d.part]
         kit.append({"bag_id": i + 1, "part": d.part, "name": "",
-                    "comp": comp_of.get(d.part), "bbox": [0.0, 0.0, 0.0, 0.0]})
+                    "comp": comp, "bbox": [0.0, 0.0, 0.0, 0.0]})
     return kit
