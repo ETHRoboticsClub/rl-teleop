@@ -46,6 +46,8 @@ def label_from_arrays(
     kitting_list: list[KitItem] | None = None,
     commanded_positions: tuple[np.ndarray, np.ndarray] | None = None,
     clock_offset_s: float = 0.0,
+    min_transport_m: float = 0.0,
+    geometric_targets: bool = False,
 ) -> Annotations:
     times = np.asarray(times, float)
     positions = np.asarray(positions, float)
@@ -76,6 +78,7 @@ def label_from_arrays(
         episode_id, arm, t_start, t_end, candidates,
         kitting_list=kitting_list, cockpit_events=cockpit_events,
         compartments=compartments, clock_offset_s=clock_offset_s, outcome=outcome,
+        min_transport_m=min_transport_m, geometric_targets=geometric_targets,
     )
 
     # If the gripper range wasn't given and the signal never nears full close,
@@ -120,6 +123,8 @@ def label_episode_dir(episode_dir: str | Path, arm: str = "left",
                       urdf_path: str | Path = "urdf/yam.urdf",
                       gripper_open_ref: float | None = None,
                       gripper_closed_ref: float | None = None,
+                      min_transport_m: float = 0.0,
+                      geometric_targets: bool = False,
                       write: bool = True) -> Annotations:
     episode_dir = Path(episode_dir)
     fk = ForwardKinematics(urdf_path)
@@ -148,7 +153,8 @@ def label_episode_dir(episode_dir: str | Path, arm: str = "left",
         gripper_open_ref=gripper_open_ref, gripper_closed_ref=gripper_closed_ref,
         cockpit_events=read_jsonl(episode_dir / "cockpit_events.jsonl") or None,
         compartments=comps, kitting_list=_load_kit(episode_dir),
-        commanded_positions=commanded,
+        commanded_positions=commanded, min_transport_m=min_transport_m,
+        geometric_targets=geometric_targets,
     )
     if write:
         ann.save(episode_dir / "annotations.json")
@@ -162,10 +168,18 @@ def main(argv=None):
     ap.add_argument("--arm", default="left")
     ap.add_argument("--open-ref", type=float, default=None, help="gripper open joint value")
     ap.add_argument("--closed-ref", type=float, default=None, help="gripper closed joint value")
+    ap.add_argument("--min-transport", type=float, default=0.0,
+                    help="min EE XY travel (m) grasp→release to count as a placement "
+                         "(kitting: ~0.10; 0 disables — drops 'released-at-pick' false placements)")
+    ap.add_argument("--geometric-targets", action="store_true",
+                    help="reassign each place target to the nearest distinct compartment by "
+                         "geometry (use when the operator picks out of kit order)")
     args = ap.parse_args(argv)
     try:
         ann = label_episode_dir(args.episode_dir, arm=args.arm,
-                                gripper_open_ref=args.open_ref, gripper_closed_ref=args.closed_ref)
+                                gripper_open_ref=args.open_ref, gripper_closed_ref=args.closed_ref,
+                                min_transport_m=args.min_transport,
+                                geometric_targets=args.geometric_targets)
     except (FileNotFoundError, RuntimeError) as e:
         print(f"⏭  skipped {Path(args.episode_dir).name}: {e}")  # clean skip, not a traceback
         return 0

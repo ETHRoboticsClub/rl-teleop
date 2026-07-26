@@ -30,6 +30,13 @@ MIN_HOLD_S = 0.20
 LIFT_WINDOW_S = 2.0
 # Minimum end-effector rise (metres, robot Z-up) to count as a "lift".
 MIN_LIFT_M = 0.03
+# Minimum horizontal (XY) distance the EE must travel between grasp and release
+# for a grasp to count as a real pick-AND-place. A success grasp that closes and
+# re-opens near the pick without transporting (a re-grip / fumble at the box) is
+# NOT a placement — gating on this removes the "released-at-pick" false placements.
+# 0.0 disables the gate (library default, back-compat); the real kitting pipeline
+# passes ~0.10 (box1→box2 is always >=~0.15m apart).
+MIN_TRANSPORT_M = 0.10
 
 # --- placement ---------------------------------------------------------------
 # A release counts as "in" a compartment if the end-effector's XY at release is

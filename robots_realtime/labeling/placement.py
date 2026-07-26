@@ -69,6 +69,47 @@ def compartment_at(x: float, y: float, compartments: list[Compartment],
     return min(hits, key=lambda c: (c.center[0] - x) ** 2 + (c.center[1] - y) ** 2).id
 
 
+def assign_targets_geometric(place_events, compartments: list[Compartment]) -> int:
+    """Reassign each placement's target to a DISTINCT compartment by minimizing
+    total release→center XY distance (optimal assignment), then HONESTLY recompute
+    detected/in_target_region/xy_offset against the new target via classify_release.
+
+    Use when the kit-order target is unreliable (operator picks out of kit order):
+    the demonstrated label becomes 'which compartment this bag was actually placed
+    in', recovered from geometry instead of pick order. One bag per compartment
+    (kitting invariant) → assignment, not nearest-independently. Mutates the given
+    PlaceEvent objects in place. Returns the number reassigned.
+    """
+    pts = [p for p in place_events if p.achieved_ee_pose is not None]
+    comps = list(compartments or [])
+    if not pts or not comps:
+        return 0
+    cost = [[(p.achieved_ee_pose[0] - c.center[0]) ** 2 + (p.achieved_ee_pose[1] - c.center[1]) ** 2
+             for c in comps] for p in pts]
+    try:
+        import numpy as np
+        from scipy.optimize import linear_sum_assignment
+        rows, cols = linear_sum_assignment(np.asarray(cost, dtype=float))
+        pairs = list(zip(rows.tolist(), cols.tolist()))
+    except Exception:
+        # greedy fallback: take the cheapest (placement, compartment) pairs first,
+        # each placement and each compartment used at most once.
+        triples = sorted((cost[i][j], i, j) for i in range(len(pts)) for j in range(len(comps)))
+        used_r, used_c, pairs = set(), set(), []
+        for _, i, j in triples:
+            if i in used_r or j in used_c:
+                continue
+            used_r.add(i); used_c.add(j); pairs.append((i, j))
+    for i, j in pairs:
+        p, c = pts[i], comps[j]
+        p.target_compartment = c.id
+        res = classify_release((p.achieved_ee_pose[0], p.achieved_ee_pose[1]), c.id, comps)
+        p.detected_compartment = res.detected_compartment
+        p.in_target_region = res.in_target_region
+        p.xy_offset_m = res.xy_offset_m
+    return len(pairs)
+
+
 def classify_release(ee_xy: tuple[float, float], target_compartment: int | None,
                      compartments: list[Compartment],
                      max_reach_m: float = 0.15) -> PlacementResult:

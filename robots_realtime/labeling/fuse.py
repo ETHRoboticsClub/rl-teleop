@@ -19,7 +19,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from robots_realtime.labeling import constants as C
-from robots_realtime.labeling.placement import Compartment, classify_release
+from robots_realtime.labeling.placement import (
+    Compartment,
+    assign_targets_geometric,
+    classify_release,
+)
 from robots_realtime.labeling.schema import (
     Annotations,
     EpisodeMeta,
@@ -46,9 +50,22 @@ def _in_window(t: float, t_start: float, t_end: float) -> bool:
     return (t_start - C.CLOCK_WINDOW_SLACK_S) <= t <= (t_end + C.CLOCK_WINDOW_SLACK_S)
 
 
-def _is_terminal(c: GraspCandidate) -> bool:
-    """A grasp that actually carried a bag and released it = the placing grasp."""
-    return c.outcome == "success" and c.lifted is not False and c.t_open is not None
+def _transported(c: GraspCandidate, min_transport_m: float) -> bool:
+    """Did the EE travel horizontally between grasp and release? A success grasp
+    that re-opens where it closed (EE barely moved) is a re-grip/fumble at the
+    pick, not a placement. When either pose is missing, or the gate is disabled
+    (min_transport_m<=0), don't gate."""
+    if min_transport_m <= 0.0 or c.grasp_pose is None or c.release_pose is None:
+        return True
+    dx = c.release_pose[0] - c.grasp_pose[0]
+    dy = c.release_pose[1] - c.grasp_pose[1]
+    return (dx * dx + dy * dy) ** 0.5 >= min_transport_m
+
+
+def _is_terminal(c: GraspCandidate, min_transport_m: float = 0.0) -> bool:
+    """A grasp that actually carried a bag, moved it, and released it = the placing grasp."""
+    return (c.outcome == "success" and c.lifted is not False and c.t_open is not None
+            and _transported(c, min_transport_m))
 
 
 def build_annotations(
@@ -62,6 +79,8 @@ def build_annotations(
     compartments: list[Compartment] | None = None,
     clock_offset_s: float = 0.0,
     outcome: str = "unknown",
+    min_transport_m: float = 0.0,
+    geometric_targets: bool = False,
 ) -> Annotations:
     flags: list[Flag] = []
     kit = list(kitting_list or [])
@@ -141,10 +160,17 @@ def build_annotations(
         segments.append(Segment(bag_id, arm, "place", terminal.t_open, terminal.t_open))
 
     for c in cand:
-        if _is_terminal(c):
+        if _is_terminal(c, min_transport_m):
             close_bag(c)
             pending = []
         else:
+            if (c.outcome == "success" and c.lifted is not False and c.t_open is not None
+                    and not _transported(c, min_transport_m)):
+                flags.append(Flag(
+                    "no_transport",
+                    f"success grasp @ {c.t_close:.3f} re-opened without transporting "
+                    f"(<{min_transport_m*100:.0f}cm from grasp) — re-grip at pick, not a placement",
+                    t=c.t_close))
             pending.append(c)
 
     # any leftover attempts that never placed → flag, don't drop
@@ -157,6 +183,16 @@ def build_annotations(
         if k.part_no is None:
             flags.append(Flag("ocr_null", f"bag {k.bag_id} part unreadable — needs manual assign",
                               bag_id=k.bag_id))
+
+    # Optional: recover each placement's target from geometry instead of pick
+    # order (operator picks out of kit order → kit-order targets are wrong). One
+    # bag per compartment → optimal assignment. Loud flag so it's never silent.
+    if geometric_targets and compartments:
+        n = assign_targets_geometric(place_events, compartments)
+        if n:
+            flags.append(Flag("geometric_targets",
+                              f"reassigned {n} place target(s) to nearest distinct "
+                              f"compartment by geometry (kit-order targets overridden)"))
 
     meta = EpisodeMeta(episode_id=episode_id, arm=arm, kitting_list=kit, outcome=outcome,
                        t_start=t_start, t_end=t_end, clock_offset_s=clock_offset_s)

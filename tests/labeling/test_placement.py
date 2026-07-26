@@ -64,3 +64,31 @@ def test_classify_no_target():
     assert r.detected_compartment == 1
     assert r.in_target_region is None
     assert r.xy_offset_m is None
+
+
+def test_geometric_assignment_recovers_swapped_targets():
+    """Placements tagged with swapped kit-order targets get reassigned to the
+    compartment they actually landed in (distinct, optimal)."""
+    from robots_realtime.labeling.placement import assign_targets_geometric
+    from robots_realtime.labeling.schema import PlaceEvent
+
+    p1 = PlaceEvent(bag_id=1, t=0.0, target_compartment=4,          # WRONG (really in 1)
+                    achieved_ee_pose=[0.05, 0.05, 0.2, 1, 0, 0, 0])
+    p2 = PlaceEvent(bag_id=2, t=1.0, target_compartment=1,          # WRONG (really in 4)
+                    achieved_ee_pose=[0.17, 0.17, 0.2, 1, 0, 0, 0])
+    n = assign_targets_geometric([p1, p2], GRID)
+    assert n == 2
+    assert p1.target_compartment == 1 and p1.in_target_region is True
+    assert p2.target_compartment == 4 and p2.in_target_region is True
+
+
+def test_geometric_assignment_is_distinct_under_contention():
+    """Two placements near the SAME cell still get DISTINCT compartments
+    (one bag per compartment)."""
+    from robots_realtime.labeling.placement import assign_targets_geometric
+    from robots_realtime.labeling.schema import PlaceEvent
+
+    p1 = PlaceEvent(bag_id=1, t=0.0, achieved_ee_pose=[0.05, 0.05, 0.2, 1, 0, 0, 0])
+    p2 = PlaceEvent(bag_id=2, t=1.0, achieved_ee_pose=[0.06, 0.06, 0.2, 1, 0, 0, 0])
+    assign_targets_geometric([p1, p2], GRID)
+    assert p1.target_compartment != p2.target_compartment
