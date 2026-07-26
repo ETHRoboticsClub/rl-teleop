@@ -330,6 +330,27 @@ class Session:
     def is_recording(self) -> bool:
         return self._is_recording
 
+    def flag_episode(self, tag: str) -> bool:
+        """Attach an operator quality flag (e.g. 're_grasp', 'bad', 'slow') to the
+        CURRENTLY-recording episode. Written to operator_flags.json in the episode
+        dir, so it survives save and is dropped with the dir on discard. No-op when
+        not recording (returns False)."""
+        with self._recording_lock:
+            d = self._episode_dir
+        if d is None:
+            return False
+        p = Path(d) / "operator_flags.json"
+        try:
+            data = json.loads(p.read_text()) if p.exists() else {"flags": []}
+        except Exception:
+            data = {"flags": []}
+        data.setdefault("flags", []).append({"tag": tag, "t": time.time()})
+        try:
+            p.write_text(json.dumps(data, indent=2) + "\n")
+        except Exception:
+            return False
+        return True
+
     @property
     def episode_start_time(self) -> float | None:
         return self._episode_start_time

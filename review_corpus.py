@@ -66,9 +66,17 @@ def main():
         p = d.get("place_events", [])
         qpath = os.path.join(os.path.dirname(f), "qa.json")
         qa = json.load(open(qpath)) if os.path.exists(qpath) else {}
+        ofpath = os.path.join(os.path.dirname(f), "operator_flags.json")
+        opflags = []
+        if os.path.exists(ofpath):
+            try:
+                opflags = [x.get("tag") for x in json.load(open(ofpath)).get("flags", [])]
+            except Exception:
+                opflags = []
         episodes.append(dict(ep=ep, dir=os.path.dirname(f), outcome=m.get("outcome"),
                              grasps=g, places=p, flags=d.get("flags", []),
-                             segs=d.get("segments", []), kit=m.get("kitting_list", []), qa=qa))
+                             segs=d.get("segments", []), kit=m.get("kitting_list", []),
+                             qa=qa, opflags=opflags))
 
     # ---- 1. corpus / label quality ----
     n = len(episodes)
@@ -113,8 +121,17 @@ def main():
     for k in ("success", "slip", "drop", "empty"):
         c = by_outcome.get(k, 0)
         P(f"      {k:8} {c:4}  {hbar(c/max(len(all_grasps),1))}")
-    P(f"  regrasp attempts ............ {regrasps}")
+    P(f"  regrasp attempts (auto-detected) {regrasps}")
     P(f"  place events ................ {len(all_places)}")
+    op_tally = {}
+    for e in episodes:
+        for tg in set(e["opflags"]):
+            op_tally[tg] = op_tally.get(tg, 0) + 1
+    if op_tally:
+        P("  operator flags (g/x/s at record) " + ", ".join(f"{k}={v}" for k, v in sorted(op_tally.items())))
+        bad_eps = [e["ep"] for e in episodes if "bad" in e["opflags"]]
+        if bad_eps:
+            P(f"      >>> operator-flagged BAD (exclude from training): {bad_eps}")
     P("")
     P("  per-episode:")
     P(f"    {'episode':30}{'outcome':9}{'grasp':6}{'place':6}{'flags':6}")

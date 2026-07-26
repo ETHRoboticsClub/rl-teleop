@@ -106,6 +106,10 @@ def _help_line(session=None) -> Text:
     else:
         t.append("[r]", style="bold white")
         t.append(" record  ")
+    t.append("[→]", style="bold white")
+    t.append(" next  ")
+    t.append("[←]", style="bold white")
+    t.append(" redo  ")
     t.append("[d]", style="bold white")
     t.append(" discard  ")
     t.append("[space]", style="bold white")
@@ -113,6 +117,8 @@ def _help_line(session=None) -> Text:
         t.append(" resume  ")
     else:
         t.append(" pause  ")
+    t.append("[g/x/s]", style="bold white")
+    t.append(" flag  ")
     t.append("[q]", style="bold white")
     t.append(" quit")
     return t
@@ -246,6 +252,49 @@ def _run_session_action_async(action_lock: threading.Lock, fn, *args, **kwargs) 
     threading.Thread(target=_worker, daemon=True).start()
 
 
+# Operator quality-flag keys → tag written into the episode dir (survives save,
+# dropped on discard). See Session.flag_episode.
+_FLAG_KEYS = {"g": "re_grasp", "x": "bad", "s": "slow"}
+
+
+def _default_instruction(session) -> str | None:
+    """The instruction a bare save/next should stamp: prefer key '1', else the
+    first non-'0' mapping, else any — mirrors what the digit keys would save."""
+    m = getattr(session, "instruction_mappings", {}) or {}
+    if not m:
+        return None
+    if "1" in m:
+        return m["1"]
+    for k in sorted(m):
+        if k != "0":
+            return m[k]
+    return next(iter(m.values()), None)
+
+
+def _advance(session, action_lock: threading.Lock) -> None:
+    """RIGHT arrow — move the episode loop forward one step: idle → start a take;
+    recording → save it and go idle (reset the box, then → again for the next)."""
+    if getattr(session, "instruction_mappings", {}):
+        if session.is_recording:
+            _run_session_action_async(action_lock, session.end_episode,
+                                      save=True, instruction=_default_instruction(session))
+        else:
+            _run_session_action_async(action_lock, session.start_episode)
+    else:
+        _run_session_action_async(action_lock, session.toggle_recording)
+
+
+def _rerecord(session, action_lock: threading.Lock) -> None:
+    """LEFT arrow — repeat/re-record: discard the current take (if any) and start
+    a fresh one, so a fumbled take is redone with a single key."""
+    def _redo() -> None:
+        if session.is_recording:
+            session.end_episode(save=False)
+        session.start_episode()
+
+    _run_session_action_async(action_lock, _redo)
+
+
 def _read_keys(session, stop_event: threading.Event) -> None:
     """Read single keypresses from stdin without echoing.
 
@@ -255,6 +304,14 @@ def _read_keys(session, stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         if _stdin_ready():
             ch = sys.stdin.read(1)
+            if ch == "\x1b":                       # arrow escape seq: ESC [ or ESC O, then A/B/C/D
+                seq = sys.stdin.read(2) if _stdin_ready() else ""
+                arrow = seq[1] if len(seq) == 2 and seq[0] in "[O" else ""
+                if arrow == "C":                   # RIGHT → advance one step
+                    _advance(session, action_lock)
+                elif arrow == "D":                 # LEFT → re-record / repeat
+                    _rerecord(session, action_lock)
+                continue
             if ch == "r":
                 if getattr(session, "instruction_mappings", {}):
                     if not session.is_recording:
@@ -274,6 +331,8 @@ def _read_keys(session, stop_event: threading.Event) -> None:
                 _run_session_action_async(action_lock, session.end_episode, save=False)
             elif ch == " ":
                 session.toggle_pause()
+            elif ch in _FLAG_KEYS:                 # g/x/s → tag the current episode
+                _run_session_action_async(action_lock, session.flag_episode, _FLAG_KEYS[ch])
             elif ch == "q":
                 stop_event.set()
                 break
