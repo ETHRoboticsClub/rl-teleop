@@ -24,7 +24,29 @@ GRIPPER_SLIP_DROP = 0.15
 
 # A grasp/release must persist at least this long to count (debounce brief
 # adjustment twitches). Seconds.
-MIN_HOLD_S = 0.20
+#
+# Raised 0.20 → 0.50 on 2026-07-27, measured against the whole recorded corpus
+# (23 episodes, 192 grip intervals) with tools/diagnose_live_gate.py:
+#
+#     hold duration    n     p50      p75      p90
+#     ─────────────────────────────────────────────
+#     outcome=success  65    4.445s   6.999s   9.064s
+#     outcome=empty   124    0.300s   0.427s   1.169s
+#
+# Real picks and twitches are separated by an order of magnitude, and the old
+# 0.20 s let 124 sub-second open/close twitches into the event stream — they
+# swamped the cockpit's event log and each one reset the grasp state machine
+# mid-approach. Sweep of the cutoff:
+#
+#     0.3s → removes 62/124 twitches, loses 1/65 real grasps
+#     0.5s → removes 98/124 twitches, loses 1/65 real grasps   ← chosen
+#     0.6s → removes 101/124,         loses 3/65
+#     0.8s → removes 106/124,         loses 7/65
+#
+# 0.5 s is the knee: 79 % of the noise for the same single lost grasp (that one
+# is a 0.275 s pick, which is faster than a human teleop grasp can physically be
+# and is itself probably a mislabel). Re-run the sweep before changing this.
+MIN_HOLD_S = 0.50
 # A grasp must be followed by a lift within this window to be a real grasp
 # (a close with no lift is an adjustment, not a pick). Seconds.
 LIFT_WINDOW_S = 2.0
@@ -57,3 +79,16 @@ CLOCK_WINDOW_SLACK_S = 1.0
 FK_EE_LINK = "link_6"
 N_ARM_JOINTS = 6
 GRIPPER_JOINT_INDEX = 6
+
+# --- grasp workspace ---------------------------------------------------------
+# Grasps whose end-effector x is below this are outside the packet mat and are
+# not training data. Measured 2026-07-28 over the 81 successful grasps in the
+# corpus: sorted x has a 176 mm empty band from 0.178 to 0.354, with 4 grasps
+# below it. Those 4 also sit at z 0.162-0.226 against a corpus mean of 0.120 --
+# near AND high, i.e. mid-air or mislabelled, not table grasps. They come from
+# two different episodes (195935, 212500), so this is not one bad session.
+#
+# A fixed gate, not a 3-sigma rule: a statistical cut moves as the corpus grows,
+# so the same recording would be in one week and out the next. Any threshold in
+# [0.20, 0.30] drops exactly these 4; 0.25 sits mid-gap. Metres, robot base frame.
+GRASP_WORKSPACE_X_MIN = 0.25
