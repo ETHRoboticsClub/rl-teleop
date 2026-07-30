@@ -33,6 +33,7 @@ from robots_realtime.labeling.schema import (
     PlaceEvent,
     Segment,
 )
+from robots_realtime.labeling.segmentation import transported
 
 
 @dataclass
@@ -53,13 +54,13 @@ def _in_window(t: float, t_start: float, t_end: float) -> bool:
 def _transported(c: GraspCandidate, min_transport_m: float) -> bool:
     """Did the EE travel horizontally between grasp and release? A success grasp
     that re-opens where it closed (EE barely moved) is a re-grip/fumble at the
-    pick, not a placement. When either pose is missing, or the gate is disabled
-    (min_transport_m<=0), don't gate."""
-    if min_transport_m <= 0.0 or c.grasp_pose is None or c.release_pose is None:
-        return True
-    dx = c.release_pose[0] - c.grasp_pose[0]
-    dy = c.release_pose[1] - c.grasp_pose[1]
-    return (dx * dx + dy * dy) ** 0.5 >= min_transport_m
+    pick, not a placement.
+
+    Delegates to segmentation.transported so the OFFLINE gate here and the LIVE
+    cockpit gate in live.LiveLabeler can never disagree about what counts as a
+    placement. Do not reimplement the threshold locally.
+    """
+    return transported(c.grasp_pose, c.release_pose, min_transport_m)
 
 
 def _is_terminal(c: GraspCandidate, min_transport_m: float = 0.0) -> bool:

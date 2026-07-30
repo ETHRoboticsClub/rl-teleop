@@ -3,7 +3,7 @@
 Turns recorded kitting teleop episodes into structured, queryable labels, and
 drives the operator cockpit's live view as each bag is grasped and placed.
 
-Design + review history: `~/Desktop/sorting-red-box/kitting-labeling-plan.md`.
+Design + review history: `~/Desktop/kitting/cockpit/kitting-labeling-plan.md`.
 
 ## What it produces
 

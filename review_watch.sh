@@ -11,17 +11,33 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 REC="${1:-recordings}"
 PORT="${2:-8792}"
-SERVE_DIR="$(mktemp -d)"
+# Stable serve dir (NOT mktemp): the page survives Ctrl-C so you can keep reviewing,
+# and the episode videos are reachable via a symlink into the recordings tree.
+SERVE_DIR="$SCRIPT_DIR/.review"
 HTML="$SERVE_DIR/index.html"
+URL="http://localhost:${PORT}"
+mkdir -p "$SERVE_DIR"
+ln -sfn "$(cd "$REC" && pwd)" "$SERVE_DIR/recordings"   # <video src="recordings/...">
 
-echo "<!doctype html><meta http-equiv=refresh content=5><body style=background:#0d1117;color:#ccc;font-family:system-ui><p style=margin:40px>waiting for first episode…</p>" > "$HTML"
-( cd "$SERVE_DIR" && python3 -m http.server "$PORT" --bind 0.0.0.0 ) >/tmp/review_http.log 2>&1 &
-HTTP_PID=$!
-cleanup(){ kill "$HTTP_PID" 2>/dev/null || true; rm -rf "$SERVE_DIR"; }
+[ -f "$HTML" ] || echo "<!doctype html><meta http-equiv=refresh content=5><body style=background:#0d1117;color:#ccc;font-family:system-ui><p style=margin:40px>waiting for first episode…</p>" > "$HTML"
+if ! curl -s -o /dev/null --max-time 1 "$URL/"; then
+  # review_server.py, not http.server: the stdlib one ignores Range, so video
+  # seeking is dead and the big camera_scan mp4s stream from byte 0 every time.
+  python3 review_server.py "$SERVE_DIR" "$PORT" >/tmp/review_http.log 2>&1 &
+  HTTP_PID=$!
+fi
+cleanup(){ kill "${HTTP_PID:-}" 2>/dev/null || true; }   # keep SERVE_DIR: page stays readable
 trap cleanup EXIT
 
-echo "live review dashboard -> http://localhost:${PORT}  (auto-refreshes; regenerates on each saved episode)"
+echo "live review dashboard -> ${URL}  (auto-refreshes; regenerates on each saved episode)"
 echo "watching: $REC   (Ctrl-C to stop)"
+
+# Auto-open on the rig display, same pattern as record_kitting.sh. Non-fatal;
+# set REVIEW_NO_OPEN=1 to skip (e.g. when you only want the tunnel).
+if [ "${REVIEW_NO_OPEN:-0}" != "1" ]; then
+  export DISPLAY="${DISPLAY:-:2}"
+  ( xdg-open "$URL" >/dev/null 2>&1 || firefox --new-window "$URL" >/dev/null 2>&1 ) &
+fi
 
 SIG_PREV=""
 while true; do
@@ -36,7 +52,7 @@ while true; do
       fi
     done < <(find "$REC" -name 'yam_left.mcap' | sort)
     # (2) regenerate the dashboard + a concise console summary.
-    python3 review_corpus.py "$REC" --html "$HTML" >/tmp/review_last.txt 2>/dev/null
+    python3 review_corpus.py "$REC" --html "$HTML" --media-prefix recordings >/tmp/review_last.txt 2>/dev/null
     grep -E "usable \(|DEAD GRIPPER|CORRUPT mcap|MISLABEL|in target region|NOT CLEAR|CLEAR —|^    [0-9]\." /tmp/review_last.txt | sed 's/^/    /'
     echo "  [$(date +%H:%M:%S)] dashboard refreshed"
     SIG_PREV="$SIG"

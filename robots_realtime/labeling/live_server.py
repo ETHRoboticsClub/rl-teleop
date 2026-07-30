@@ -5,6 +5,7 @@ Serves the exact contract the cockpit polls:
     POST /seed             -> seed the kit, returns state
     GET  /cam/<id>         -> MJPEG proxied from --cam-base, else 404
     GET  /events           -> the live cockpit_events (debug / offline consistency)
+    POST /episodemode?m=   -> flip auto-advance live: grasp | full (cockpit "Takt")
 
 Point the cockpit's "live URL" at http://localhost:<port>. As the operator
 teleoperates, a feed pushes gripper samples into the LiveLabeler and the cockpit
@@ -30,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from robots_realtime.labeling import constants as C
+from robots_realtime.labeling.fk import ForwardKinematics
 from robots_realtime.labeling.live import LiveLabeler
 
 DEFAULT_KIT = [
@@ -63,11 +65,26 @@ KIT_NAMES = {
 
 
 def scanned_kit(dets):
-    """kit_from_detections with the current kit's fixed compartments + display names."""
+    """kit_from_detections with the current kit's fixed compartments + display names.
+
+    Every physical packet the scan sees becomes a row, including one whose number
+    could not be read or does not map to the catalog. Those are marked
+    ident="unknown" rather than dropped: a bag missing from the pick list is a bag
+    the operator cannot act on, and one unreadable label must not stall the kit.
+    Identity is only ever asserted from a real catalog match — never guessed.
+    """
     from robots_realtime.labeling.detector import kit_from_detections
     kit = kit_from_detections(dets, comp_of=KIT_CATALOG)
     for p in kit:
-        p["name"] = KIT_NAMES.get(p.get("part"), "")
+        part = p.get("part")
+        known = bool(part) and part in KIT_CATALOG
+        p["ident"] = "ok" if known else "unknown"
+        p["name"] = KIT_NAMES.get(part, "") if known else "Nicht erkannt"
+        if not known:
+            # No catalog match → no compartment. Showing one would be a guess, and a
+            # bag placed in a guessed compartment is a defect that leaves the cell.
+            p["comp"] = None
+            p["read"] = part or None      # keep the raw read (if any) for the operator
     return kit
 
 
@@ -167,21 +184,114 @@ def _state_with_detections(labeler: LiveLabeler, detector) -> dict:
         claimed[cands[0]] = True
         return parsed[cands[0]][1]
 
-    for pk in st["packets"]:
+    # A SKIPPED bag is still physically on the mat, so it keeps its box — but it must
+    # claim LAST. Skipped rows sit before the pointer, so in list order they would grab
+    # the scarce detections first and blank the box on the packet being picked right now.
+    # The entries are mutated in place, so visiting them in a different order is safe.
+    for pk in sorted(st["packets"], key=lambda p: p.get("status") == "skipped"):
+        # A PLACED packet is physically off the mat, so it must not claim a detection.
+        # With duplicate part ids (this kit runs 3 identical bags), a placed entry would
+        # otherwise steal the one box OCR read this window from the still-present CURRENT
+        # packet — and its orange "pick this next" overlay vanishes. Skipping placed
+        # entries also makes the current packet (first non-placed in kit order) claim
+        # first, so it wins the box whenever detections are scarce.
+        if pk.get("status") == "placed":
+            pk["bbox_px"] = None
+            pk["det_conf"] = 0.0
+            continue
         kp = parse_part(pk.get("part") or "")
         d = None
-        if kp:
+        if kp and pk.get("ident") != "unknown":
             mid, suf = kp[1], kp[2]
             d = _take(lambda p, _d: bool(p) and p[1] == mid and p[2] == suf)   # 1) exact id
             if d is None:
                 d = _take(lambda p, _d: bool(p) and p[1] == mid)               # 2) middle-only
+        else:
+            # An unidentified entry still has a physical bag behind it, so give it the
+            # matching unidentified detection. The operator has to SEE the bag the
+            # system could not name — that is the whole point of keeping the row.
+            d = _take(lambda p, _d: p is None)
         pk["bbox_px"] = d.bbox if d else None
         pk["det_conf"] = d.conf if d else 0.0
     return st
 
 
+class EpisodeMode:
+    """The auto-advance switch, flippable while a session runs.
+
+    This used to be a launch-time argument only: --episode-mode grasp wired the
+    labeler's on_place to rr-session's /record/next, and nothing could unwire it
+    short of restarting the backend. But auto-advance is exactly the feature an
+    operator wants to switch OFF the moment it misfires — a placement the gate
+    scores as real when it was a re-grip ends the take early, and the fix is to
+    take the takt back by hand, not to stop the session.
+
+    So the callback is now always installed and reads this object each time. The
+    read is a plain attribute under a lock: the joint feed fires it from its own
+    thread, the HTTP handler writes it from another.
+
+        full   the operator ends every take   (→ / Nächste / [1])
+        grasp  every gated placement saves the take and starts the next
+    """
+
+    VALID = ("full", "grasp")
+
+    def __init__(self, mode: str = "full"):
+        self._lock = threading.Lock()
+        self._mode = mode if mode in self.VALID else "full"
+
+    @property
+    def mode(self) -> str:
+        with self._lock:
+            return self._mode
+
+    @property
+    def auto(self) -> bool:
+        return self.mode == "grasp"
+
+    def set(self, mode: str) -> dict:
+        if mode not in self.VALID:
+            return {"ok": False, "error": f"mode must be one of {list(self.VALID)}",
+                    "episode_mode": self.mode}
+        with self._lock:
+            changed = mode != self._mode
+            self._mode = mode
+        if changed:
+            print(f"[live] episode-mode → {mode}"
+                  + ("  (each gated placement saves the take and starts the next)"
+                     if mode == "grasp" else "  (you end every take yourself)"))
+        return {"ok": True, "episode_mode": mode, "changed": changed}
+
+
+def make_auto_advance(control_url: str, episode_mode: EpisodeMode):
+    """The labeler's on_place callback: save this take and start the next one.
+
+    Always installed, but a no-op unless the switch is on. Keeping the wiring
+    constant and gating inside is what makes the toggle safe to flip mid-take —
+    there is no window where on_place is being reassigned under the feed thread.
+    """
+    import urllib.request as _u
+
+    ctl = control_url.rstrip("/")
+
+    def _advance() -> None:
+        if not episode_mode.auto:
+            return
+        req = _u.Request(ctl + "/record/next", data=b"{}", method="POST",
+                         headers={"Content-Type": "application/json"})
+        try:
+            with _u.urlopen(req, timeout=2) as r:
+                r.read()
+        except Exception as e:
+            # Never fatal: the operator can still end the take by hand.
+            print(f"[live] auto-advance failed ({e}) — end the take with [1] or the cockpit")
+
+    return _advance
+
+
 def _make_handler(labeler: LiveLabeler, cam_base: str | None,
-                  bridge: "CameraBridge | None" = None, detector=None):
+                  bridge: "CameraBridge | None" = None, detector=None,
+                  episode_mode: EpisodeMode | None = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -204,7 +314,11 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
 
         def do_GET(self):
             if self.path == "/state":
-                self._json(_state_with_detections(labeler, detector))
+                st = _state_with_detections(labeler, detector)
+                # The cockpit renders the takt switch from this, never from a
+                # local flag — same rule as the recorder transport.
+                st["episode_mode"] = episode_mode.mode if episode_mode else "full"
+                self._json(st)
             elif self.path == "/events":
                 self._json(labeler.events)
             elif self.path.startswith("/cam/"):
@@ -232,16 +346,37 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
             elif self.path == "/advance":
                 labeler.advance()
                 self._json(labeler.state())
+            elif self.path.startswith("/skip"):
+                # Step past the current packet without claiming it was placed, so one
+                # unreadable label can never hold up the rest of the kit.
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                labeler.skip((q.get("reason") or ["unidentified"])[0])
+                self._json(_state_with_detections(labeler, detector))
             elif self.path.startswith("/recalc"):
-                # manual re-scan: drop held/merged/stale boxes and detect fresh right now
-                if detector is not None:
-                    detector.recalibrate_now()
-                self._json({"ok": detector is not None,
-                            **(detector.status() if detector is not None else {})})
+                # Manual re-scan: drop held/merged/stale boxes and detect fresh right now.
+                # WAIT for that scan to land before answering — returning immediately meant
+                # replying with the pre-rescan box count, so the cockpit panel showed an
+                # unchanged number and the ⟳ button looked like it had done nothing. One
+                # cycle is ~2-3s (full-res OCR); past the budget we say so instead of lying.
+                if detector is None:
+                    self._json({"ok": False, "reason": "no detector"})
+                else:
+                    done = detector.recalibrate_now(wait_s=8.0)
+                    self._json({"ok": True, "rescanned": done, **detector.status()})
             elif self.path.startswith("/autotune"):
                 # sweep exposure to match the current lighting, pick the best, re-scan
                 self._json(detector.autotune() if detector is not None
                            else {"ok": False, "reason": "no detector"})
+            elif self.path.startswith("/episodemode"):
+                # Flip auto-advance live: /episodemode?m=grasp|full  (cockpit "Takt")
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                m = (q.get("m") or [""])[0]
+                if episode_mode is None:
+                    self._json({"ok": False, "error": "no episode-mode switch on this server"})
+                else:
+                    self._json(episode_mode.set(m))
             elif self.path.startswith("/trackmode"):
                 # switch the box tracker: /trackmode?m=ocr|contour|sam
                 from urllib.parse import parse_qs, urlparse
@@ -318,10 +453,11 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
 
 class LiveLabelServer:
     def __init__(self, labeler: LiveLabeler, port: int = 8791, cam_base: str | None = None,
-                 bridge: "CameraBridge | None" = None, host: str = "127.0.0.1", detector=None):
+                 bridge: "CameraBridge | None" = None, host: str = "127.0.0.1", detector=None,
+                 episode_mode: EpisodeMode | None = None):
         self.labeler = labeler
-        self._httpd = ThreadingHTTPServer((host, port),
-                                          _make_handler(labeler, cam_base, bridge, detector))
+        self._httpd = ThreadingHTTPServer(
+            (host, port), _make_handler(labeler, cam_base, bridge, detector, episode_mode))
         self.port = port
 
     def serve_forever(self):
@@ -338,22 +474,28 @@ class LiveLabelServer:
 
 def _feed_from_source(labeler: LiveLabeler, next_sample, stop=None,
                       poll_s: float = 0.005) -> None:
-    """Pump (ts, gripper_width) from ``next_sample()`` into the labeler until
-    stop is set. ``next_sample`` returns (ts, width) or None when nothing new.
+    """Pump (ts, gripper_width, ee_pos) from ``next_sample()`` into the labeler
+    until stop is set. ``next_sample`` returns (ts, width, ee_pos) or None when
+    nothing new; ee_pos may be None when joint data is unavailable (the transport
+    gate then fails open and the cockpit flags it).
     Deduplicates on ts so the latest-per-topic subscriber isn't re-pushed."""
     last_ts = None
     while stop is None or not stop.is_set():
         s = next_sample()
         if s is not None:
-            ts, width = s
+            # Accept (ts, width) as well as (ts, width, ee_pos): a source that
+            # cannot supply poses must degrade to the ungated behavior, never
+            # crash the feed thread and take live labeling down with it.
+            ts, width, ee_pos = s if len(s) == 3 else (s[0], s[1], None)
             if ts != last_ts:
                 last_ts = ts
-                labeler.push(float(ts), float(width))
+                labeler.push(float(ts), float(width), ee_pos)
         time.sleep(poll_s)
 
 
 def bus_feed(labeler: LiveLabeler, arm: str = "left", host: str = "127.0.0.1",
-             port: int | None = None, stop=None) -> None:
+             port: int | None = None, stop=None,
+             urdf_path: str = "urdf/yam.urdf") -> None:
     """Subscribe to the live rl-teleop joint stream and drive the labeler.
 
     The follower publishes ``yam_{arm}/joint_state`` = {"joint_pos": [...7...]}
@@ -365,6 +507,15 @@ def bus_feed(labeler: LiveLabeler, arm: str = "left", host: str = "127.0.0.1",
 
     topic = f"yam_{arm}/joint_state"
     sub = Subscriber([topic], host=host, port=port or DEFAULT_SUB_PORT)
+
+    # The transport gate needs where the gripper IS, not just how open it is. The
+    # arm joints already ride in the same envelope as gripper_pos, so this costs
+    # one FK per sample (~89 us, 1.8% of a core at 200 Hz) and no new subscription.
+    fk = None
+    try:
+        fk = ForwardKinematics(urdf_path)
+    except Exception as e:                      # missing/!parseable URDF
+        print(f"[live] no FK ({e}) — transport gate disabled, re-grasps will advance")
 
     def next_sample():
         env = sub.get_latest(topic)
@@ -378,7 +529,14 @@ def bus_feed(labeler: LiveLabeler, arm: str = "left", host: str = "127.0.0.1",
         if grip is None or ts is None:
             return None
         width = float(grip[0]) if hasattr(grip, "__len__") else float(grip)
-        return float(ts), width
+        ee_pos = None
+        joints = data.get("joint_pos")
+        if fk is not None and joints is not None and len(joints) >= C.N_ARM_JOINTS:
+            try:
+                ee_pos = fk.ee_pose(list(joints)[: C.N_ARM_JOINTS])[:3]
+            except Exception:
+                ee_pos = None                   # never let FK kill the feed
+        return float(ts), width, ee_pos
 
     _feed_from_source(labeler, next_sample, stop=stop)
 
@@ -391,10 +549,22 @@ def write_cockpit_events(labeler: LiveLabeler, path: str | Path) -> None:
 
 
 def replay_feed(labeler: LiveLabeler, times, positions, realtime: bool = True,
-                speed: float = 1.0) -> None:
-    """Push a joint timeline into the labeler, optionally pacing in real time."""
+                speed: float = 1.0, urdf_path: str | None = "urdf/yam.urdf") -> None:
+    """Push a joint timeline into the labeler, optionally pacing in real time.
+
+    Computes EE positions so a replay exercises the SAME transport gate as the
+    live bus feed — a replay that skipped the gate would report advance counts the
+    real rig never produces. Pass urdf_path=None to replay without the gate.
+    """
     times = np.asarray(times, float)
-    gripper = np.asarray(positions, float)[:, C.GRIPPER_JOINT_INDEX]
+    pos = np.asarray(positions, float)
+    gripper = pos[:, C.GRIPPER_JOINT_INDEX]
+    ee = None
+    if urdf_path is not None:
+        try:
+            ee = ForwardKinematics(urdf_path).ee_positions(pos[:, : C.N_ARM_JOINTS])
+        except Exception:
+            ee = None
     t0 = times[0] if times.size else 0.0
     wall0 = time.monotonic()
     for i in range(times.size):
@@ -403,7 +573,8 @@ def replay_feed(labeler: LiveLabeler, times, positions, realtime: bool = True,
             dt = target - (time.monotonic() - wall0)
             if dt > 0:
                 time.sleep(dt)
-        labeler.push(float(times[i]), float(gripper[i]))
+        labeler.push(float(times[i]), float(gripper[i]),
+                     None if ee is None else ee[i])
 
 
 def _demo_episode():
@@ -545,9 +716,38 @@ def main(argv=None):
                     help="rr-session recordings root; watch it to save kit.json + auto-label")
     ap.add_argument("--auto-label", action="store_true",
                     help="run label_episode on each saved episode → annotations.json")
+    ap.add_argument("--episode-mode", default="full", choices=["full", "grasp"],
+                    help=(
+                        "STARTING position of a switch that stays live all session "
+                        "(cockpit Takt control / POST /episodemode?m=...).  "
+                        "full  = one episode per BOX; the operator ends it (default, "
+                        "current behaviour).  "
+                        "grasp = one episode per GRASP-AND-PLACE cycle; each gated "
+                        "successful placement saves the take and starts the next, "
+                        "hands-free. Needs --control-url (rr-session's control port)."
+                    ))
+    ap.add_argument("--control-url", default="http://localhost:8792",
+                    help="rr-session control surface, used by --episode-mode grasp")
     args = ap.parse_args(argv)
 
     labeler = LiveLabeler(open_ref=args.open_ref, closed_ref=args.closed_ref)
+
+    # Auto-advance ("grasp" mode): one saved episode per grasp-and-place cycle.
+    # The labeler already knows the exact instant a placement passes the
+    # transport gate; all that was missing was telling the recorder.
+    #
+    # --episode-mode only picks the STARTING position now. The switch is live
+    # for the whole session — POST /episodemode?m=grasp|full, or the Takt
+    # control in the cockpit — because the moment auto-advance misfires is the
+    # moment you want the takt back, without restarting anything.
+    episode_mode = EpisodeMode(args.episode_mode)
+    labeler.on_place = make_auto_advance(args.control_url, episode_mode)
+    if episode_mode.auto:
+        print(f"[live] episode-mode=grasp — each placement saves a take via "
+              f"{args.control_url.rstrip('/')} (switchable: cockpit Takt / POST /episodemode)")
+    else:
+        print("[live] episode-mode=full — one episode per box; you end it ([1] or cockpit) "
+              "(switchable: cockpit Takt / POST /episodemode)")
     labeler.seed(DEFAULT_KIT)
 
     bridge = None
@@ -596,7 +796,8 @@ def main(argv=None):
         print(f"Watching {args.save_root} (kit.json + auto-label={args.auto_label})")
 
     server = LiveLabelServer(labeler, port=args.port, cam_base=args.cam_base,
-                             bridge=bridge, host=args.host, detector=detector)
+                             bridge=bridge, host=args.host, detector=detector,
+                             episode_mode=episode_mode)
     server.start_background()
     print(f"Live label backend on http://{args.host}:{args.port}  (point the cockpit here)")
 

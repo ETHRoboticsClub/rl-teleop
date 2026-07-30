@@ -14,8 +14,14 @@ __pycache__/
 .ruff_cache/
 .env
 recordings/
+.review/
 .omo/*
 !.omo/drafts/
 !.omo/drafts/**
 !.omo/plans/
 !.omo/plans/**
+outputs/
+*.pt
+.review-grasps/
+.omc/
+*.bak-viser

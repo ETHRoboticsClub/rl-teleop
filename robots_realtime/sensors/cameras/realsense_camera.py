@@ -229,6 +229,29 @@ class RealSenseCamera(CameraDriver):
         self._use_infrared = not has_color
         self._configure_exposure()
 
+        # Populate intrinsics. _read_intrinsics() was defined but never called,
+        # so intrinsic_data kept its empty-dict default and every frame went out
+        # with `intrinsics: {}`. That is silent: CameraNode still publishes the
+        # key, and ViserMonitorNode._update_depth_cloud simply returns early
+        # when _intrinsics_matrix() can't build a 3x3 from it -- so the depth
+        # point cloud rendered nothing, with no error anywhere. Depth is
+        # unusable without K, so this has to happen before any frame is read.
+        #
+        # Must be here rather than in __post_init__: it reads self._profile,
+        # which only exists once pipe.start() has returned. Being at the tail of
+        # _start_pipeline_once also covers _restart_pipeline(), which re-enters
+        # this method after a read timeout and would otherwise wipe intrinsics.
+        #
+        # Side effect by design: this also fills self._depth_intrinsic_data,
+        # which read() emits as `depth_intrinsics` when depth is NOT aligned.
+        self.intrinsic_data = self._read_intrinsics()
+        if not self.intrinsic_data:
+            logger.warning(
+                "RealSenseCamera %s: intrinsics unavailable; depth consumers "
+                "(point cloud, deprojection) will not work",
+                self.device_id or "auto",
+            )
+
     def _restart_pipeline(self) -> None:
         if self._pipeline is not None:
             try:

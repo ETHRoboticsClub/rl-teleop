@@ -4,7 +4,7 @@
 WHY THIS FILE EXISTS. `dark_noise` was defined in the `lerobot-edit-scripts`
 fork, which was lost in the 2026-05-16 migration off the `ethrc` account. Only
 its config YAML survives, inside
-`~/Desktop/handoff-2026-05-16/patches/lerobot-edit-scripts-commits/0005-*.patch`.
+`~/Desktop/_archive/handoff-2026-05-16/patches/lerobot-edit-scripts-commits/0005-*.patch`.
 That YAML names three transforms stock LeRobot does not know:
 
     GaussianNoise · RandomAutocontrast · GaussianBlur

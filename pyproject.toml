@@ -45,11 +45,17 @@ dependencies = [
     "rerun-sdk",
     "ruckig",
     "easyocr",
+    # PINNED TO A CUDA BUILD ON PURPOSE -- see [[tool.uv.index]] below.
+    # torch arrives transitively via lerobot[feetech] and easyocr, so without
+    # these two lines uv resolves it from PyPI, which ships the cu126 build.
+    "torch==2.7.1",
+    "torchvision==0.22.1",
 ]
 
 [project.scripts]
 rr-session = "robots_realtime.rr_session_cli:main"
 rr-replay  = "robots_realtime.rr_replay_cli:main"
+rr-bus     = "robots_realtime.rr_bus_cli:main"
 
 [project.optional-dependencies]
 sensors = [
@@ -65,8 +71,35 @@ sim = [
     "gymnasium>=0.29",
 ]
 
+# TORCH MUST COME FROM THE cu128 INDEX, NOT PyPI.
+#
+# The rig's GPU is a 5090 (sm_120). PyPI's torch 2.7.1 is built against cu126,
+# which has NO KERNELS for sm_120: torch.cuda.is_available() returns True, the
+# device name reports correctly, and the first matmul dies with "no kernel image
+# is available for execution on the device".
+#
+# Before this pin, `uv run <anything>` re-synced from uv.lock and swapped a
+# hand-installed cu128 torch back to cu126 -- 14 packages, silently, in under a
+# second. Measured 2026-07-29: starting the arm session with `uv run rr-session`
+# did exactly that, and the failure only surfaces later as the policy losing the
+# GPU, which reads as "the policy is bad" rather than "the install changed".
+#
+# `explicit = true` means this index is used ONLY for the packages mapped to it
+# below, so nothing else in the graph gets resolved against the PyTorch mirror.
+#
+# IF A NON-BLACKWELL MACHINE JOINS THIS PROJECT: cu128 needs driver >= 525 and is
+# fine on Ampere/Ada too, so this should not need per-machine branching. If one
+# genuinely needs cu126, make the index choice conditional rather than reverting
+# this -- going back to PyPI silently breaks the 5090.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [tool.uv.sources]
-panda_python = { path = "dependencies/panda_py_0.7.5_libfranka_0.10.0/panda_python-0.7.5+libfranka.0.10.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+panda_python ={ path = "dependencies/panda_py_0.7.5_libfranka_0.10.0/panda_python-0.7.5+libfranka.0.10.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }
 pyzed = { path = "dependencies/pyzed-5.1-cp311-cp311-linux_x86_64.whl" }
 i2rt = { path = "dependencies/i2rt", editable = true }
 lerobot_teleoperator_yamactiveleader = { path = "dependencies/lerobot_teleoperator_yamactiveleader", editable = true }

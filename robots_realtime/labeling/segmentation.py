@@ -60,8 +60,17 @@ def normalize_width(width_raw, open_ref: float | None = None,
     return norm
 
 
-def _classify(hold_vals: np.ndarray, t_close: float, t_arr: np.ndarray,
-              ee_z: np.ndarray | None) -> tuple[float, float, str, bool | None]:
+def classify_hold(hold_vals: np.ndarray, t_close: float, t_arr: np.ndarray,
+                  ee_z: np.ndarray | None) -> tuple[float, float, str, bool | None]:
+    """Classify one closed-gripper hold → (hold_norm, min_norm, outcome, lifted).
+
+    PUBLIC because the LIVE cockpit labeler (live.OnlineGripSegmenter) calls it on
+    its accumulated hold buffer. Both labelers running the identical classifier is
+    the only reliable way to keep them agreeing: when the live path had its own
+    copy, it used the mean instead of the median and measured lift over the whole
+    hold instead of LIFT_WINDOW_S, and a single 8-second hold then read
+    lifted=True live / False offline. Do not fork this.
+    """
     hold_norm = float(np.median(hold_vals))
     min_norm = float(np.min(hold_vals))
     slipped = min_norm < hold_norm - C.GRIPPER_SLIP_DROP
@@ -110,14 +119,62 @@ def detect_grip_intervals(times, width_raw, ee_z=None,
         else:
             hold.append(float(w[i]))
             if w[i] > C.GRIPPER_CLOSE_EXIT:
-                hn, mn, oc, lifted = _classify(np.asarray(hold), t_close, t, z)
+                hn, mn, oc, lifted = classify_hold(np.asarray(hold), t_close, t, z)
                 intervals.append(GripInterval(t_close, float(t[i]), hn, mn, oc, lifted))
                 closed = False
     if closed:
-        hn, mn, oc, lifted = _classify(np.asarray(hold), t_close, t, z)
+        hn, mn, oc, lifted = classify_hold(np.asarray(hold), t_close, t, z)
         intervals.append(GripInterval(t_close, None, hn, mn, oc, lifted))
 
     # Debounce: drop intervals shorter than MIN_HOLD_S (adjustment twitches).
     end = float(t[-1])
     return [iv for iv in intervals
             if (iv.t_open if iv.t_open is not None else end) - iv.t_close >= C.MIN_HOLD_S]
+
+
+# ── Transport gate ────────────────────────────────────────────────────────────
+# Shared by the OFFLINE labeler (fuse._transported) and the LIVE cockpit labeler
+# (live.LiveLabeler). ONE implementation on purpose: these two segmenters have
+# already drifted apart once (live had no lift check), and a threshold rule that
+# exists in two places will drift again.
+#
+# Measured over 46 recorded grip intervals, the two populations are cleanly
+# bimodal with an 8.7 cm empty gap, so the exact threshold is not sensitive
+# (8/10/12/14 cm all classify identically):
+#
+#     re-grasp / fumble at the pick        real pick → place
+#     ●●●●●●●●●●●●●●●●●● n=18              ●●●●●●●●●●●●●●●● n=28
+#     0.1 cm ....... 5.8 cm       14.5 cm ....... 48.1 cm
+#                       └──── 8.7 cm empty ────┘
+#                                ▲
+#                       C.MIN_TRANSPORT_M = 10 cm
+
+def transport_distance_m(pose_a, pose_b) -> float | None:
+    """Horizontal (XY) distance between two EE poses. None if either is missing."""
+    if pose_a is None or pose_b is None:
+        return None
+    dx = float(pose_b[0]) - float(pose_a[0])
+    dy = float(pose_b[1]) - float(pose_a[1])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def transport_ok(distance_m: float | None, min_transport_m: float) -> bool:
+    """The threshold rule itself, expressed exactly once.
+
+    FAILS OPEN (True) when the gate is disabled or the distance is unknown. A
+    missing measurement must never silently freeze the kit pointer; callers
+    surface that case as a visible warning instead.
+    """
+    if min_transport_m <= 0.0 or distance_m is None:
+        return True
+    return distance_m >= min_transport_m
+
+
+def transported(pose_a, pose_b, min_transport_m: float) -> bool:
+    """Did the EE travel far enough grasp→release to be a real placement?
+
+    Pose-pair form, used by the OFFLINE labeler which has both poses in hand. The
+    LIVE labeler measures the distance incrementally and calls transport_ok
+    directly — both funnel through the same threshold rule.
+    """
+    return transport_ok(transport_distance_m(pose_a, pose_b), min_transport_m)

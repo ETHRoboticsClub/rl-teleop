@@ -6,7 +6,7 @@ grasp/release keyframes, phase segments, placement correctness, and FK/IK
 tracking error. Human corrections live in a separate ``corrections.json`` and
 are merged on read.
 
-Design notes (see ~/Desktop/sorting-red-box/kitting-labeling-plan.md):
+Design notes (see ~/Desktop/kitting/cockpit/kitting-labeling-plan.md):
   * The raw recording is never modified. ``annotations.json`` is regenerable.
   * No gripper force sensor exists — grasp/slip come from gripper WIDTH
     (position, motor index 6) + vision, never "gripper effort".

@@ -5,7 +5,9 @@ Renders at 10 Hz.  Keyboard shortcuts work in the same terminal.
 
 from __future__ import annotations
 
+import os
 import re
+import select
 import sys
 import termios
 import threading
@@ -256,6 +258,12 @@ def _run_session_action_async(action_lock: threading.Lock, fn, *args, **kwargs) 
 # dropped on discard). See Session.flag_episode.
 _FLAG_KEYS = {"g": "re_grasp", "x": "bad", "s": "slow"}
 
+# Module-level so the HTTP control surface (runtime/control_server.py) can take
+# the SAME lock. The cockpit and the keyboard are peers driving one session —
+# without a shared lock, clicking REC while a save is still flushing would run
+# two session actions at once.
+ACTION_LOCK = threading.Lock()
+
 
 def _default_instruction(session) -> str | None:
     """The instruction a bare save/next should stamp: prefer key '1', else the
@@ -295,18 +303,58 @@ def _rerecord(session, action_lock: threading.Lock) -> None:
     _run_session_action_async(action_lock, _redo)
 
 
+def _read_arrow(fd: int, timeout: float = 0.05) -> str:
+    """After an ESC byte, read the rest of an ESC[X / ESCOX sequence.
+
+    Returns the final letter ("A".."D") or "" for a bare ESC / anything else.
+
+    Reads the fd DIRECTLY (os.read) rather than through sys.stdin. A terminal
+    emits the whole 3-byte arrow sequence in one write, and sys.stdin.read(1)
+    pulls all 3 bytes into the TextIOWrapper's internal buffer while returning
+    only the ESC — after which select() on the fd reports "not ready" because
+    the remaining "[C" lives in Python's buffer, not the kernel's. Gating the
+    continuation read on select() therefore dropped every arrow key.
+    """
+    buf = b""
+    deadline = time.monotonic() + timeout
+    while len(buf) < 2:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            break
+        try:
+            chunk = os.read(fd, 2 - len(buf))
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    if len(buf) == 2 and buf[:1] in (b"[", b"O"):
+        return buf[1:].decode("ascii", errors="ignore")
+    return ""
+
+
 def _read_keys(session, stop_event: threading.Event) -> None:
     """Read single keypresses from stdin without echoing.
 
     Terminal setup (setcbreak) is owned by run_tui, not here.
+
+    Keys are read with os.read on the raw fd so that select() stays an accurate
+    "bytes are waiting" signal — see _read_arrow for why buffering through
+    sys.stdin breaks multi-byte escape sequences.
     """
-    action_lock = threading.Lock()
+    action_lock = ACTION_LOCK          # shared with the HTTP control surface
+    fd = sys.stdin.fileno()
     while not stop_event.is_set():
         if _stdin_ready():
-            ch = sys.stdin.read(1)
+            try:
+                raw = os.read(fd, 1)
+            except OSError:
+                break
+            if not raw:                            # EOF (stdin closed)
+                break
+            ch = raw.decode("utf-8", errors="ignore")
             if ch == "\x1b":                       # arrow escape seq: ESC [ or ESC O, then A/B/C/D
-                seq = sys.stdin.read(2) if _stdin_ready() else ""
-                arrow = seq[1] if len(seq) == 2 and seq[0] in "[O" else ""
+                arrow = _read_arrow(fd)
                 if arrow == "C":                   # RIGHT → advance one step
                     _advance(session, action_lock)
                 elif arrow == "D":                 # LEFT → re-record / repeat

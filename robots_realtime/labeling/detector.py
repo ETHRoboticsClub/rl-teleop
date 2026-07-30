@@ -26,6 +26,7 @@ import re
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -92,8 +93,14 @@ class Detection:
 
 
 def detect_blobs(frame: np.ndarray, min_area: int = 1500,
-                 thresh: int = 140) -> list[list[int]]:
-    """Bright packets on the dark mat → list of [x,y,w,h] pixel bboxes."""
+                 thresh: int = 140, max_area_frac: float = 0.6) -> list[list[int]]:
+    """Bright packets on the dark mat → list of [x,y,w,h] pixel bboxes.
+
+    ``max_area_frac`` caps a blob's share of the frame. The default 0.6 only
+    rejects a near-full-frame background; callers that need to tell a BAG from
+    scene furniture (a calibration board left in shot measures ~0.34 of frame,
+    a bag ~0.14) should pass something tighter.
+    """
     import cv2
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if frame.ndim == 3 and frame.shape[2] == 3 else frame
     _, th = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
@@ -105,10 +112,17 @@ def detect_blobs(frame: np.ndarray, min_area: int = 1500,
         if cv2.contourArea(c) < min_area:
             continue
         x, y, w, h = cv2.boundingRect(c)
-        if w * h > 0.6 * W * H:      # skip a near-full-frame blob (background)
+        if w * h > max_area_frac * W * H:      # scene furniture / background, not a packet
             continue
         out.append([int(x), int(y), int(w), int(h)])
     return out
+
+
+def _center_in(box: list[int], other: list[int]) -> bool:
+    """Is box's centre inside other?"""
+    cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+    return (other[0] <= cx <= other[0] + other[2]
+            and other[1] <= cy <= other[1] + other[3])
 
 
 def enhance_for_ocr(frame, gamma: float = 1.0):
@@ -220,6 +234,11 @@ class PacketDetector:
     callable returning the latest scan RGB frame (H,W,3) uint8 or None.
     """
 
+    # Concurrency for the autotune gamma sweep. Each worker holds its own easyocr
+    # Reader (~290MB RSS), created on first use and kept for later sweeps, so this
+    # is a speed-vs-memory dial, not a free one.
+    SWEEP_WORKERS = 4
+
     def __init__(self, frame_source, known_source, period_s: float = 2.0,
                  gpu: bool = False, hold_seconds: float = 5.0, min_conf: float = 0.5,
                  mode: str = "ocr", margin: int = 0):
@@ -254,6 +273,15 @@ class PacketDetector:
         self._stop = threading.Event()
         self._kick = threading.Event()   # wake the loop early (manual recalc)
         self._reset = False              # drop held boxes + reset expected on next cycle
+        # Recalc completion tracking. The cockpit's ⟳ Recalculate used to return
+        # status() the instant it set the flag above — i.e. the box count from BEFORE
+        # the rescan — so the panel showed a stale number and the button looked dead.
+        # recalibrate_now(wait_s=...) now blocks until the loop has actually finished a
+        # cycle that consumed this request, so the caller reports the real new count.
+        self._reset_gen = 0              # bumped per recalc request
+        self._served_gen = 0            # highest request the loop has fully re-scanned
+        self._cycle_cv = threading.Condition()
+        self._sweep_readers: dict[int, object] = {}   # per-thread OCR readers for autotune
         self._expected = 0             # high-water mark of packets seen (recalibration target)
         self._recalibrate = True       # sweep exposure/gamma when we come up short
         self._vote_window = 15         # per-packet reads kept for the temporal identity vote
@@ -275,14 +303,16 @@ class PacketDetector:
         return self._reader
 
     def detect_once(self, frame: np.ndarray, known=None,
-                    gamma: float = 1.0) -> list[Detection]:
+                    gamma: float = 1.0, reader=None) -> list[Detection]:
         """Read EVERY packet on the scan frame: enhance for OCR (white-balance +
         gamma + contrast), OCR, group each printed part number (prefix + 5-digit
         middle + 3-digit suffix) into one box, then dedupe/clean. ``gamma`` is the
         software exposure used by the recalibration sweep. ``known`` (optional) snaps
-        a read to the closest catalog SKU."""
+        a read to the closest catalog SKU. ``reader`` overrides the shared easyocr
+        reader — the parallel autotune sweep passes one reader per worker thread,
+        since easyocr Readers are not thread-safe."""
         try:
-            res = self._ocr().readtext(enhance_for_ocr(frame, gamma))
+            res = (reader or self._ocr()).readtext(enhance_for_ocr(frame, gamma))
         except Exception:
             # OCR unavailable → fall back to unidentified blobs (cockpit uses order)
             return [Detection(b, None, 0.0) for b in detect_blobs(frame)]
@@ -333,7 +363,39 @@ class PacketDetector:
             part = f"{pre[0]}-{mid}-{(suf[0] if suf else '000')}"
             box = boxer(mbb, mctr)
             dets.append(Detection([int(v) for v in box], part, round(mconf, 2)))
-        return _clean_dets(dets, self.min_conf)
+        named = _clean_dets(dets, self.min_conf)
+        return named + self._unnamed_blobs(frame, named)
+
+    # A blob larger than this share of the frame is scene furniture (a calibration
+    # board, the tray, a shadow), not a bag. Measured: board ~0.34, bag ~0.14.
+    MAX_BAG_AREA_FRAC = 0.25
+
+    def _unnamed_blobs(self, frame, named: list["Detection"]) -> list["Detection"]:
+        """Bags the silhouette pass can see but OCR could not name.
+
+        Without this an unreadable bag simply does not exist: the kit is built from
+        detections, so it is silently absent from the pick list and the operator is
+        left with five bags in front of them and one row on screen. Emitting it with
+        part=None keeps it in the pipeline as an explicit "not identified" entry the
+        cockpit can flag and the operator can skip — strictly better than a missing
+        row nobody can act on, and it never invents an identity.
+        """
+        try:
+            blobs = detect_blobs(frame, max_area_frac=self.MAX_BAG_AREA_FRAC)
+        except Exception:
+            return []
+        out = []
+        for b in blobs:
+            b = [int(v) for v in b]
+            # A blob that already carries a named read IS that packet. Test both
+            # directions: the OCR heuristic box can be smaller than the silhouette
+            # or, with `margin` cranked up, larger than it.
+            if any(_center_in(b, d.bbox) or _center_in(d.bbox, b) for d in named):
+                continue
+            if any(_center_in(b, o.bbox) for o in out):     # one entry per silhouette
+                continue
+            out.append(Detection(b, None, 0.0))
+        return out
 
     # ---- pluggable box trackers (switch live via /trackmode) ----------------------------
 
@@ -450,6 +512,10 @@ class PacketDetector:
         # it's been gone that long (picked / removed).
         held: list[dict] = []          # {"bbox": [x,y,w,h], "reads": deque, "seen": monotonic}
         while not self._stop.is_set():
+            # Snapshot the recalc request this cycle will satisfy BEFORE doing the work,
+            # so a request arriving mid-cycle is served by the NEXT cycle, not credited to
+            # this one (which already read its frame and never dropped the held boxes).
+            pending = self._reset_gen
             if self._reset:                        # manual /recalc: forget everything, re-scan clean
                 held = []
                 self._expected = 0
@@ -508,6 +574,11 @@ class PacketDetector:
                         self._wh = [int(frame.shape[1]), int(frame.shape[0])]
                 except Exception:
                     pass
+            # publish: this cycle's boxes are live, so anyone blocked in
+            # recalibrate_now(wait_s=...) can now read a post-rescan count
+            with self._cycle_cv:
+                self._served_gen = max(self._served_gen, pending)
+                self._cycle_cv.notify_all()
             # sleep until the next cycle OR until a manual recalc kicks us awake
             if self._kick.wait(self._period):
                 self._kick.clear()
@@ -521,11 +592,29 @@ class PacketDetector:
 
     # ---- runtime controls (driven by the cockpit debug panel) --------------------------
 
-    def recalibrate_now(self) -> None:
+    def recalibrate_now(self, wait_s: float = 0.0) -> bool:
         """Drop all held boxes and re-scan from scratch on the next (immediate) cycle.
-        Use after moving/adding bags so stale or merged boxes clear at once."""
+        Use after moving/adding bags so stale or merged boxes clear at once.
+
+        With ``wait_s`` > 0, block until the loop has finished a cycle that consumed
+        THIS request (so ``status()`` afterwards reports the rescanned boxes, not the
+        stale ones) and return whether that happened inside the budget. The default 0
+        keeps mode/margin switches instant — they only need the rescan queued."""
+        with self._cycle_cv:
+            self._reset_gen += 1
+            target = self._reset_gen
         self._reset = True
         self._kick.set()
+        if wait_s <= 0:
+            return False
+        deadline = time.monotonic() + wait_s
+        with self._cycle_cv:
+            while self._served_gen < target:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False                   # still scanning; caller reports "pending"
+                self._cycle_cv.wait(left)
+        return True
 
     def set_mode(self, mode: str) -> dict:
         """Switch the box tracker: 'ocr' | 'contour' | 'sam'. Applies on the next cycle.
@@ -559,17 +648,78 @@ class PacketDetector:
         if frame is None:
             return {"ok": False, "reason": "no scan frame"}
         frame = np.asarray(frame)
-        sweep = []
+        known = self._known_source() or None
+        t0 = time.monotonic()
+        # The passes are independent, so run them concurrently. Measured on the rig
+        # (32 cores, 1280x720, 8 gammas): 15.7s serial -> 6.5s at 8 workers x 2 torch
+        # threads, with an IDENTICAL sweep. Downscaling the frame was tried first and is
+        # not an option — at 0.75 scale the part numbers stop reading (4 reads -> 1) and
+        # below that they vanish entirely, so the sweep would tune on noise.
+        scored = self._sweep(frame, known, gammas)
         best_g, best_n = self._gamma, -1
-        for g in gammas:
-            dets = self.detect_once(frame, self._known_source() or None, gamma=g)
-            n = len({d.part for d in dets if d.part})
-            sweep.append({"gamma": round(g, 2), "reads": n})
+        for g, n in scored:
             if n > best_n or (n == best_n and abs(g - 1.0) < abs(best_g - 1.0)):
                 best_g, best_n = g, n
         self._gamma = best_g
         self.recalibrate_now()
-        return {"ok": True, "gamma": round(best_g, 2), "reads": best_n, "sweep": sweep}
+        return {"ok": True, "gamma": round(best_g, 2), "reads": best_n,
+                "sweep": [{"gamma": round(g, 2), "reads": n} for g, n in scored],
+                "secs": round(time.monotonic() - t0, 1)}
+
+    def _can_clone_reader(self) -> bool:
+        """Can we mint INDEPENDENT OCR readers for the sweep workers? Only if the primary
+        reader is a real easyocr one. A caller-injected reader (the tests' fake) has no
+        clonable equivalent, so the sweep shares it and runs serially instead of racing
+        one non-thread-safe object across eight threads."""
+        try:
+            import easyocr
+        except Exception:
+            return False
+        primary = self._reader
+        return primary is None or isinstance(primary, easyocr.Reader)
+
+    def _sweep(self, frame, known, gammas) -> list[tuple[float, int]]:
+        """Score every gamma (distinct valid part numbers read) in the given order. Each
+        worker thread keeps its own easyocr Reader — they are not thread-safe, and a shared
+        one would serialise the sweep anyway. Readers are cached across calls so only the
+        first autotune pays the model-load cost."""
+        parallel = self._can_clone_reader()
+
+        def score(g):
+            r = self._reader
+            if parallel:
+                tid = threading.get_ident()
+                r = self._sweep_readers.get(tid)
+                if r is None:
+                    import easyocr
+                    r = easyocr.Reader(["en"], gpu=self._gpu, verbose=False)
+                    self._sweep_readers[tid] = r
+            dets = self.detect_once(frame, known, gamma=g, reader=r)
+            return (g, len({d.part for d in dets if d.part}))
+
+        workers = max(1, min(len(gammas), self.SWEEP_WORKERS)) if parallel else 1
+        if workers == 1:
+            return [score(g) for g in gammas]
+        # Trim torch's intra-op threads for the duration: the detect loop runs at 4 so it
+        # does not starve the camera streaming in this process, but 8 concurrent passes x
+        # 4 threads oversubscribes 32 cores and ran SLOWER (7.1s) than 8 x 2 (6.5s).
+        prev = None
+        try:
+            import torch
+            prev = torch.get_num_threads()
+            torch.set_num_threads(2)
+        except Exception:
+            pass
+        try:
+            with ThreadPoolExecutor(max_workers=workers,
+                                    thread_name_prefix="autotune") as ex:
+                return list(ex.map(score, gammas))
+        finally:
+            if prev is not None:
+                try:
+                    torch.set_num_threads(prev)
+                except Exception:
+                    pass
 
     def status(self) -> dict:
         with self._lock:

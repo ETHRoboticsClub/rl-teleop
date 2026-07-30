@@ -71,6 +71,30 @@ def main() -> None:
         default=None,
         help="Override the MessageBus subscriber/XPUB port. Defaults to 5556.",
     )
+    parser.add_argument(
+        "--attach-bus",
+        action="store_true",
+        help=(
+            "Attach to a MessageBus that is already running (see `rr-bus`) "
+            "instead of starting one. Lets several sessions -- e.g. an "
+            "always-on camera daemon plus a restartable arm session -- share "
+            "one bus, and leaves the bus up when this session exits."
+        ),
+    )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=8792,
+        help=(
+            "Port for the HTTP control surface the cockpit drives "
+            "(/status, /record/start, /record/save, ...). Defaults to 8792."
+        ),
+    )
+    parser.add_argument(
+        "--no-control",
+        action="store_true",
+        help="Do not start the HTTP control surface (keyboard-only session).",
+    )
     args = parser.parse_args()
 
     session_arg: str = args.session
@@ -113,12 +137,32 @@ def main() -> None:
         if args.pub_port is not None or args.sub_port is not None:
             session.configure_bus_ports(pub_port=args.pub_port, sub_port=args.sub_port)
 
+    if args.attach_bus:
+        session.attach_to_existing_bus()
+
     # Allow save-root override
     if args.save_root:
         from pathlib import Path
         session._save_root = Path(args.save_root)
 
     session.start()
+
+    # HTTP control surface — lets the cockpit drive the same session the
+    # keyboard drives. Started after session.start() so /status is truthful
+    # the moment it answers, and never fatal: a bound port must not stop a
+    # recording session from running keyboard-only.
+    control = None
+    if not args.no_control:
+        from robots_realtime.runtime.control_server import ControlServer
+        control = ControlServer(session, port=args.control_port)
+        if control.start():
+            print(f"session control → {control.url}  (cockpit drives this)")
+        else:
+            print(
+                f"session control → port {args.control_port} busy; "
+                "continuing keyboard-only. Free the port or pass --control-port N."
+            )
+            control = None
 
     try:
         if args.no_tui:
@@ -128,6 +172,8 @@ def main() -> None:
             from robots_realtime.runtime.tui import run_tui
             run_tui(session)
     finally:
+        if control is not None:
+            control.stop()
         session.stop()
 
     os._exit(0)

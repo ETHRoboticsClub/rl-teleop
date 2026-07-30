@@ -1,5 +1,8 @@
 """Unit tests for the scan-cam packet detector's pure logic (blob detection + the
 closed-SKU matching that turns OCR tokens into a part id)."""
+import threading
+import time
+
 import numpy as np
 
 from robots_realtime.labeling.detector import (
@@ -102,6 +105,143 @@ def test_detect_once_reads_all_packets_generically():
     det._reader = _FakeReader(results)
     dets = det.detect_once(np.zeros((600, 640, 3), np.uint8), None)
     assert sorted(d.part for d in dets) == ["MDDY-11065-001", "UNN-10126-151"]
+
+
+def test_ocr_mode_box_is_original_heuristic():
+    """Mode 'ocr' (the default, the tracker that worked well) expands the 5-digit box onto
+    the bag: left/up 1×, right 2×, down 3×."""
+    frame = np.zeros((480, 640, 3), np.uint8)
+    det = PacketDetector(lambda: None, lambda: None)                 # mode='ocr' default
+    det._reader = _FakeReader([_word("UNN", 200, 150),
+                               _word("10126", 250, 150, w=40, h=20), _word("151", 330, 150)])
+    dets = det.detect_once(frame, None)
+    assert len(dets) == 1 and dets[0].part == "UNN-10126-151"
+    # mid box [250,150,40,20] → [250-40, 150-20, 40+2*40, 20+3*20] = [210,130,120,80]
+    assert tuple(dets[0].bbox) == (210, 130, 120, 80)
+
+
+def test_contour_mode_segments_each_bag():
+    """Mode 'contour' watersheds the bag silhouettes seeded by each digit centroid, so two
+    touching-ish bags get two separate boxes, each inside its own bag (never merged)."""
+    frame = np.zeros((480, 640, 3), np.uint8)
+    frame[100:200, 100:250] = 90                          # bag A (brighter than mat, < label)
+    frame[100:200, 300:450] = 90                          # bag B, dark gap between
+    det = PacketDetector(lambda: None, lambda: None, mode="contour")
+    det._reader = _FakeReader([
+        _word("UNN", 120, 140), _word("10126", 150, 140), _word("151", 205, 140),   # in A
+        _word("MDDY", 320, 140), _word("11065", 355, 140), _word("001", 415, 140),  # in B
+    ])
+    dets = det.detect_once(frame, None)
+    assert sorted(d.part for d in dets) == ["MDDY-11065-001", "UNN-10126-151"]
+    for d in dets:
+        assert d.bbox[2] < 220                            # ~one bag wide (~150), not both (~350)
+
+
+def test_margin_expands_every_box():
+    frame = np.zeros((480, 640, 3), np.uint8)
+    det = PacketDetector(lambda: None, lambda: None, margin=10)
+    det._reader = _FakeReader([_word("UNN", 200, 150),
+                               _word("10126", 250, 150, w=40, h=20), _word("151", 330, 150)])
+    # base ocr box [210,130,120,80] grown by 10px/side → [200,120,140,100]
+    assert tuple(det.detect_once(frame, None)[0].bbox) == (200, 120, 140, 100)
+
+
+def test_set_mode_and_margin():
+    det = PacketDetector(lambda: None, lambda: None)
+    assert det.set_mode("contour") == {"ok": True, "mode": "contour"} and det._reset is True
+    assert det.set_mode("bogus")["ok"] is False           # unknown mode rejected, keeps current
+    assert det._mode == "contour"
+    assert det.set_margin(25) == {"ok": True, "margin": 25} and det._margin == 25
+
+
+def test_recalibrate_now_kicks_and_resets():
+    det = PacketDetector(lambda: None, lambda: None)
+    det._expected = 5
+    det.recalibrate_now()
+    assert det._reset is True and det._kick.is_set()
+
+
+def test_autotune_picks_gamma_with_most_reads():
+    """autotune sweeps exposure and keeps the gamma reading the most distinct parts; on a
+    tie it prefers gamma closest to 1.0. Also sets self._gamma and triggers a re-scan."""
+    frame = np.zeros((480, 640, 3), np.uint8)
+    det = PacketDetector(lambda: frame, lambda: None)
+    det._reader = _FakeReader([_word("UNN", 100, 100), _word("10126", 150, 100),
+                               _word("151", 210, 100)])
+    out = det.autotune(gammas=(0.5, 1.0, 1.7))           # fake OCR ignores gamma → all tie at 1
+    assert out["ok"] and out["reads"] == 1 and out["gamma"] == 1.0
+    assert det._gamma == 1.0 and det._reset is True       # applied + re-scan queued
+    # the sweep is scored concurrently, so it must still report gammas in the ORDER given
+    assert [s["gamma"] for s in out["sweep"]] == [0.5, 1.0, 1.7]
+    assert out["secs"] >= 0                               # cockpit shows how long it took
+
+
+def test_sweep_shares_an_injected_reader_instead_of_racing_it():
+    """The autotune sweep parallelises by giving each worker its OWN easyocr reader. A
+    caller-injected reader has no clonable equivalent, so the sweep must fall back to
+    serial rather than hand one non-thread-safe object to eight threads."""
+    det = PacketDetector(lambda: None, lambda: None)
+    det._reader = _FakeReader([])
+    assert det._can_clone_reader() is False
+    det.autotune(gammas=(0.5, 1.0))
+    assert det._sweep_readers == {}                       # no per-thread readers were made
+
+
+def _running_detector(period_s=0.02, frame_source=None):
+    frame = np.zeros((480, 640, 3), np.uint8)
+    det = PacketDetector(frame_source or (lambda: frame), lambda: None, period_s=period_s)
+    det._reader = _FakeReader([_word("UNN", 100, 100), _word("10126", 150, 100),
+                               _word("151", 210, 100)])
+    return det
+
+
+def test_recalc_wait_blocks_until_the_rescan_actually_landed():
+    """/recalc used to answer the instant it set the flag, so it reported the box count
+    from BEFORE the rescan and the cockpit's ⟳ button looked like it did nothing.
+    recalibrate_now(wait_s=...) must return only once a cycle has served the request."""
+    det = _running_detector().start()
+    try:
+        assert det.recalibrate_now(wait_s=3.0) is True
+        assert det._served_gen >= det._reset_gen           # this request was served
+        assert len(det.current()[0]) == 1                  # post-rescan boxes are live
+    finally:
+        det.stop()
+
+
+def test_recalc_wait_times_out_instead_of_hanging():
+    """No loop running → nothing can serve the request. Bounded wait, honest False, and
+    the reset stays queued for whenever the loop does start."""
+    det = PacketDetector(lambda: None, lambda: None)
+    t0 = time.monotonic()
+    assert det.recalibrate_now(wait_s=0.2) is False
+    assert 0.15 <= time.monotonic() - t0 < 2.0
+    assert det._reset is True and det._kick.is_set()
+
+
+def test_recalc_arriving_mid_cycle_waits_for_the_NEXT_cycle():
+    """A cycle already in flight read its frame before the operator hit ⟳ and never dropped
+    the held boxes, so it must not be credited with serving that request."""
+    in_cycle, release = threading.Event(), threading.Event()
+
+    def frames():
+        in_cycle.set()
+        release.wait(5)
+        return np.zeros((480, 640, 3), np.uint8)
+
+    det = _running_detector(frame_source=frames).start()
+    done = []
+    try:
+        assert in_cycle.wait(3)                            # a cycle is now mid-flight
+        t = threading.Thread(target=lambda: done.append(det.recalibrate_now(wait_s=3.0)))
+        t.start()
+        time.sleep(0.3)
+        assert done == []                                  # in-flight cycle must NOT satisfy it
+        release.set()                                      # let it finish; next cycle serves us
+        t.join(5)
+        assert done == [True]
+    finally:
+        release.set()
+        det.stop()
 
 
 def test_detect_once_needs_prefix_near_middle():

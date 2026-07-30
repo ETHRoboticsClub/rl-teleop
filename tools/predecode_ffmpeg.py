@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Decode a LeRobot dataset's mp4s to JPGs, so training never touches a video decoder.
 
-WHY THIS EXISTS RATHER THAN ~/Desktop/lerobot-fast/predecode.py: that script
+WHY THIS EXISTS RATHER THAN ~/Desktop/lab/lerobot-fast/predecode.py: that script
 decodes with `torchcodec.VideoDecoder`, and torchcodec cannot load on this
 machine -- it links against libavutil .56/.57/.58/.59 (ffmpeg 4-7) and the system
 has ffmpeg 8 (libavutil.so.60). The ffmpeg CLI itself works fine, so this does

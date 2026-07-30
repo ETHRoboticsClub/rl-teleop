@@ -90,6 +90,8 @@ class RobotNode(Node):
         poll_freq: float | None = None,
         startup_joint_pos: list[float] | None = None,
         startup_duration_s: float = 2.0,
+        # Hold the arm WHERE IT IS at boot, without moving it. See setup().
+        startup_hold: bool = False,
         # Default to parking at the zero pose on shutdown; override in YAML with
         # a custom list, or set `shutdown_joint_pos: null` to skip parking.
         shutdown_joint_pos: list[float] | None = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
@@ -110,6 +112,10 @@ class RobotNode(Node):
         self._robot_config = robot_config  # stored for reference; instantiation is caller's job
         self._startup_joint_pos = startup_joint_pos
         self._startup_duration_s = startup_duration_s
+        self._startup_hold = bool(startup_hold)
+        # The pose latched at boot by startup_hold, re-commanded while no
+        # publisher owns the arm. LATCHED ONCE and never re-read -- see step().
+        self._hold_q: np.ndarray | None = None
         self._shutdown_joint_pos = shutdown_joint_pos
         self._shutdown_duration_s = shutdown_duration_s
         # Safe-handoff ramp state. On the first command and after any gap
@@ -136,9 +142,58 @@ class RobotNode(Node):
             self._robot = _instantiate_from_target_yaml(self._robot_config)
 
         if self._startup_joint_pos is not None:
+            if self._startup_hold:
+                print(f"[{self.name}] startup_hold ignored: startup_joint_pos is set "
+                      f"and an explicit target wins over holding position")
             print(f"[{self.name}] Moving to startup pose over {self._startup_duration_s:.1f}s")
             self._move_to_pose(self._startup_joint_pos, self._startup_duration_s)
             print(f"[{self.name}] Startup pose reached")
+        elif self._startup_hold:
+            # HOLD WHERE IT IS. Command the arm's own measured position, once.
+            #
+            # THE BUG THIS FIXES. The driver's control loop holds the LAST
+            # COMMANDED position (see step()). With no startup pose and no
+            # publisher yet, command_joint_pos() was never called at all -- so
+            # there was no last command, the motors were limp, and a YAM with no
+            # brakes sank into the table. Measured 2026-07-29: an arm parked at
+            # home, unpowered 16 h, came up reading joint2 +53.3 deg off home
+            # and resting on the plate at -5.8 cm clearance.
+            #
+            # "booting must not move the arm" and "booting must not leave the arm
+            # limp" are different requirements, and the configs only satisfied the
+            # first. This satisfies both: commanding the MEASURED position is a
+            # zero-motion command, so it is safe from any pose -- including one
+            # already lying on the table, where a startup ramp would instead
+            # sweep blindly with no clearance model (_move_to_pose has none, and
+            # it runs here in setup(), before the step loop, where nothing can
+            # observe or abort it).
+            q = self._read_joint_pos()
+            if q is None:
+                raise RuntimeError(
+                    f"[{self.name}] startup_hold was requested but the driver's "
+                    f"joint position could not be read, so the arm cannot be held. "
+                    f"Refusing to start: continuing would leave it limp, which is "
+                    f"the failure this option exists to prevent."
+                )
+            self._hold_q = np.array(q, dtype=np.float64)
+            self._robot.command_joint_pos(self._hold_q)
+            print(f"[{self.name}] Holding startup position (no motion): "
+                  f"{np.round(self._hold_q, 4).tolist()}")
+
+    def _read_joint_pos(self) -> np.ndarray | None:
+        """The driver's full command-space position, or None if it cannot be read.
+
+        get_joint_pos() is the 7-element vector in COMMAND space (6 arm joints +
+        gripper) -- not get_observations()["joint_pos"], which omits the gripper
+        on i2rt MotorChainRobot and would give a shape mismatch against a command.
+
+        Not every driver implements it, which is why both callers (the handoff
+        ramp seed and startup_hold) have to tolerate its absence.
+        """
+        try:
+            return np.asarray(self._robot.get_joint_pos(), dtype=np.float64)
+        except (AttributeError, TypeError):
+            return None
 
     def step(self) -> None:
         ts = time.time()
@@ -164,10 +219,7 @@ class RobotNode(Node):
                 # NOT get_observations()["joint_pos"] which omits the gripper on i2rt
                 # MotorChainRobot and would cause a shape mismatch.
                 if is_new and (self._last_msg_ts == 0.0 or (cmd_ts - self._last_msg_ts) > self._resume_gap_s):
-                    try:
-                        seed = np.asarray(self._robot.get_joint_pos(), dtype=np.float64)
-                    except (AttributeError, TypeError):
-                        seed = None
+                    seed = self._read_joint_pos()
                     self._ramp_seed = seed.copy() if seed is not None and seed.shape == target.shape else target.copy()
                     self._ramp_start_time = now
                     self._ramping = self._ramp_duration_s > 0.0
@@ -185,6 +237,27 @@ class RobotNode(Node):
                         self._robot.command_joint_pos(blended)
                 else:
                     self._robot.command_joint_pos(target)
+
+                # A publisher owns the arm now. Drop the boot hold: from here the
+                # arm is held by the command stream, and after the publisher dies
+                # `cmd` stays non-None (get_latest returns the last envelope
+                # forever), so this branch keeps re-commanding that last target --
+                # which IS the documented hold-on-Ctrl-C behaviour the sort loop
+                # relies on. Re-latching would fight it.
+                self._hold_q = None
+            elif self._hold_q is not None:
+                # No publisher has ever spoken. Re-command the pose latched at
+                # boot, so a driver that forgets its target does not leave the arm
+                # limp without anything noticing.
+                #
+                # THIS MUST STAY A CONSTANT. Re-reading get_joint_pos() here
+                # instead would ratchet the arm into the table: every joint
+                # settles slightly BELOW what it is told (steady-state error is
+                # gravity torque / kp -- the reason move_arm.settle exists), so
+                # commanding the measurement bakes in the sag, then sags again
+                # from there. It would descend steadily while every reading looked
+                # perfectly healthy.
+                self._robot.command_joint_pos(self._hold_q)
 
         self.publish("joint_state", self._robot.get_observations(), ts=ts)
 
@@ -224,6 +297,7 @@ class RobotNode(Node):
         if "poll_freq" in params:
             kwargs["poll_freq"] = params["poll_freq"]
         for key in (
+            "startup_hold",
             "startup_joint_pos",
             "startup_duration_s",
             "shutdown_joint_pos",

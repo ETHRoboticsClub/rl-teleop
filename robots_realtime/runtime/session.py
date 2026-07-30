@@ -37,6 +37,21 @@ from robots_realtime.runtime.transport.serialization import unpack
 _HZ_WINDOW = 30
 
 
+def _port_is_bound(port: int, host: str = "127.0.0.1") -> bool:
+    """True if something is already listening on `port`.
+
+    Used only to make --attach-bus fail loudly. ZMQ's connect() succeeds
+    against a port with no listener and simply queues forever, so without this
+    check a typo'd port produces a session where every node looks healthy and
+    no message is ever delivered.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
 def _run_git(args: list[str], cwd: Path, timeout: float = 2.0) -> str | None:
     try:
         proc = subprocess.run(
@@ -201,6 +216,13 @@ class Session:
         self._is_paused: bool = False
         self._session_start_time = time.time()
 
+        # attach_bus: do not spawn a broker, assume one is already running on
+        # these ports (see rr_bus_cli). Nodes connect() either way, so this
+        # changes nothing about how they talk -- only who owns the ports.
+        # Set via attach_to_existing_bus() so it can also be flipped on a
+        # session built by a make_session() module.
+        self._attach_bus: bool = False
+
         self._hosts: list[ProcessHost] = []
         all_node_names: list[str] = []
         self._node_descriptors: list[dict] = []
@@ -261,11 +283,28 @@ class Session:
                 node._pub_port = self._pub_port
                 node._sub_port = self._sub_port
 
+    def attach_to_existing_bus(self, attach: bool = True) -> None:
+        """Use a broker someone else already runs instead of spawning one."""
+        for host in self._hosts:
+            if getattr(host, "_proc", None) is not None:
+                raise RuntimeError("Cannot change bus ownership after nodes start")
+        self._attach_bus = bool(attach)
+
     def start(self) -> None:
         import tempfile
         self._log_dir = Path(tempfile.mkdtemp(prefix="rr_logs_"))
 
-        self._bus.start()
+        if self._attach_bus:
+            # Fail here rather than letting every node connect() to a dead port
+            # and sit silent forever -- a connect to nothing does not raise.
+            if not _port_is_bound(self._sub_port):
+                raise RuntimeError(
+                    f"--attach-bus: nothing is listening on port {self._sub_port}.\n"
+                    "  Start the broker first:  rr-bus\n"
+                    "  Or drop --attach-bus to let this session own the bus."
+                )
+        else:
+            self._bus.start()
         time.sleep(0.1)
 
         for host in self._hosts:
@@ -314,7 +353,10 @@ class Session:
             t.start()
         for t in threads:
             t.join(timeout=8.0)
-        self._bus.stop()
+        # Never stop a bus this session did not start: other sessions and dev
+        # tools are still on it.
+        if not self._attach_bus:
+            self._bus.stop()
 
     def wait(self) -> None:
         try:
