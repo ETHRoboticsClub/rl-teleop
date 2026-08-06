@@ -43,8 +43,19 @@ Recording stays session-owned, not bus-owned.
 
 ## Python env
 
-- `.venv` is a `uv` venv on **torch 2.7.1+cu128**. The 5090 needs the `+cu128` build.
-- **`uv sync` / `uv run` has downgraded torch to cu126 here**, which produces
-  "no kernel image is available" at runtime. If you must re-resolve, pass the explicit
-  cu128 index. Prefer not to re-resolve at all.
+- `.venv` is a `uv` venv on **torch 2.7.1+cu128**. The 5090 (sm_120) needs the `+cu128`
+  build; PyPI's cu126 wheel has no kernels for it and dies on the first matmul with "no
+  kernel image is available". Verified 2026-08-06: the installed venv is `torch-2.7.1+cu128`.
+- **The `uv run` downgrade is fixed at the root, but keep using `.venv/bin/python` anyway.**
+  `uv sync` / `uv run` *used to* swap the cu128 build for cu126 — 14 packages, silently, in
+  under a second. That is no longer possible from this lockfile: `pyproject.toml:48-52` pins
+  torch and torchvision to an explicit `[[tool.uv.index]]`, and `uv.lock` resolves both from
+  `https://download.pytorch.org/whl/cu128`. Confirmed 2026-08-06, and consistent with the
+  rig's own sessions being started via `uv run rr-session`.
+  Still prefer `.venv/bin/python`: the failure was silent and surfaced as "the policy is
+  bad" rather than "the install changed", and the explicit interpreter costs nothing.
+  Note `sort_kitting.sh` and `PLAN-ACT-V2-ZONE-FILTERED.md` still say "NEVER `uv run`" —
+  over-cautious now rather than wrong. See `../AUDIT.md` §S6.
 - 589 tests collect, 9 collection errors are pre-existing and not caused by your change.
+  **Unverified as of 2026-08-06** — checking it means importing the test modules, which this
+  cleanup pass was not permitted to do while the rig was live.
