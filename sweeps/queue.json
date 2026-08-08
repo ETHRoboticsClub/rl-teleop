@@ -1,0 +1,112 @@
+{
+  "note": "Overnight ACT sweep, 2026-08-08. Every run: ETHRC/yam_grasp_v2_wrist, 20000 steps, batch 8, seed 1000, keep 2 checkpoints (~1.2 GB each run). At ~14 steps/s a run is ~24 min.",
+
+  "why_these_axes": [
+    "MEASURED FIRST: all four existing training runs on disk are hyperparameter-IDENTICAL. lr 1e-5, lr_backbone 1e-5, wd 1e-4, chunk 100, n_action_steps 100, n_obs 1, kl_weight 10.0, latent_dim 32, resnet18/IMAGENET1K_V1, dim_model 512, 8 heads, 4 encoder / 1 decoder layers. Only the dataset, the step count and the seed ever varied. So no hyperparameter has ever been swept on this project and every number below is a stock LeRobot default that nobody chose.",
+
+    "CHUNK SIZE IS THE HEADLINE. Measured episode lengths: yam_grasp_v1 is 77 episodes with p50 = max = 90 frames, so ALL 77 are shorter than chunk_size=100 -- that run asked the model to emit more actions than any episode contains. yam_grasp_v2_wrist is 69 episodes of a fixed 150-frame (5.0 s) window, while the research note puts the actual align_grasp->lift sub-sequence at 30-90 frames. So chunk 100 spans well past the behaviour being learned in one direction and past the end of the data in the other. It is the least defensible untuned parameter in the config and it gets four points of coverage.",
+
+    "SEED IS AN AXIS, NOT A NUISANCE. With 69 episodes, run-to-run variance may exceed the effect of any hyperparameter. base and base_seed2 are identical but for the seed; if they differ as much as the treatment runs differ from base, the whole sweep is measuring noise and that is the single most important thing to learn tonight.",
+
+    "NOT SWEPT, DELIBERATELY: n_action_steps -- it is read only by ACTPolicy.select_action to size the action queue and is already overridden to 16 at load in act_runner.py:63,632-635. It is a DEPLOY-time knob, so A/B it at rollout; training it away would just cost a run. n_obs_steps -- ACT in lerobot is single-observation by construction. Augmentation -- dark_noise is applied to every run because the corpus already establishes that no_aug fails and kitchen_sink works; removing it would re-litigate a settled question.",
+
+    "RANKING CAVEAT: validation loss does NOT predict rollout success on this rig -- measured, the best-loss checkpoint never closed its jaws once and the worst-loss checkpoint is the only one that ever emptied a mat. So these runs produce CANDIDATES, not a winner. The ranking has to happen on the robot, which is why every run keeps 2 checkpoints rather than 1."
+  ],
+
+  "runs": [
+    {
+      "id": "base",
+      "note": "The production config exactly, at 20k steps. The control. Everything else is read against this.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=100", "--policy.n_action_steps=100",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=1000", "--wandb.enable=false"]
+    },
+    {
+      "id": "base_seed2",
+      "note": "Identical to base but seed 2000. Measures run-to-run variance, which bounds how much of any other result is real.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=100", "--policy.n_action_steps=100",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=2000", "--wandb.enable=false"]
+    },
+    {
+      "id": "chunk50",
+      "note": "Chunk halved to 50 frames (1.67 s) -- inside the 30-90 frame grasp rather than spanning past it.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=50", "--policy.n_action_steps=50",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=1000", "--wandb.enable=false"]
+    },
+    {
+      "id": "chunk30",
+      "note": "Chunk 30 frames (1.0 s) -- the short end of the measured grasp sub-sequence.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=30", "--policy.n_action_steps=30",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=1000", "--wandb.enable=false"]
+    },
+    {
+      "id": "chunk150",
+      "note": "Chunk 150 = the full episode window. The opposite bet to chunk30: predict the whole take from one observation.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=150", "--policy.n_action_steps=150",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=1000", "--wandb.enable=false"]
+    },
+    {
+      "id": "kl1",
+      "note": "kl_weight 10.0 -> 1.0. The CVAE prior is stock-tuned for ~50 demos of bimanual ALOHA data, not 69 wrist-only grasps; a weaker prior lets the latent carry more of the demonstration's variation.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=100", "--policy.n_action_steps=100",
+               "--policy.kl_weight=1.0",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=1000", "--wandb.enable=false"]
+    },
+    {
+      "id": "novae",
+      "note": "use_vae false -- drop the CVAE entirely. Its job is to absorb multimodality in the demonstrations; with a single scripted approach to a single grasp there may be little multimodality to absorb, and the KL term is then pure noise on the loss.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=100", "--policy.n_action_steps=100",
+               "--policy.use_vae=false",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=1000", "--wandb.enable=false"]
+    },
+    {
+      "id": "frozen_backbone",
+      "note": "lr_backbone 0 -- freeze the ImageNet resnet18. Fine-tuning 11M backbone parameters on 69 episodes is the classic small-data overfit; freezing is the standard answer and has never been tried here.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=100", "--policy.n_action_steps=100",
+               "--policy.optimizer_lr_backbone=0.0",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=1000", "--wandb.enable=false"]
+    },
+    {
+      "id": "lr3e5",
+      "note": "lr 1e-5 -> 3e-5. 20k steps over 69 episodes is many epochs; if the stock lr is simply too low for this dataset size, this is the cheapest way to find out.",
+      "keep_checkpoints": 2, "timeout_s": 7200,
+      "args": ["--dataset.repo_id=ETHRC/yam_grasp_v2_wrist", "--policy.type=act",
+               "--policy.device=cuda", "--policy.push_to_hub=false",
+               "--policy.chunk_size=100", "--policy.n_action_steps=100",
+               "--policy.optimizer_lr=3e-5",
+               "--steps=20000", "--save_freq=10000", "--batch_size=8",
+               "--num_workers=4", "--seed=1000", "--wandb.enable=false"]
+    }
+  ]
+}

@@ -117,10 +117,28 @@ def load_done(results_path: Path) -> set[str]:
 
 
 def checkpoints_of(out_dir: Path) -> list[Path]:
+    """Real checkpoint directories, oldest first. Excludes the `last` symlink.
+
+    LeRobot writes numbered directories plus a `last` SYMLINK pointing at the
+    newest one. `Path.is_dir()` follows symlinks and returns True for it, so a
+    naive listing yields ['000500', 'last'] -- and because 'last' sorts after
+    any digit string, a keep-newest-N prune deletes the real checkpoint and
+    leaves a dangling link behind.
+
+    That is not hypothetical: it happened here on the first two runs. The
+    directory was left holding nothing but `last -> 000500`, and the driver
+    cheerfully recorded `n_checkpoints=2, status=ok` over an empty tree -- the
+    exact failure mode this file exists to avoid. Hence: symlinks excluded, and
+    a name that must be all digits.
+    """
     ck = out_dir / "checkpoints"
     if not ck.is_dir():
         return []
-    return sorted((d for d in ck.iterdir() if d.is_dir()), key=lambda p: p.name)
+    return sorted(
+        (d for d in ck.iterdir()
+         if d.is_dir() and not d.is_symlink() and d.name.isdigit()),
+        key=lambda p: int(p.name),
+    )
 
 
 def prune_checkpoints(out_dir: Path, keep: int) -> tuple[int, float]:
@@ -219,6 +237,21 @@ def run_one(spec: dict, results_path: Path, log_dir: Path) -> dict:
     rec["pruned"] = n_pruned
     rec["gb_freed_by_prune"] = round(gb_freed, 2)
     rec["size_gb"] = round(dir_size_gb(out_dir), 2)
+
+    # Re-check AFTER pruning, and re-point `last`. A prune that removed the
+    # checkpoint `last` refers to would otherwise leave a dangling symlink that
+    # every downstream loader follows into a FileNotFoundError.
+    surviving = checkpoints_of(out_dir)
+    rec["n_checkpoints_after_prune"] = len(surviving)
+    last_link = out_dir / "checkpoints" / "last"
+    if surviving:
+        if last_link.is_symlink() and not last_link.resolve().exists():
+            last_link.unlink()
+            last_link.symlink_to(surviving[-1].name)
+            rec["relinked_last"] = surviving[-1].name
+    if rec["status"] == "ok" and not surviving:
+        rec["status"] = "failed"
+        rec["error"] = "pruning left no checkpoint behind"
     rec["free_gb_after"] = round(free_gb(REPO), 1)
     rec["finished_at"] = utcnow()
 
