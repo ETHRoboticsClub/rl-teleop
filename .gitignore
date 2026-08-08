@@ -41,3 +41,4 @@ sweeps/results-smoke.jsonl
 /.venv
 /outputs
 /recordings
+sweeps/*-driver.log
