@@ -24,7 +24,25 @@ from robots_realtime.labeling.schema import (
     KitItem,
     TrackingError,
 )
-from robots_realtime.labeling.segmentation import detect_grip_intervals
+from robots_realtime.labeling.segmentation import (
+    GripperRangeUnknown,
+    detect_grip_intervals,
+    is_unknown,
+)
+
+
+def annotations_path(episode_dir: str | Path, arm: str = "left") -> Path:
+    """Where this arm's annotations live inside an episode directory.
+
+    The left arm keeps the historical bare name so every existing episode,
+    dataset export and review tool still finds its file. A second arm in the
+    same episode gets its own file — one episode directory now holds one
+    annotations file PER ARM, because a bimanual take is labelled twice (once
+    per arm) and the two label sets must not overwrite each other.
+    """
+    episode_dir = Path(episode_dir)
+    return episode_dir / ("annotations.json" if arm == "left"
+                          else f"annotations_{arm}.json")
 
 
 def _joints_at(times: np.ndarray, joints: np.ndarray, t: float) -> np.ndarray:
@@ -57,10 +75,19 @@ def label_from_arrays(
     ee_pos = fk.ee_positions(arm_joints)
     ee_z = ee_pos[:, 2]
 
-    intervals = detect_grip_intervals(
-        times, gripper, ee_z=ee_z,
-        open_ref=gripper_open_ref, closed_ref=gripper_closed_ref,
-    )
+    # A dead / rangeless gripper channel is not "an episode with no grasps" — it
+    # is an episode we cannot label at all. Before 2026-08-08 normalize_width
+    # returned all-zeros here, which reads as "jaws fully shut for the whole
+    # take": the most confident possible value, produced from no information.
+    gripper_unknown: str | None = None
+    try:
+        intervals = detect_grip_intervals(
+            times, gripper, ee_z=ee_z,
+            open_ref=gripper_open_ref, closed_ref=gripper_closed_ref,
+        )
+    except GripperRangeUnknown as e:
+        gripper_unknown = str(e)
+        intervals = []
 
     candidates: list[GraspCandidate] = []
     for iv in intervals:
@@ -81,11 +108,20 @@ def label_from_arrays(
         min_transport_m=min_transport_m, geometric_targets=geometric_targets,
     )
 
-    # If the gripper range wasn't given and the signal never nears full close,
-    # empty-vs-bag can't be told apart — flag it loudly (don't fail silently).
-    if gripper_closed_ref is None:
+    # The guard that could not fire (AUDIT.md S1.4). It used to read
+    #     if normalize_width(gripper).min() > 0.15 and candidates:
+    # — but on a never-moved gripper normalize_width returned all-zeros, so
+    # .min() was 0.0, so `0.0 > 0.15` was False and no flag was raised. The one
+    # input it existed to catch was the one input it certified as healthy. It
+    # also required `candidates`, and a dead channel produces none, so it was
+    # doubly unreachable. Both conditions are gone: the unknown case is now its
+    # own branch and is flagged whether or not anything was detected.
+    if gripper_unknown is not None:
+        ann.flags.append(Flag("gripper_range_unknown", gripper_unknown))
+    elif gripper_closed_ref is None and candidates:
         from robots_realtime.labeling.segmentation import normalize_width
-        if normalize_width(gripper).min() > 0.15 and candidates:
+        norm = normalize_width(gripper, on_degenerate="unknown")
+        if not is_unknown(norm) and float(np.nanmin(norm)) > 0.15:
             ann.flags.append(Flag(
                 "gripper_range_unknown",
                 "gripper never near full close and no known limits; empty-grasp "
@@ -157,7 +193,7 @@ def label_episode_dir(episode_dir: str | Path, arm: str = "left",
         geometric_targets=geometric_targets,
     )
     if write:
-        ann.save(episode_dir / "annotations.json")
+        ann.save(annotations_path(episode_dir, arm))
     return ann
 
 
@@ -183,7 +219,7 @@ def main(argv=None):
     except (FileNotFoundError, RuntimeError) as e:
         print(f"⏭  skipped {Path(args.episode_dir).name}: {e}")  # clean skip, not a traceback
         return 0
-    print(f"wrote {Path(args.episode_dir) / 'annotations.json'}")
+    print(f"wrote {annotations_path(args.episode_dir, args.arm)}")
     print(f"  bags placed: {len(ann.place_events)}  grasp attempts: {len(ann.grasp_attempts)}"
           f"  flags: {len(ann.flags)}")
     for f in ann.flags:

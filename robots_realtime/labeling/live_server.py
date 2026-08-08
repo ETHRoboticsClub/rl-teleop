@@ -602,7 +602,31 @@ def episode_kit_json(packets: list[dict]) -> list[dict]:
             for i, p in enumerate(packets)]
 
 
-def _run_label_episode(episode_dir: Path, arm: str) -> None:
+def _label_episode_argv(episode_dir: Path, arm: str,
+                        labeler: "LiveLabeler | None" = None) -> list[str]:
+    """The exact argv the auto-labeller shells out with.
+
+    Split out so it is testable, because what it forwards is the whole bug:
+    until 2026-08-08 this was `label_episode <dir> --arm <arm>` and nothing
+    else. The LIVE labeller runs with open_ref=1.0 / closed_ref=0.0 and
+    MIN_TRANSPORT_M=0.10; label_episode's own defaults are None/None/0.0. So the
+    same --auto-label run showed the operator one set of labels live and wrote a
+    DIFFERENT set into annotations.json — the authoritative file the corpus is
+    built from — using the percentile guess instead of the known limits.
+    (DATA-PIPELINE.md 2.3.) The live path already had the right answer; it just
+    never handed it over.
+    """
+    argv = ["robots_realtime.labeling.label_episode", str(episode_dir), "--arm", arm]
+    if labeler is not None:
+        if labeler.open_ref is not None and labeler.closed_ref is not None:
+            argv += ["--open-ref", repr(float(labeler.open_ref)),
+                     "--closed-ref", repr(float(labeler.closed_ref))]
+        argv += ["--min-transport", repr(float(labeler.min_transport_m))]
+    return argv
+
+
+def _run_label_episode(episode_dir: Path, arm: str,
+                       labeler: "LiveLabeler | None" = None) -> None:
     """Fire label_episode as an isolated subprocess → writes annotations.json.
     Isolated so a bad/incomplete episode (e.g. missing yam_<arm>.mcap) logs an
     error instead of taking down the server."""
@@ -612,8 +636,8 @@ def _run_label_episode(episode_dir: Path, arm: str) -> None:
         # low priority (nice) so the labeler's OCR doesn't starve the live camera
         # streaming at save time (that was freezing the cockpit).
         subprocess.Popen(
-            ["nice", "-n", "19", sys.executable, "-m",
-             "robots_realtime.labeling.label_episode", str(episode_dir), "--arm", arm],
+            ["nice", "-n", "19", sys.executable, "-m"]
+            + _label_episode_argv(episode_dir, arm, labeler),
             cwd=str(Path.cwd()),
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         print(f"[auto-label] {episode_dir.name} → annotations.json")
@@ -672,7 +696,7 @@ def record_watcher(save_root: str, labeler: LiveLabeler, arm: str,
                         and time.time() - mcap.stat().st_mtime > 20.0):
                     print(f"[auto-label] backfill saved-but-unlabeled {d.name}")
                     track[key]["labeled"] = True
-                    _run_label_episode(d, arm)
+                    _run_label_episode(d, arm, labeler)
             t = track[key]
             if not t["labeled"] and meta.exists():
                 m = meta.stat().st_mtime
@@ -682,7 +706,7 @@ def record_watcher(save_root: str, labeler: LiveLabeler, arm: str,
                     t["labeled"] = True
                     labeler.locked = False             # episode done → let the NEXT setup re-scan
                     if auto_label:
-                        _run_label_episode(d, arm)
+                        _run_label_episode(d, arm, labeler)
 
 
 def main(argv=None):

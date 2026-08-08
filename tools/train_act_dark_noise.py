@@ -33,10 +33,34 @@ Usage (all lerobot-train flags work):
 # dataclass from main()'s type annotation via inspect; with PEP 563 the
 # annotation is the STRING "TrainPipelineConfig" and parsing dies with
 # "must be called with a dataclass type or instance".
+import os  # noqa: E402
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# ── fast data path ──────────────────────────────────────────────────────────
+# LEROBOT_PREDECODED_ROOT on its own does NOTHING. The env var is only read by
+# lerobot-fast/predecoded_patch.py, which must be IMPORTED to monkey-patch
+# `lerobot.datasets.video_utils.decode_video_frames` before the dataset is
+# built. Setting the variable and not importing the patch silently trains at
+# full decode cost -- or, on this rig, does not train at all: torchcodec cannot
+# load (libavutil missing for every FFmpeg version it supports), so the stock
+# decode path raises at the first batch. The patch is what makes video reading
+# work here, not just what makes it fast.
+#
+# torchcodec is imported LAZILY inside video_utils.get_decoder(), so installing
+# the patch first means that import is never reached.
+FAST = Path.home() / "Desktop/lab/lerobot-fast"
+if os.environ.get("LEROBOT_PREDECODED_ROOT"):
+    if not (FAST / "predecoded_patch.py").exists():
+        raise SystemExit(
+            f"LEROBOT_PREDECODED_ROOT is set but {FAST}/predecoded_patch.py is missing.\n"
+            "Refusing to run: without the patch this trains from the mp4s at full\n"
+            "decode cost, or dies on torchcodec. Unset the variable to opt out.")
+    sys.path.insert(0, str(FAST))
+    import predecoded_patch  # noqa: F401,E402  side-effect import
+    print(f"predecoded cache: {os.environ['LEROBOT_PREDECODED_ROOT']}", flush=True)
 
 from lerobot.configs import parser  # noqa: E402
 from lerobot.configs.train import TrainPipelineConfig  # noqa: E402

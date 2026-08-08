@@ -13,7 +13,7 @@ where I verified or contradicted it. **[web]** is new literature research done t
 
 ---
 
-## 0. The five conclusions, before the evidence
+## 0. The seven conclusions, before the evidence
 
 1. **No hyperparameter has ever been varied on this rig.** All four training runs on disk
    are byte-for-byte identical in every policy hyperparameter, and identical to upstream
@@ -40,7 +40,22 @@ where I verified or contradicted it. **[web]** is new literature research done t
    hyperparameter fixes a 15-scene corpus, and no offline metric computed on those same
    15 scenes can rank checkpoints that trained on all of them. §4.4.
 
-5. **The two highest-expected-value experiments require zero training runs.**
+5. **A holdout already existed, and on it the proxy beats the loss and inverts its ranking.**
+   The zone filter dropped 8 grasps from v1 when building v2, so those 8 are unseen by every
+   v2-line checkpoint. Scored there: the **deployed** `ft50k/006000` prints a **31% worse**
+   loss than `v2 scratch 50000` and beats it **7/7 paired** on held-out grasps (sign test
+   p ≈ 0.016), with a generalisation gap of **1.43× vs 2.31×**. The warm start from the
+   two-camera v1 pretrain is the reason. §4.7.
+
+6. **The corpus is not partly corrupt** — settled by another stream: `|stored p − FK(q)|` is
+   identically 0.000000 mm on all 77, and the "24 of 77" was leader-vs-follower teleop tracking
+   error, not a data defect. I have removed that caveat throughout. It **strengthens** the
+   central argument rather than weakening it: with the action labels exact, "the data is
+   corrupt" is eliminated as a competing explanation for why loss fails to predict rollout
+   success, leaving the two mechanisms measured here — no holdout (§4.1) and a padding-scaled
+   loss (§4.2).
+
+7. **The two highest-expected-value *deploy* experiments require zero training runs.**
    `n_action_steps` and `temporal_ensemble_coeff` are both pure inference-side knobs
    (verified: the temporal ensembler holds no learned parameters), and the deployed
    override `N_ACTION_STEPS = 16` is contradicted by the only quantitative evidence that

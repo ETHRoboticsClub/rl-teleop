@@ -34,7 +34,7 @@ def test_record_watcher_labels_on_end_not_start(tmp_path, monkeypatch):
 
     labeled: list[str] = []
     monkeypatch.setattr("robots_realtime.labeling.live_server._run_label_episode",
-                        lambda d, arm: labeled.append(d.name))
+                        lambda d, arm, *_: labeled.append(d.name))
 
     stop = threading.Event()
     t = threading.Thread(target=record_watcher,
@@ -71,7 +71,7 @@ def test_record_watcher_idempotent_on_restart(tmp_path, monkeypatch):
 
     labeled: list[str] = []
     monkeypatch.setattr("robots_realtime.labeling.live_server._run_label_episode",
-                        lambda d, arm: labeled.append(d.name))
+                        lambda d, arm, *_: labeled.append(d.name))
     stop = threading.Event()
     threading.Thread(target=record_watcher,
                      args=(str(tmp_path), labeler, "left", True, stop), daemon=True).start()
@@ -98,7 +98,7 @@ def test_record_watcher_backfills_saved_but_unlabeled(tmp_path, monkeypatch):
 
     labeled: list[str] = []
     monkeypatch.setattr("robots_realtime.labeling.live_server._run_label_episode",
-                        lambda d, arm: labeled.append(d.name))
+                        lambda d, arm, *_: labeled.append(d.name))
     stop = threading.Event()
     threading.Thread(target=record_watcher,
                      args=(str(tmp_path), labeler, "left", True, stop), daemon=True).start()
@@ -119,7 +119,7 @@ def test_record_watcher_does_not_backfill_active_recording(tmp_path, monkeypatch
 
     labeled: list[str] = []
     monkeypatch.setattr("robots_realtime.labeling.live_server._run_label_episode",
-                        lambda d, arm: labeled.append(d.name))
+                        lambda d, arm, *_: labeled.append(d.name))
     stop = threading.Event()
     threading.Thread(target=record_watcher,
                      args=(str(tmp_path), labeler, "left", True, stop), daemon=True).start()
@@ -166,3 +166,44 @@ def test_state_matches_suffix_not_position():
     by_part = {p["part"]: p["bbox_px"] for p in st["packets"]}
     assert by_part["UNN-10015-007"] == [800, 500, 90, 60]   # its own box, not the -231 one
     assert by_part["UNN-10015-231"] == [200, 100, 90, 60]
+
+
+# ── what the auto-labeller forwards ─────────────────────────────────────────
+# DATA-PIPELINE.md 2.3: until 2026-08-08 this shelled out
+# `label_episode <dir> --arm <arm>` and nothing else, so the LIVE labeller ran
+# with open_ref=1.0/closed_ref=0.0/MIN_TRANSPORT_M=0.10 while the file it wrote
+# -- annotations.json, the authority the corpus is built from -- was produced by
+# label_episode's own defaults of None/None/0.0. Same run, two answers.
+
+def test_auto_label_forwards_the_live_labellers_gripper_refs():
+    from robots_realtime.labeling.live import LiveLabeler
+    from robots_realtime.labeling.live_server import _label_episode_argv
+    from pathlib import Path
+
+    argv = _label_episode_argv(Path("/eps/episode_x"), "left",
+                               LiveLabeler(open_ref=1.0, closed_ref=0.0))
+    assert "--open-ref" in argv and argv[argv.index("--open-ref") + 1] == "1.0"
+    assert "--closed-ref" in argv and argv[argv.index("--closed-ref") + 1] == "0.0"
+
+
+def test_auto_label_forwards_the_transport_gate():
+    """constants.py says 'the real kitting pipeline passes ~0.10' and nothing in
+    either tree passed it. That gate is what fuse._transported exists to
+    enforce -- a release detected at the pick location rather than over a bin."""
+    from robots_realtime.labeling import constants as C
+    from robots_realtime.labeling.live import LiveLabeler
+    from robots_realtime.labeling.live_server import _label_episode_argv
+    from pathlib import Path
+
+    argv = _label_episode_argv(Path("/eps/episode_x"), "left", LiveLabeler())
+    assert float(argv[argv.index("--min-transport") + 1]) == C.MIN_TRANSPORT_M
+    assert C.MIN_TRANSPORT_M > 0
+
+
+def test_auto_label_without_a_labeller_is_the_old_bare_argv():
+    """Back-compat for any caller that has no LiveLabeler in hand."""
+    from robots_realtime.labeling.live_server import _label_episode_argv
+    from pathlib import Path
+
+    argv = _label_episode_argv(Path("/eps/episode_x"), "right")
+    assert argv[-2:] == ["--arm", "right"]

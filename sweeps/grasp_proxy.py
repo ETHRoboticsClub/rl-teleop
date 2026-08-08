@@ -11,6 +11,17 @@ Why not loss: see sweeps/RESEARCH.md S4. Two reasons in one line each --
     lengths; (b) 96% of the frames in a window are approach/lift, so a policy
     that never closes its jaws pays ~4% of the loss for it.
 
+VALIDATED, once, on real held-out data -- see RESEARCH.md S4.7. The zone filter
+dropped 8 grasps from yam_grasp_v1 when building yam_grasp_v2_wrist, so those 8
+are unseen by every v2-line checkpoint (indices in sweeps/holdout_v1_indices.json).
+Scored there, this metric ranks the DEPLOYED ft50k/006000 above v2-scratch-50000
+on 7/7 episodes for both close_dt and approach_l1 -- while the training loss ranks
+them the other way round (0.0509 vs 0.0392). Generalisation gap 1.43x vs 2.31x.
+
+It has NO resolution when run on data the checkpoint trained on: close_rate
+saturates at 1.000 and approach_l1 just tracks the loss (RESEARCH.md S4.4, S4.5).
+So: only ever score a checkpoint on recordings withheld from its training run.
+
 Usage:
     LEROBOT_PREDECODED_ROOT=~/.cache/lerobot-predecoded/yam_grasp_v2_wrist \
     .venv/bin/python sweeps/grasp_proxy.py CKPT [CKPT ...]

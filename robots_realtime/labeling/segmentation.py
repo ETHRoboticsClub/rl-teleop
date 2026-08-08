@@ -35,26 +35,109 @@ class GripInterval:
     lifted: bool | None        # True/False if ee_z given, else None
 
 
+class GripperRangeUnknown(RuntimeError):
+    """The gripper width channel carries no usable open→closed range.
+
+    Raised instead of returning a plausible-looking constant. THE WHOLE POINT:
+    the two normalisers this function replaced returned *opposite* constants for
+    this case — ``np.zeros_like`` ("jaws fully shut") in the offline labeller and
+    ``np.ones_like`` ("jaws wide open") in the ACT exporter — over the same
+    recordings. Neither had any information; both looked like an answer.
+    See AUDIT.md S1.1/S1.3 and DATA-PIPELINE.md 2.7.
+    """
+
+
+# Sentinel returned by ``normalize_width(..., on_degenerate="unknown")``.
+UNKNOWN = np.nan
+
+
+def is_unknown(norm) -> bool:
+    """True when ``norm`` is the explicit unknown sentinel (all-NaN, or empty).
+
+    Callers that ask for ``on_degenerate="unknown"`` MUST test with this before
+    thresholding: every ``nan < x`` comparison is False, so an untested unknown
+    array silently reads as "the gripper never closed".
+    """
+    a = np.asarray(norm, dtype=float)
+    return a.size == 0 or bool(np.all(np.isnan(a)))
+
+
 def normalize_width(width_raw, open_ref: float | None = None,
-                    closed_ref: float | None = None) -> np.ndarray:
+                    closed_ref: float | None = None, *,
+                    on_degenerate: str = "raise") -> np.ndarray:
     """Map raw gripper width to [0, 1] with 1 = open, 0 = closed.
 
+    THE ONE NORMALISER. ``tools/export_lerobot.normalize_gripper`` is a thin
+    wrapper over this; do not fork it. When it was forked, the two copies
+    disagreed on the degenerate case in opposite directions and the grasp corpus
+    and the ACT tensors built from the same recordings contradicted each other.
+
     Prefer the gripper's KNOWN physical limits (``open_ref``/``closed_ref`` from
-    the robot config) so a bag-thickness hold normalizes to its true fraction.
-    Without them, fall back to episode percentiles + auto-orientation — correct
-    only when the episode actually spans the full open→closed range.
+    the robot config — on this rig 1.0 / 0.0, see ``qa_label.py``). With refs a
+    never-moving gripper resting at 0.993 normalises to 0.993 = OPEN, which is
+    the truth. Without them we fall back to episode percentiles, which is only
+    valid when the episode actually spans the full open→closed range — and we
+    cannot verify that, which is why the fallback is allowed to give up.
+
+    ``on_degenerate`` controls the no-information case:
+        "raise"    → raise GripperRangeUnknown (default; loud beats plausible)
+        "unknown"  → np.full(shape, nan); test it with ``is_unknown``
+
+    Degenerate means any of:
+      * empty input,
+      * any non-finite sample (one NaN used to poison the whole array silently
+        into "nothing was ever grasped" — AUDIT.md S1.6),
+      * no usable range: refs given but identical, or no refs and the observed
+        percentile spread is below ``C.GRIPPER_MIN_RANGE_FRAC`` of the signal's
+        own magnitude.
     """
+    if on_degenerate not in ("raise", "unknown"):
+        raise ValueError(f"on_degenerate must be 'raise' or 'unknown', got {on_degenerate!r}")
+
+    def _give_up(reason: str, shape) -> np.ndarray:
+        if on_degenerate == "raise":
+            raise GripperRangeUnknown(reason)
+        return np.full(shape, UNKNOWN, dtype=float)
+
     w = np.asarray(width_raw, dtype=float)
     if w.size == 0:
-        return w
-    if open_ref is not None and closed_ref is not None and abs(open_ref - closed_ref) > 1e-9:
+        return _give_up("empty gripper width array", w.shape)
+    if not np.all(np.isfinite(w)):
+        n_bad = int((~np.isfinite(w)).sum())
+        return _give_up(
+            f"{n_bad}/{w.size} non-finite gripper samples "
+            "(dropped bus samples or an mcap gap)", w.shape)
+
+    if open_ref is not None and closed_ref is not None:
+        if abs(open_ref - closed_ref) <= 1e-9:
+            return _give_up(
+                f"open_ref ({open_ref}) and closed_ref ({closed_ref}) are the same value",
+                w.shape)
         return np.clip((w - closed_ref) / (open_ref - closed_ref), 0.0, 1.0)
-    lo, hi = np.percentile(w, [2, 98])
-    if hi - lo < 1e-9:
-        return np.zeros_like(w)          # gripper never moved
+
+    lo, hi = (float(v) for v in np.percentile(w, [2, 98]))
+    # A RELATIVE floor, not an epsilon. The old test was `hi - lo < 1e-9`, which
+    # a real dead gripper never satisfies: measured over the 29 readable episodes
+    # in recordings/, twelve have a gripper that never left the open stop and
+    # still show ~1e-4 of sensor noise (e.g. 0.9989..0.9990). 1e-4 clears 1e-9,
+    # so the guard passed and the fallback amplified pure noise into a full-scale
+    # open/close trace. Any threshold between ~1e-3 and ~0.9 separates those
+    # twelve from the seventeen live ones (measured spread 0.9960..0.9986), so
+    # the exact value is not sensitive.
+    span = max(abs(hi), abs(lo), 1.0e-12)
+    if (hi - lo) <= C.GRIPPER_MIN_RANGE_FRAC * span:
+        return _give_up(
+            f"gripper width spans only {hi - lo:.3e} over [{lo:.6f}, {hi:.6f}] "
+            f"(< {C.GRIPPER_MIN_RANGE_FRAC:.0%} of its own magnitude) and no "
+            "open_ref/closed_ref were given — the jaws either never moved or the "
+            "channel is dead; pass the gripper's physical limits", w.shape)
+
     norm = np.clip((w - lo) / (hi - lo), 0.0, 1.0)
     # Gripper starts open; if the first sample sits at the low end, the raw
-    # signal is inverted (open = low raw) so flip it.
+    # signal is inverted (open = low raw) so flip it. This is an assumption
+    # about the recording, not a measurement — an episode cut mid-hold inverts
+    # the whole trace (AUDIT.md S1.5). Passing refs skips this branch entirely,
+    # which is the reason to pass them.
     if float(norm[0]) < 0.5:
         norm = 1.0 - norm
     return norm
@@ -100,7 +183,13 @@ def classify_hold(hold_vals: np.ndarray, t_close: float, t_arr: np.ndarray,
 def detect_grip_intervals(times, width_raw, ee_z=None,
                           open_ref: float | None = None,
                           closed_ref: float | None = None) -> list[GripInterval]:
-    """Hysteresis state machine over the normalized gripper width."""
+    """Hysteresis state machine over the normalized gripper width.
+
+    Raises ``GripperRangeUnknown`` when the width channel carries no information.
+    It deliberately does NOT swallow that into an empty list: "no grasps" and
+    "no gripper signal" are different facts about an episode and the caller has
+    to record which one it is (``label_episode`` turns it into a loud Flag).
+    """
     t = np.asarray(times, dtype=float)
     if t.size == 0:
         return []

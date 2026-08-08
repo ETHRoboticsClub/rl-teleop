@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 
 from export_lerobot import (  # noqa: E402
     CAMERAS, MIN_WINDOW_FRAMES, N_DOF, build_features, grasp_windows,
-    in_workspace, nearest_index, normalize_gripper, usable_grasps,
+    in_zone, nearest_index, normalize_gripper, usable_grasps, zone_label,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -45,10 +45,11 @@ def ann(outcome="success", attempts=(), **meta):
             "place_events": [], "tracking": [], "flags": []}
 
 
-def grasp(t, outcome="success", x=0.43):
-    """A grasp attempt. Default x sits mid-workspace (corpus mean is 0.432)."""
+def grasp(t, outcome="success", x=0.43, y=-0.25):
+    """A grasp attempt. Defaults sit mid-zone: the corpus mean is (0.432, -0.244)
+    and the median y is -0.244, so the default survives every gate below."""
     return {"bag_id": 1, "attempt": 1, "arm": "left", "t": t, "outcome": outcome,
-            "ee_pose": [x, -0.25, 0.12, 0.0, 0.0, 0.0, 1.0]}
+            "ee_pose": [x, y, 0.12, 0.0, 0.0, 0.0, 1.0]}
 
 
 # ── episode selection ───────────────────────────────────────────────────────
@@ -80,21 +81,62 @@ def test_rejects_missing_annotations(tmp_path):
     assert good == [] and "no annotations.json" in why
 
 
-def test_rejects_operator_x_flag(tmp_path):
-    """Operator pressed 'x' during the take. Their judgement outranks the
-    labeller's — that is the whole point of the flag."""
+def test_rejects_the_tag_the_recorder_actually_writes(tmp_path):
+    """THE regression for AUDIT.md S7.1. The operator presses the KEY 'x';
+    tui.py:259 maps it to the TAG 'bad'; session.py:389 writes {"tag": "bad"};
+    control_server.py:59 rejects a literal "x" with a 400. The exporter filtered
+    on "x", so the tag it looked for could not exist and the filter never once
+    fired -- while review_corpus.py, reading the same files, correctly named
+    those episodes in the QA report.
+
+    This fixture is the bytes session.py writes, not a hand-made "x". The old
+    test fabricated {"tag": "x"} and therefore passed while pinning the bug in
+    place; that is why this file's fixture had to change with the code."""
     ep = write_episode(tmp_path, "episode_e",
                        annotations=ann(attempts=[grasp(5.0)]),
-                       flags={"flags": [{"tag": "x", "t": 5.2}]})
+                       flags={"flags": [{"tag": "bad", "t": 1785097885.49}]})
     good, why = usable_grasps(ep)
-    assert good == [] and "'x'" in why
+    assert good == [] and "bad" in why
+
+
+def test_the_tag_matches_what_the_session_writer_uses():
+    """Pins the two ends of the chain to one constant so they cannot drift
+    apart again. Reads the writer's own map rather than restating "bad"."""
+    from robots_realtime.runtime.tui import _FLAG_KEYS
+    assert _FLAG_KEYS["x"] in C.OPERATOR_BAD_TAGS
+    assert _FLAG_KEYS["g"] not in C.OPERATOR_BAD_TAGS
+    assert _FLAG_KEYS["s"] not in C.OPERATOR_BAD_TAGS
+
+
+def test_a_bad_take_is_excluded_from_the_exported_plan(tmp_path):
+    """usable_grasps is not the only door into the exporter -- plan_episode has
+    its own path for window_mode='full', which never calls it. Prove the take is
+    actually excluded from what gets written, not merely from one filter."""
+    from export_lerobot import Report, plan_episode
+    ep = write_episode(tmp_path, "episode_bad",
+                       annotations=ann(attempts=[grasp(5.0)]),
+                       flags={"flags": [{"tag": "bad", "t": 5.2}]})
+    for mode in ("grasp", "full"):
+        rep = Report()
+        assert plan_episode(ep, 3.0, 2.0, 30, rep, window_mode=mode) is None
+        assert any("bad take" in r.reason for r in rep.rejected), mode
 
 
 def test_other_flags_do_not_reject(tmp_path):
-    """'g' (regrasp) and 's' (slow) are annotations, not rejections."""
+    """'re_grasp' and 'slow' are annotations, not rejections. Both appear in the
+    real corpus (two episodes carry 'slow')."""
     ep = write_episode(tmp_path, "episode_f",
                        annotations=ann(attempts=[grasp(5.0)]),
-                       flags={"flags": [{"tag": "g", "t": 5.2}, {"tag": "s", "t": 6.0}]})
+                       flags={"flags": [{"tag": "re_grasp", "t": 5.2},
+                                        {"tag": "slow", "t": 6.0}]})
+    good, why = usable_grasps(ep)
+    assert why is None and len(good) == 1
+
+
+def test_a_malformed_flag_entry_does_not_crash_the_export(tmp_path):
+    ep = write_episode(tmp_path, "episode_f2",
+                       annotations=ann(attempts=[grasp(5.0)]),
+                       flags={"flags": ["bad", {"t": 1.0}, {"tag": None}]})
     good, why = usable_grasps(ep)
     assert why is None and len(good) == 1
 
@@ -172,9 +214,14 @@ def test_gripper_normalisation_is_scale_invariant():
     assert np.allclose(a, b, atol=1e-6)
 
 
-def test_degenerate_gripper_range_does_not_divide_by_zero():
-    out = normalize_gripper(np.full(5, 3.0, dtype=np.float32))
-    assert np.all(np.isfinite(out)) and np.all(out == 1.0)
+def test_degenerate_gripper_range_refuses_instead_of_inventing_all_open():
+    """Was: `assert np.all(out == 1.0)`. That pinned half of AUDIT.md S1.3 --
+    this file answered "wide open" and the labeller answered "fully shut" for
+    the same recording, and both were guesses. Full coverage in
+    test_gripper_normalisation.py."""
+    from robots_realtime.labeling.segmentation import GripperRangeUnknown
+    with pytest.raises(GripperRangeUnknown):
+        normalize_gripper(np.full(5, 3.0, dtype=np.float32))
 
 
 def test_nearest_index_picks_the_closest_sample():
@@ -295,24 +342,98 @@ def test_camera_stream_past_end_returns_none(tmp_path):
 # statistical cut. See constants.GRASP_WORKSPACE_X_MIN.
 
 def test_gate_keeps_a_grasp_on_the_mat():
-    assert in_workspace(grasp(1.0, x=0.43)) is True
+    assert in_zone(grasp(1.0, x=0.43)) is True
 
 
 def test_gate_drops_a_grasp_off_the_mat():
-    assert in_workspace(grasp(1.0, x=0.15)) is False
+    assert in_zone(grasp(1.0, x=0.15)) is False
 
 
 def test_gate_boundary_is_inclusive():
-    assert in_workspace(grasp(1.0, x=C.GRASP_WORKSPACE_X_MIN)) is True
-    assert in_workspace(grasp(1.0, x=C.GRASP_WORKSPACE_X_MIN - 1e-6)) is False
+    assert in_zone(grasp(1.0, x=C.GRASP_WORKSPACE_X_MIN)) is True
+    assert in_zone(grasp(1.0, x=C.GRASP_WORKSPACE_X_MIN - 1e-6)) is False
 
 
 def test_gate_fails_open_on_a_missing_pose():
     """Unknown is not out-of-bounds. A grasp with no ee_pose is a labeller
-    problem and must not be silently reclassified as a workspace result."""
+    problem and must not be silently reclassified as a zone result."""
     g = grasp(1.0)
     del g["ee_pose"]
-    assert in_workspace(g) is True
+    assert in_zone(g) is True
+
+
+# ── lateral gate ────────────────────────────────────────────────────────────
+# Added 2026-08-03 for the zone-filtered retrain. OFF by default so every
+# dataset exported before that date still reproduces byte-for-byte.
+
+def test_lateral_gate_is_off_by_default():
+    """THE compatibility guarantee. y=-0.099 is a real corner grasp from
+    episode_181321; with no y_max passed it must still export, or yam_grasp_v1
+    silently stops reproducing."""
+    assert C.GRASP_ZONE_Y_MAX is None
+    assert in_zone(grasp(1.0, x=0.54, y=-0.099)) is True
+
+
+def test_lateral_gate_drops_the_corner_when_asked():
+    assert in_zone(grasp(1.0, y=-0.099), y_max=-0.13) is False
+
+
+def test_lateral_gate_keeps_the_main_band():
+    assert in_zone(grasp(1.0, y=-0.30), y_max=-0.13) is True
+
+
+def test_lateral_boundary_is_inclusive_like_x():
+    """Both bounds keep the grasp that sits exactly on them. Asymmetry here
+    would be a silent off-by-one between the two gates."""
+    assert in_zone(grasp(1.0, y=-0.13), y_max=-0.13) is True
+    assert in_zone(grasp(1.0, y=-0.13 + 1e-6), y_max=-0.13) is False
+
+
+def test_lateral_gate_fails_open_on_a_missing_pose():
+    g = grasp(1.0)
+    del g["ee_pose"]
+    assert in_zone(g, y_max=-0.13) is True
+
+
+def test_bounds_are_independent():
+    """A grasp outside on x is dropped no matter how good its y is, and the
+    reverse. Collapsing these into one test would hide either bound going dead."""
+    assert in_zone(grasp(1.0, x=0.15, y=-0.30), y_max=-0.13) is False   # x only
+    assert in_zone(grasp(1.0, x=0.43, y=-0.09), y_max=-0.13) is False   # y only
+    assert in_zone(grasp(1.0, x=0.15, y=-0.09), y_max=-0.13) is False   # both
+    assert in_zone(grasp(1.0, x=0.43, y=-0.30), y_max=-0.13) is True    # neither
+
+
+def test_zone_label_agrees_with_in_zone():
+    """The review page badges with zone_label and the exporter gates with
+    in_zone. If they disagree the page shows a selection the dataset does not
+    contain -- the exact failure the review tool exists to prevent."""
+    cases = [(0.43, -0.25), (0.15, -0.25), (0.43, -0.09), (0.15, -0.09),
+             (0.25, -0.13), (0.54, -0.085), (0.354, -0.379)]
+    for x, y in cases:
+        g = grasp(1.0, x=x, y=y)
+        assert (zone_label(g, y_max=-0.13) == "in") is in_zone(g, y_max=-0.13), (x, y)
+
+    g = grasp(1.0)
+    del g["ee_pose"]
+    assert zone_label(g) == "nopose"
+    assert in_zone(g) is True
+
+
+def test_zone_label_names_which_bound_dropped_it():
+    assert zone_label(grasp(1.0, x=0.15), y_max=-0.13) == "near"
+    assert zone_label(grasp(1.0, y=-0.09), y_max=-0.13) == "corner"
+    assert zone_label(grasp(1.0), y_max=-0.13) == "in"
+
+
+def test_episode_rejection_reason_names_both_bounds(tmp_path):
+    """A run that exports nothing must say WHY in terms of the bounds actually
+    in force, not the default ones."""
+    ep = write_episode(tmp_path, "episode_corner", annotations=ann(
+        attempts=[grasp(1.0, y=-0.09), grasp(5.0, y=-0.10)]))
+    good, why = usable_grasps(ep, y_max=-0.13)
+    assert good == []
+    assert "y > -0.13" in why
 
 
 def test_gate_is_grasp_level_not_episode_level(tmp_path):
@@ -334,7 +455,7 @@ def test_episode_with_only_off_mat_grasps_is_rejected(tmp_path):
         attempts=[grasp(1.0, x=0.10), grasp(5.0, x=0.18)]))
     good, why = usable_grasps(ep)
     assert good == []
-    assert why is not None and "outside the workspace" in why
+    assert why is not None and "outside the zone" in why
 
 
 def test_gate_can_be_disabled_for_review(tmp_path):
@@ -344,3 +465,113 @@ def test_gate_can_be_disabled_for_review(tmp_path):
         attempts=[grasp(1.0, x=0.43), grasp(5.0, x=0.15)]))
     good, why = usable_grasps(ep, workspace_gate=False)
     assert why is None and [g["t"] for g in good] == [1.0, 5.0]
+
+
+# ── the corpus itself ───────────────────────────────────────────────────────
+# Everything above runs on synthetic episodes. These two run on the REAL
+# recordings, because the numbers the review page shows an operator are the
+# numbers the dataset must contain, and a synthetic fixture cannot pin that.
+# Skipped rather than failed when recordings/ is absent (CI, fresh clone).
+
+CORPUS = Path(__file__).resolve().parents[2] / "recordings"
+needs_corpus = pytest.mark.skipif(not CORPUS.exists(), reason="recordings/ not present")
+
+
+def _corpus_grasps(x_min=None, y_max=None):
+    from export_lerobot import episode_dirs
+    n = 0
+    for ep in episode_dirs(CORPUS):
+        good, why = usable_grasps(ep, x_min=x_min, y_max=y_max)
+        if not why:
+            n += len(good)
+    return n
+
+
+@needs_corpus
+def test_corpus_default_zone_still_yields_v1():
+    """yam_grasp_v1 is 77 windows. If this number moves, the lateral gate has
+    leaked into the default path and v1 has stopped reproducing."""
+    assert _corpus_grasps() == 77
+
+
+@needs_corpus
+def test_corpus_zone_x325_y13_yields_69():
+    """The zone reviewed on 2026-08-03. This is the count the HTML page reports
+    and the count `--zone-x-min 0.325 --zone-y-max -0.13` must export. If the
+    two ever disagree, an operator approved a selection the model never saw."""
+    assert _corpus_grasps(x_min=0.325, y_max=-0.13) == 69
+
+
+@needs_corpus
+def test_corpus_x_bound_alone_changes_nothing_between_025_and_0325():
+    """Documents WHY the x bound is not the interesting knob: the corpus has a
+    176 mm empty band there, so every threshold in it selects the same grasps.
+    The lateral bound is where the real choice lives."""
+    assert _corpus_grasps(x_min=0.25) == _corpus_grasps(x_min=0.325) == 77
+
+
+# ── camera sets ─────────────────────────────────────────────────────────────
+# Added 2026-08-03. A wrist-only dataset trains a policy that reads the gripper
+# camera and the joints, nothing else. ACT supports it with no config change:
+# the backbone and encoder_img_feat_input_proj are SHARED across cameras and the
+# camera position embedding is sinusoidal, so no weight is camera-keyed
+# (verified against the 50k checkpoint: zero tensors mention a camera).
+
+def test_default_camera_set_is_both():
+    """Compatibility guarantee, same shape as the zone one: omitting --cameras
+    must reproduce the two-camera datasets exported before this flag existed."""
+    from export_lerobot import CAMERA_SETS, resolve_cameras
+    assert resolve_cameras(None) == CAMERAS
+    assert CAMERA_SETS["both"] == CAMERAS
+
+
+def test_wrist_set_is_the_gripper_camera_only():
+    from export_lerobot import CAMERA_SETS
+    assert CAMERA_SETS["wrist"] == {"camera_left": "wrist"}
+
+
+def test_scan_camera_is_in_no_camera_set():
+    """camera_scan looks at the packet mat and must never reach the policy,
+    whichever set is chosen."""
+    from export_lerobot import CAMERA_SETS
+    for name, cams in CAMERA_SETS.items():
+        assert "camera_scan" not in cams, name
+
+
+def test_features_follow_the_selected_camera_set():
+    from export_lerobot import CAMERA_SETS
+    shapes = {"camera_top": (720, 1280), "camera_left": (480, 640)}
+
+    both = build_features(shapes, CAMERA_SETS["both"])
+    assert set(both) == {"observation.state", "action",
+                         "observation.images.top", "observation.images.wrist"}
+
+    wrist = build_features(shapes, CAMERA_SETS["wrist"])
+    assert set(wrist) == {"observation.state", "action", "observation.images.wrist"}
+    # the joints are NOT dropped with the camera -- that is the whole point
+    assert wrist["observation.state"]["shape"] == (N_DOF,)
+    assert wrist["action"]["shape"] == (N_DOF,)
+    # and the surviving camera keeps its own 640x480, not the top camera's
+    assert wrist["observation.images.wrist"]["shape"] == (480, 640, 3)
+
+
+def test_wrist_features_are_a_subset_of_both():
+    """A wrist-only policy must see exactly the feature it would have seen in a
+    two-camera dataset, byte for byte. If the suffix or shape drifted, weights
+    from the two-camera checkpoint could not be fine-tuned onto it."""
+    from export_lerobot import CAMERA_SETS
+    shapes = {"camera_top": (720, 1280), "camera_left": (480, 640)}
+    both = build_features(shapes, CAMERA_SETS["both"])
+    wrist = build_features(shapes, CAMERA_SETS["wrist"])
+    for k, v in wrist.items():
+        assert both[k] == v, k
+
+
+def test_build_features_names_the_mismatch_not_the_missing_key():
+    """Regression, 2026-08-03: export() probed shapes for the wrist camera but
+    called build_features() without passing `cameras`, so it asked for the top
+    camera and died on `KeyError: 'camera_top'` 100 lines from the cause. The
+    --dry-run path returns before this line, so the dry run was clean."""
+    from export_lerobot import CAMERA_SETS
+    with pytest.raises(KeyError, match="pass the same .cameras."):
+        build_features({"camera_left": (480, 640)}, CAMERA_SETS["both"])

@@ -22,6 +22,41 @@ GRIPPER_EMPTY_CLOSE = 0.08   # closed to < 8% of range = closed on nothing
 # fraction below the grasp-hold width (toward fully closed), the bag is gone.
 GRIPPER_SLIP_DROP = 0.15
 
+# --- gripper normalisation ----------------------------------------------------
+# When no open_ref/closed_ref are given, segmentation.normalize_width falls back
+# to episode percentiles. That fallback is only meaningful if the episode really
+# spans open→closed, so it needs a floor below which it refuses to answer.
+#
+# The floor is RELATIVE to the signal's own magnitude, not an epsilon. Measured
+# 2026-08-08 over the 29 readable episodes in recordings/ (yam_left.mcap, col 6):
+#
+#     live gripper   (n=17)   p98-p2 spread 0.9960 .. 0.9986
+#     dead gripper   (n=12)   p98-p2 spread 0.0000 .. 0.0002   (resting ~0.96-0.999)
+#
+# The old guard tested `hi - lo < 1e-9`, which none of the twelve dead episodes
+# satisfied — sensor noise alone is ~1e-4 — so the fallback rescaled that noise
+# into a full-scale open/close trace. Any threshold in [1e-3, 0.9] separates the
+# two populations; 0.05 sits far from both edges.
+#
+# ASSUMPTION, stated because it is the one way this can be wrong: the raw
+# gripper value has no large constant offset (this rig records ~0.002 closed /
+# ~0.999 open; the other calibration seen in the wild is -0.0235 / 5.2218). A rig
+# that reported, say, 1000.0 closed / 1005.0 open would trip this floor on a
+# healthy episode. Pass open_ref/closed_ref and none of this applies.
+GRIPPER_MIN_RANGE_FRAC = 0.05
+
+# --- operator flags -----------------------------------------------------------
+# The tag written into operator_flags.json when the operator rejects a take
+# live. It is "bad": tui.py:259 maps the KEY "x" to the TAG "bad",
+# session.py:389 writes {"tag": "bad"}, and control_server.py rejects a literal
+# "x" with a 400. export_lerobot.py used to filter on "x", so from the day the
+# flag was added until 2026-08-08 the filter could not match anything and every
+# take the operator rejected was exported as training data. (AUDIT.md S7.1)
+#
+# A set, not a string, so the exporter and review_corpus.py cannot drift apart
+# again, and so a hand-edited older file that literally says "x" still counts.
+OPERATOR_BAD_TAGS = frozenset({"bad", "x"})
+
 # A grasp/release must persist at least this long to count (debounce brief
 # adjustment twitches). Seconds.
 #
@@ -92,3 +127,21 @@ GRIPPER_JOINT_INDEX = 6
 # so the same recording would be in one week and out the next. Any threshold in
 # [0.20, 0.30] drops exactly these 4; 0.25 sits mid-gap. Metres, robot base frame.
 GRASP_WORKSPACE_X_MIN = 0.25
+
+# Lateral gate. None = OFF, which is the default and reproduces every dataset
+# exported before 2026-08-03. It exists because the x gate above cannot express
+# "the far corner of the mat":
+#
+#     base -y  ................................................ base +y
+#     -0.38                      -0.24                     -0.085
+#       |  main packet layout (n=75, 7% fail)  |  corner (n=14, 21% fail)  |
+#                                           y_max
+#
+# Measured over the 89 labelled attempts: grasps at y > -0.13 fail three times
+# as often as the rest. n=14 with 3 failures, so this is a direction, NOT a
+# proven threshold -- which is exactly why it defaults to None and has to be
+# passed explicitly by someone who has looked at tools/review_grasps.py.
+#
+# NOT a claim about the tray. The tray spans y -0.487..-0.087 (results/
+# tray_box.json), so it underlies BOTH bands; the corner is not "over the box".
+GRASP_ZONE_Y_MAX = None
