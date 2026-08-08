@@ -127,12 +127,37 @@ def main() -> int:
 
     rows.sort(key=lambda r: -r["score"])
     print(f"\n{'run':<20}{'n':>4}{'close_rate':>12}{'close_dt_s':>12}"
-          f"{'approach_l1':>13}{'score':>10}")
-    print("-" * 71)
+          f"{'approach_l1':>13}{'score':>10}  flag")
+    print("-" * 79)
     for r in rows:
+        flag = "" if r["close_rate"] >= 1.0 else "  <-- DID NOT ALWAYS CLOSE"
         print(f"{r['run']:<20}{r['n']:>4}{r['close_rate']:>12.3f}"
               f"{r['close_dt_med_s']:>12.3f}{r['approach_l1_rad']:>13.5f}"
-              f"{r['score']:>10.4f}")
+              f"{r['score']:>10.4f}{flag}")
+
+    # Surface close_rate separately and loudly, because the composite score hides
+    # it. Measured in this sweep: chunk_size=50 scored 0.7503 against a seed band
+    # floor of 0.7510 -- inconclusive on score alone -- while its close_rate was
+    # 0.944 against 1.000 for every baseline checkpoint. The categorical drop in
+    # the thing that actually matters was nearly buried by the blend.
+    #
+    # Worse, approach_l1 moved the OPPOSITE way: shrinking the chunk produced a
+    # visibly smoother approach that grasped less often. A ranking that reads
+    # only the composite would have promoted it.
+    #
+    # This codebase's recurring failure is a single number that cannot say "no"
+    # (a witness saturating at 1.000, a val loss that anti-correlates with
+    # success). A blended score is one of those. So close_rate gets its own line.
+    bad = [r for r in rows if r["close_rate"] < 1.0]
+    if bad:
+        print(f"\n!! {len(bad)} checkpoint(s) failed to close the jaws on some held-out "
+              f"grasps.\n   Rank these BELOW anything at close_rate 1.000 regardless of "
+              f"score -- a policy\n   that does not close is not a better policy with a "
+              f"worse number, it is not a policy.")
+        for r in bad:
+            missed = round((1.0 - r["close_rate"]) * r["n"])
+            print(f"     {r['run']:<20} close_rate {r['close_rate']:.3f} "
+                  f"({missed} of {r['n']} held-out grasps)")
 
     out = SWEEPS / "ranking.json"
     out.write_text(json.dumps(rows, indent=2))
