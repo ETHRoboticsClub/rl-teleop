@@ -1,0 +1,38 @@
+[
+  {
+    "n": 18,
+    "close_rate": 1.0,
+    "close_dt_med_s": 0.03333333333333333,
+    "approach_l1_rad": 0.03278256045825101,
+    "score": 0.9177682124168313,
+    "ckpt": "outputs/ft_from_v1_6k/checkpoints/006000/pretrained_model",
+    "run": "ft_from_v1_6k"
+  },
+  {
+    "n": 18,
+    "close_rate": 1.0,
+    "close_dt_med_s": 0.05,
+    "approach_l1_rad": 0.03747103016595499,
+    "score": 0.90005793966809,
+    "ckpt": "outputs/v_warm/checkpoints/000006/pretrained_model",
+    "run": "v_warm"
+  },
+  {
+    "n": 18,
+    "close_rate": 1.0,
+    "close_dt_med_s": 0.06666666666666667,
+    "approach_l1_rad": 0.03354399587433982,
+    "score": 0.899578674917987,
+    "ckpt": "outputs/ft_from_v1_6k/checkpoints/003000/pretrained_model",
+    "run": "ft_from_v1_6k"
+  },
+  {
+    "n": 18,
+    "close_rate": 1.0,
+    "close_dt_med_s": 0.2,
+    "approach_l1_rad": 0.058264997282887,
+    "score": 0.7834700054342261,
+    "ckpt": "outputs/s_base/checkpoints/010000/pretrained_model",
+    "run": "s_base"
+  }
+]
