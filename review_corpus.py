@@ -20,6 +20,7 @@ the page (review_watch.sh symlinks it into the served dir as "recordings/").
 """
 from __future__ import annotations
 import glob, html as _html, json, math, os, struct, sys, statistics as st
+from robots_realtime.labeling import constants as C
 
 # camera stem -> (label, per-frame timestamp sidecar), in player order.
 #
@@ -186,7 +187,12 @@ def main():
             op_tally[tg] = op_tally.get(tg, 0) + 1
     if op_tally:
         P("  operator flags (g/x/s at record) " + ", ".join(f"{k}={v}" for k, v in sorted(op_tally.items())))
-        bad_eps = [e["ep"] for e in episodes if "bad" in e["opflags"]]
+        # Read the shared constant rather than keeping a second copy of the rule.
+        # This file already had the tag right while export_lerobot.py had it
+        # wrong, and the two disagreeing is exactly what let this report name
+        # episodes the exporter then went on to export anyway.
+        bad_eps = [e["ep"] for e in episodes
+                   if any(t in C.OPERATOR_BAD_TAGS for t in e["opflags"])]
         if bad_eps:
             P(f"      >>> operator-flagged BAD (exclude from training): {bad_eps}")
     P("")
