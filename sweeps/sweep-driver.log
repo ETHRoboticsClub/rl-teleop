@@ -1,6 +1,0 @@
-queue: 8 runs, 0 already terminal, 8 to go
-free disk: 65.5 GB
-
-=== s_base ===
-    /home/tommaso/Desktop/kitting-v2/rl-teleop/.venv/bin/python /home/tommaso/Desktop/kitting-v2/rl-teleop/tools/train_act_dark_noise.py --output_dir=/home/tommaso/Desktop/kitting-v2/rl-teleop/sweeps/outputs/s_base --dataset.repo_id=ETHRC/yam_grasp_v2_wrist --dataset.episodes=[0,1,2,3,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,46,47,48,49,50,51,52,53,54,55,56,63,64,65,66,67,68] --policy.type=act --policy.device=cuda --policy.push_to_hub=false --policy.chunk_size=100 --policy.n_action_steps=100 --steps=20000 --save_freq=10000 --batch_size=8 --num_workers=4 --seed=1000 --wandb.enable=false
-    log -> /home/tommaso/Desktop/kitting-v2/rl-teleop/sweeps/logs/s_base.log
