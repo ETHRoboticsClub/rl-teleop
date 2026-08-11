@@ -595,11 +595,29 @@ class Soak:
                                 {"health": h},
                             )
 
-                if not args.faults or time.monotonic() < next_fault or not hosts:
+                hosts = [h for h in hosts if h.is_alive()]
+                if args.faults and not hosts:
+                    # Nothing left alive to attack. Idling out the clock would
+                    # report a long clean soak that tested nothing at all — the
+                    # exact species of comfortable lie this project is about.
+                    self.log("every camera node is down; ending the soak early rather "
+                             "than reporting time in which nothing was tested")
+                    break
+                if not args.faults or time.monotonic() < next_fault:
                     continue
 
                 host = hosts[n % len(hosts)]
                 fault = faults[n % len(faults)]
+                # SIGKILL IS PERMANENT — nothing restarts a node in-place today
+                # (that is an option-3 property: cameras in a supervised daemon
+                # whose lifetime is independent of the session). So in a long
+                # soak it eats the fleet: after four kill rounds there is nothing
+                # left to test and the remaining hour measures nothing. Keep it
+                # in the rotation, but rarely, and let the recoverable faults do
+                # the sustained work.
+                if fault is self.fault_sigkill and (n % args.kill_every) != 0:
+                    fault = self.fault_driver_frozen if self._fault_file(host.node_name) \
+                        else self.fault_sigstop
                 n += 1
                 # A killed node cannot be re-killed; drop it from rotation.
                 if not host.is_alive():
@@ -681,6 +699,10 @@ def main(argv=None) -> int:
     ap.add_argument("--sub-port", type=int, default=SOAK_SUB_PORT)
     ap.add_argument("--faults", action="store_true", help="inject process-level faults")
     ap.add_argument("--fault-period", type=float, default=60.0)
+    ap.add_argument("--kill-every", type=int, default=6,
+                    help="only SIGKILL a node on every Nth fault round. Killed nodes "
+                         "are never restarted, so a long soak that kills freely runs "
+                         "out of cameras and then measures nothing.")
     ap.add_argument("--audit-secs", type=float, default=3.0)
     ap.add_argument("--audit-period", type=int, default=30)
     ap.add_argument("--warmup", type=float, default=8.0)

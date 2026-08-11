@@ -66,9 +66,21 @@ WHAT COUNTS AS A FAILURE
 - the frame is bit-identical to the previous one for ``freeze_timeout_s``
   (frozen content — the failure the cockpit lied about, and the only one that
   looks perfect from every other angle)
+- the frames are DISTINCT but repeating: a device cycling a small ring of
+  buffers, A,B,A,B forever, which passes any consecutive-frame comparison and
+  carries no new information. Judged over a window, not a pair.
+- frames arrive, correctly formed, at a small fraction of the configured rate
+  (``degraded (slow)``) — a camera nobody should record from, which every other
+  check called healthy
 - the frame geometry is not the configured geometry (silent profile change)
 - the device identity changed across a reopen (the two wrist cameras share USB
   serial ``SN0001``, so the port path is their only identity)
+
+Two of those — the ring, and the rate — were not in the original fault catalogue.
+They were invented while attacking the finished code, and both were real holes.
+The lesson is in the shape they share with the bug this class was written for:
+every one of these failures produced output that looked, to any check narrow
+enough, exactly like success.
 
 RECOVERY POLICY
 ===============
