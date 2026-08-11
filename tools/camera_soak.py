@@ -322,6 +322,34 @@ class Soak:
         if not said_something:
             self.violation(fault, node, "NO signal reported the fault at all", evidence)
 
+    def device_present(self, node: str) -> bool | None:
+        """Is this node's physical device still on the bus? None = can't tell.
+
+        A camera cannot recover from a fault if the hardware left the building
+        while the fault was running, and calling that a supervisor bug is a lie
+        about the thing under test. It happened for real during this work: the
+        ASMedia controller died mid-soak and took the D455 with it, three
+        minutes before a SIGSTOP round that then "failed to recover".
+        """
+        for host in self.session._hosts:
+            if host.node_name != node:
+                continue
+            spec = getattr(getattr(host, "_node", None), "_driver_spec", None) or {}
+            path = spec.get("device_path")
+            if path:
+                return os.path.exists(path)
+            serial = spec.get("device_id")
+            if serial:
+                try:
+                    import pyrealsense2 as rs
+                    return str(serial) in [
+                        d.get_info(rs.camera_info.serial_number)
+                        for d in rs.context().query_devices()
+                    ]
+                except Exception:
+                    return None
+        return None
+
     def await_recovery(self, fault: str, node: str, timeout: float) -> bool:
         """Wait for the node to stream distinct frames again."""
         assert self.audit is not None
@@ -331,6 +359,16 @@ class Soak:
             if node in streaming_nodes(win):
                 return True
         return False
+
+    def recovery_expected(self, node: str) -> bool:
+        """False when the device is physically absent — recovery is impossible."""
+        present = self.device_present(node)
+        if present is False:
+            self.log(f"  NOTE: {node}'s device is no longer on the USB bus. Recovery is "
+                     f"impossible and this is NOT a supervisor failure — check dmesg for "
+                     f"a controller death or an unplug.")
+            return False
+        return True
 
     # -- faults ---------------------------------------------------------
 
@@ -353,7 +391,8 @@ class Soak:
             os.kill(pid, signal.SIGCONT)
             self.log(f"  SIGCONT {node}")
         if not self.await_recovery("SIGSTOP", node, timeout=30.0):
-            self.violation("SIGSTOP", node, "did not recover after SIGCONT within 30 s")
+            if self.recovery_expected(node):
+                self.violation("SIGSTOP", node, "did not recover after SIGCONT within 30 s")
         else:
             self.check_invariant("SIGSTOP", node, expect_streaming=True)
 
@@ -421,8 +460,9 @@ class Soak:
                 self._set_driver_fault(node, "ok")
         if recover:
             if not self.await_recovery(f"DRIVER_{mode.upper()}", node, timeout=30.0):
-                self.violation(f"DRIVER_{mode.upper()}", node,
-                               "did not recover within 30 s after the fault was cleared")
+                if self.recovery_expected(node):
+                    self.violation(f"DRIVER_{mode.upper()}", node,
+                                   "did not recover within 30 s after the fault was cleared")
             else:
                 self.check_invariant(f"DRIVER_{mode.upper()}", node, expect_streaming=True)
 

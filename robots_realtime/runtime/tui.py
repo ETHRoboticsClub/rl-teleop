@@ -38,12 +38,17 @@ def _make_table(session, nodes_with_errors: set[str] | None = None) -> Table:
     )
     table.add_column("NODE",   style="bold")
     table.add_column("STATUS", justify="center")
+    table.add_column("CAMERA", justify="center")
     table.add_column("STEP(HZ)",   justify="right")
     table.add_column("PUB(HZ)",    justify="right")
     table.add_column("TOPICS", style="dim")
 
     errs = nodes_with_errors or set()
     for st in session.node_statuses():
+        # `alive` is now assigned from ProcessHost.is_alive() every ~250 ms. It
+        # used to be initialised True and set nowhere in the repository, so this
+        # dot was a green literal that no failure could ever change — a camera
+        # node that died in setup() sat here reading "● live" for eleven minutes.
         dot   = Text("● ", style="green") if st.alive else Text("○ ", style="red")
         label = Text("live" if st.alive else "dead", style="green" if st.alive else "red")
         status_cell = Text()
@@ -51,13 +56,27 @@ def _make_table(session, nodes_with_errors: set[str] | None = None) -> Table:
             status_cell.append("⚠ ", style="bold red")
         status_cell += dot + label
 
+        # A node can be perfectly alive and its camera useless. Both facts, side
+        # by side, from <node>/health — including `stale`, which is what a
+        # SIGSTOPped node looks like (alive, publishing nothing, last health
+        # message still cheerfully saying ok).
+        cam_state = getattr(st, "camera_state", None)
+        if cam_state is None:
+            camera_cell = Text("—", style="dim")
+        elif cam_state == "ok":
+            camera_cell = Text("ok", style="green")
+        elif cam_state in ("failed", "stale"):
+            camera_cell = Text(cam_state.upper(), style="bold red")
+        else:
+            camera_cell = Text(cam_state, style="yellow")
+
         step_val = f"{st.step_hz:>6.1f}" if st.step_hz > 0 else Text("  ---", style="dim")
         pub_val  = f"{st.pub_hz:>6.1f}"  if st.pub_hz  > 0 else Text("  ---", style="dim")
 
         topics = ", ".join(t for t in st._timestamps.keys() if not t.startswith("_")) or "—"
 
         name_cell = Text(st.name, style="bold red" if st.name in errs else "bold")
-        table.add_row(name_cell, status_cell, step_val, pub_val, topics)
+        table.add_row(name_cell, status_cell, camera_cell, step_val, pub_val, topics)
 
     return table
 

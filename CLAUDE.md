@@ -18,18 +18,60 @@ move or rename this directory you break that repo too.
 
 ## The bus
 
-`rr-bus` owns the cameras. Individual sessions **attach** to it, they do not open devices
-directly:
+**`rr-bus` does NOT own the cameras.** This section used to say it did, and that was
+never true of the code — `robots_realtime/rr_bus_cli.py` starts *only* the XPUB/XSUB
+broker (`MessageBus`). The camera daemon it refers to was never written. **Sessions open
+`/dev/video*` and the RealSense devices directly**, which is why two sessions collide and
+why a "camera busy" error usually IS device contention.
+
+Corrected 2026-08-12. It mattered: it is the same class of failure as the cameras
+themselves — a signal confidently reporting something that is not so — and anyone
+debugging a busy camera was being sent to look in the wrong place.
 
 ```bash
-tmux new-session -d -s bus 'cd ~/Desktop/kitting/rl-teleop && uv run rr-bus'
+# rr-bus starts a BROKER whose lifetime is independent of any session. Useful so
+# subscribers survive a session restart; it does not hold any camera.
+tmux new-session -d -s bus 'cd ~/Desktop/kitting-v2/rl-teleop && uv run rr-bus'
 uv run rr-session <config>.yaml --attach-bus --no-tui
 ```
 
-A "camera busy" error is almost always **bus ownership**, not device contention. Do not
-start hunting for a second process holding `/dev/video*`.
+A "camera busy" error means **another process has the device open**. Find it:
 
-Recording stays session-owned, not bus-owned.
+```bash
+for d in /dev/video*; do h=$(lsof -t "$d" 2>/dev/null); [ -n "$h" ] && echo "$d -> $h"; done
+pgrep -fa rr-session
+```
+
+Recording is session-owned, and the writer is called in-process by `Publisher.publish()`
+*before* the ZMQ send — so **a perfect mp4 is not evidence that anything was published**.
+
+## Camera health — read this before trusting any camera indicator
+
+As of 2026-08-12 every camera runs behind `SupervisedCamera`: bounded reads,
+reopen-with-backoff, and a `<node>/health` topic carrying
+`{state, last_frame_age_s, consecutive_failures, device_path, reopens, ...}` with
+`state ∈ {ok, degraded, reopening, failed}`.
+
+```bash
+# is a camera physically present? (opens nothing — safe with a session running)
+./.venv/bin/python3 tools/preflight_cameras.py configs/yam/yam_right_kitting_teleop.yaml
+
+# is it actually DELIVERING? the independent auditor — run before every session
+./.venv/bin/python3 tools/check_streams.py
+
+# attack the camera stack (safe: fakes and synthetic cameras, no hardware)
+bash tools/red_rounds.sh
+```
+
+Three rules that came out of the hardening run:
+
+- **`check_streams.py` must never read the health topic.** Its whole value is that it can
+  catch the health topic lying. There is a test that fails if anyone changes this.
+- **An episode recorded while a camera was unhealthy is stamped `"degraded": true` in
+  `session_meta.json`**, naming the cameras, covering mid-episode dropouts. Filter with
+  `jq -r 'select(.degraded) | .episode_dir' recordings/*/*/session_meta.json`.
+- **Never fault-inject a config containing a `RobotNode`.** `robots_realtime/runtime/
+  safety_guard.py` refuses, and `tools/camera_soak.py` calls it before anything starts.
 
 ## RealSense
 
