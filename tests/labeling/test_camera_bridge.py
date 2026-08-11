@@ -22,11 +22,20 @@ def test_encode_rejects_non_rgb():
 
 
 class _FakeBridge:
-    """Duck-typed bridge: serves a fixed JPEG for cam id 'top'."""
+    """Duck-typed bridge: serves a fixed JPEG for cam id 'top'.
+
+    ``state()`` is part of the interface now, not an optional extra: /cam/<id>
+    returns 503 with an ``X-Cam-State`` header naming WHY there is no picture,
+    because "unmapped", "no_data" and "stale" are three different operator
+    problems (wrong --bus-cams, node never started, camera died mid-session) and
+    a bare 503 makes them look like one.
+    """
     def __init__(self):
         self._jpg = encode_frame_jpeg(np.full((32, 32, 3), 128, np.uint8))
     def jpeg(self, cam_id):
         return self._jpg if cam_id == "top" else None
+    def state(self, cam_id):
+        return {"id": cam_id, "state": "ok" if cam_id == "top" else "unmapped"}
 
 
 def test_cam_endpoint_serves_jpeg():
@@ -51,5 +60,8 @@ def test_cam_endpoint_serves_jpeg():
             assert False, "expected 503"
         except urllib.error.HTTPError as e:
             assert e.code == 503
+            # and it says WHY, so an unmapped panel is distinguishable from a
+            # camera that died mid-session.
+            assert e.headers.get("X-Cam-State") == "unmapped"
     finally:
         srv.shutdown()

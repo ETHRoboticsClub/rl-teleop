@@ -84,6 +84,14 @@ class FakeDevice:
             return self.serial
         return ""
 
+    def query_sensors(self) -> list:
+        # _start_pipeline_once() calls _configure_exposure(), which iterates the
+        # device's sensors. The fake had no such method, so these tests died on
+        # AttributeError before reaching their own assertions — a pre-existing
+        # failure unrelated to the camera-hardening work. No sensors is a valid
+        # answer and exercises the "nothing to configure" path.
+        return []
+
     def hardware_reset(self) -> None:
         self.reset_count += 1
 
@@ -149,7 +157,10 @@ def test_busy_open_retries_without_killing_processes(
     camera.fps = 30
 
     monkeypatch.setattr(camera, "_device_has_color_sensor", lambda: True)
-    monkeypatch.setattr(camera, "_is_busy_error", lambda exc: True)
+    # The predicate is called _is_retryable_open_error; _is_busy_error has not
+    # existed for some time, so this monkeypatch raised AttributeError and the
+    # test never ran. Pre-existing, unrelated to the camera-hardening work.
+    monkeypatch.setattr(camera, "_is_retryable_open_error", lambda exc: True)
 
     monkeypatch.setattr(_time_mod, "sleep", lambda _seconds: None)
 

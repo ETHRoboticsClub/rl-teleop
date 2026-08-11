@@ -60,6 +60,7 @@ from tools.export_lerobot import (  # noqa: E402
     CAMERAS,
     episode_dirs,
     grasp_windows,
+    grasp_windows_indexed,
     load_json,
     usable_grasps,
     zone_label,
@@ -118,7 +119,8 @@ def failed_attempts(root: Path):
 
 
 def collect(root: Path, pre_s: float, post_s: float,
-            x_min: float | None = None, y_max: float | None = None):
+            x_min: float | None = None, y_max: float | None = None,
+            arm: str = "left"):
     """One record per grasp window, in exporter order. Also the rejected episodes."""
     records, rejects = [], []
 
@@ -126,7 +128,7 @@ def collect(root: Path, pre_s: float, post_s: float,
         # workspace_gate=False so the dropped grasps still appear, badged, with
         # the reason visible. The gate itself is applied below from the same
         # constant the exporter uses -- never re-derived here.
-        grasps, why = usable_grasps(ep, workspace_gate=False)
+        grasps, why = usable_grasps(ep, workspace_gate=False, arm=arm)
         if why:
             rejects.append((ep.name, why))
             continue
@@ -148,12 +150,21 @@ def collect(root: Path, pre_s: float, post_s: float,
 
         ordered = sorted((g for g in grasps if g.get("t") is not None),
                          key=lambda g: float(g["t"]))
-        windows = grasp_windows(ordered, t0, t1, pre_s, post_s)
-        if len(windows) != len(ordered):
-            # grasp_windows drops any window that clips to nothing; without a
-            # 1:1 match we cannot say which grasp a window belongs to.
-            rejects.append((ep.name, f"{len(ordered)} grasps -> {len(windows)} windows"))
+        # Indexed form keeps grasp identity, so a window that clips to nothing
+        # drops ONLY its own grasp. The old code rejected the whole episode on a
+        # length mismatch, which threw away every grasp in a take whose wrist
+        # camera died near the end -- while the exporter wrote those same grasps.
+        idx_windows = grasp_windows_indexed(ordered, t0, t1, pre_s, post_s)
+        if not idx_windows:
+            rejects.append((ep.name, f"{len(ordered)} grasps, no window inside the recorded span"))
             continue
+        if len(idx_windows) != len(ordered):
+            n_clip = len(ordered) - len(idx_windows)
+            rejects.append((ep.name,
+                            f"NOTE {n_clip}/{len(ordered)} grasps outside the camera span "
+                            f"(a camera stopped early) -- the other {len(idx_windows)} are shown"))
+        ordered = [ordered[i] for i, _, _ in idx_windows]
+        windows = [(lo, hi) for _, lo, hi in idx_windows]
 
         ann = load_json(ep / "annotations.json") or {}
         kit = {k.get("bag_id"): k for k in ((ann.get("episode_meta") or {}).get("kitting_list") or [])}
@@ -964,11 +975,22 @@ def main(argv=None) -> int:
     ap.add_argument("--hover-z", type=float, default=0.17)
     ap.add_argument("--no-frames", action="store_true",
                     help="skip video decode, reuse whatever is already in out/frames")
+    ap.add_argument("--arm", default="left", choices=("left", "right"),
+                    help="which arm's annotations_<arm>.json to review. Also selects "
+                         "the wrist camera (left->camera_left, right->camera_right), "
+                         "matching what the exporter writes as observation.images.wrist.")
     ap.add_argument("--open", action="store_true")
     a = ap.parse_args(argv)
 
     root, outdir = Path(a.root), Path(a.out)
-    records, rejects = collect(root, a.pre_s, a.post_s, a.zone_x_min, a.zone_y_max)
+    # The wrist camera is arm-specific. CAMERAS is a module global read by
+    # collect() and grab_frames(); rebinding it here keeps those two reading the
+    # SAME dict rather than each deciding for itself which wrist to show.
+    if a.arm == "right":
+        global CAMERAS
+        CAMERAS = {"camera_top": "top", "camera_right": "wrist"}
+    records, rejects = collect(root, a.pre_s, a.post_s, a.zone_x_min, a.zone_y_max,
+                               arm=a.arm)
     if not records:
         print("no grasp windows found", file=sys.stderr)
         return 1

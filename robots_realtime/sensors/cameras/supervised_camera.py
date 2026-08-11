@@ -97,6 +97,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -256,6 +257,8 @@ class SupervisedCamera(CameraDriver):
         geometry_give_up: int = 3,
         freeze_give_up: int = 2,
         min_healthy_frames: int = 3,
+        stall_window: int = 30,
+        stall_distinct_ratio: float = 0.34,
         expected_shape: Optional[Tuple[int, int]] = None,
         target_fps: Optional[float] = None,
         identity_fn: Optional[Callable[[CameraDriver], str]] = None,
@@ -277,6 +280,11 @@ class SupervisedCamera(CameraDriver):
         # Consecutive DISTINCT frames required before a recovering camera is
         # allowed to call itself ok. See _accept.
         self._min_healthy_frames = max(1, int(min_healthy_frames))
+        # Window over which frame distinctness is judged, to catch a device
+        # cycling a ring of buffers rather than sitting on one. See _accept.
+        self._stall_distinct_ratio = float(stall_distinct_ratio)
+        self._recent_fps: deque[str] = deque(maxlen=max(4, int(stall_window)))
+        self._stalled_since: Optional[float] = None
         self._expected_shape = tuple(expected_shape) if expected_shape else None
         self._min_period_s = (1.0 / float(target_fps)) if target_fps else 0.0
         self._identity_fn = identity_fn
@@ -514,6 +522,42 @@ class SupervisedCamera(CameraDriver):
 
         fp = _fingerprint(arr)
         distinct = fp != self._last_fingerprint
+
+        # A RING OF BUFFERS IS A FREEZE WITH EXTRA STEPS. Comparing each frame
+        # only against the one before it catches a device stuck on ONE buffer and
+        # misses a device cycling a small ring — A,B,A,B forever is "distinct"
+        # at every single step, so the camera reported `ok` indefinitely while
+        # carrying no new information at all. (Found by inventing the fault:
+        # rings of 2, 3 and 5 all sailed through the consecutive-frame check.)
+        #
+        # So distinctness is measured over a WINDOW. A real sensor pointed at a
+        # motionless bench still produces all-distinct frames — the noise floor
+        # guarantees it — so a window in which a third of the frames are repeats
+        # is not a working camera. Sustained for freeze_timeout_s, same as the
+        # ring-of-1 case, so a transient cannot trip it.
+        self._recent_fps.append(fp)
+        if len(self._recent_fps) == self._recent_fps.maxlen:
+            ratio = len(set(self._recent_fps)) / len(self._recent_fps)
+            if ratio <= self._stall_distinct_ratio:
+                if self._stalled_since is None:
+                    self._stalled_since = mono
+                elif mono - self._stalled_since >= self._freeze_timeout_s:
+                    self._freeze_incidents += 1
+                    n_distinct = len(set(self._recent_fps))
+                    detail = (
+                        f"only {n_distinct} distinct frames in the last "
+                        f"{len(self._recent_fps)} — the device is cycling a ring of "
+                        f"buffers (incident {self._freeze_incidents})"
+                    )
+                    if self._freeze_incidents >= self._freeze_give_up:
+                        self._set_state(STATE_FAILED, "stalled", detail)
+                        self._reopen_request.set()
+                        raise CameraUnavailable("stalled", STATE_FAILED, detail)
+                    self._on_failure("stalled", detail)
+                    raise CameraUnavailable("stalled", self._health.state, detail)
+            else:
+                self._stalled_since = None
+
         if not distinct:
             if self._frozen_since is None:
                 self._frozen_since = mono
@@ -557,8 +601,24 @@ class SupervisedCamera(CameraDriver):
             # never climbs back to `ok`, which is what stops the flap above.
             self._healthy_streak = self._healthy_streak + 1 if distinct else 0
             streak = self._healthy_streak
-        if streak >= self._min_healthy_frames and self._health.state != STATE_OK \
-                and not self._health.terminal:
+
+        # RECOVERY IS JUDGED OVER THE WHOLE WINDOW, not over the last few frames.
+        # A device cycling a ring of buffers passes "N consecutive distinct
+        # frames" trivially — A,B,A,B is distinct at every step — so with only
+        # the streak test it climbed back to `ok` after every reopen and the
+        # incident counter reset with it. It never converged, exactly like the
+        # ring-of-1 flap. The window has to be FULL and genuinely varied before
+        # this camera is allowed to call itself healthy again.
+        window_full = len(self._recent_fps) == self._recent_fps.maxlen
+        window_varied = window_full and (
+            len(set(self._recent_fps)) / len(self._recent_fps) > self._stall_distinct_ratio
+        )
+        if (
+            streak >= self._min_healthy_frames
+            and window_varied
+            and self._health.state != STATE_OK
+            and not self._health.terminal
+        ):
             self._freeze_incidents = 0
             self._set_state(STATE_OK)
         return data
@@ -687,6 +747,8 @@ class SupervisedCamera(CameraDriver):
                 self._last_fingerprint = None
                 self._frozen_since = None
                 self._healthy_streak = 0
+                self._recent_fps.clear()
+                self._stalled_since = None
             if old is not None:
                 self._safe_stop_driver(old)
                 self._set_state(STATE_REOPENING, self._health.reason, self._health.detail)

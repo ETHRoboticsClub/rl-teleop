@@ -119,6 +119,17 @@ CAMERA_SETS = {
     "wrists": {"camera_left": "wrist_left", "camera_right": "wrist_right"},
     "wrists_top": {"camera_top": "top",
                    "camera_left": "wrist_left", "camera_right": "wrist_right"},
+    # RIGHT-arm single-wrist sets, added 2026-08-12 for the first right-arm grasp
+    # dataset. They map camera_RIGHT onto the historical "wrist" suffix, so the
+    # feature layout is identical to yam_grasp_v2_wrist and the two datasets are
+    # directly comparable (and a v2 checkpoint can warm-start this one).
+    #
+    # THE HAZARD THAT BUYS: "wrist" no longer says WHICH wrist, so a left-wrist
+    # checkpoint will load a right-wrist dataset without complaint. That is
+    # acceptable here only because these sets are single-arm and the arm is named
+    # in the repo-id. Never add camera_left to one of these.
+    "wrist_right": {"camera_right": "wrist"},
+    "wrist_right_top": {"camera_top": "top", "camera_right": "wrist"},
 }
 
 
@@ -339,13 +350,68 @@ def usable_grasps(ep: Path, workspace_gate: bool = True,
     return good, None
 
 
-def grasp_windows(grasps: list[dict], t0: float, t1: float,
-                  pre_s: float, post_s: float) -> list[tuple[float, float]]:
-    """[close - pre, close + post] per grasp, clipped so windows never overlap.
+# ── operator keep-list ──────────────────────────────────────────────────────
+# Set by --keep. None means "no keep-list", which is NOT the same as an empty
+# one: None exports everything usable_grasps returns, {} exports nothing.
+KEEP: dict[str, list[float]] | None = None
 
-    Overlap matters: two grasps 2s apart with pre=3/post=2 would otherwise share
-    frames, and the same frames appearing in two training episodes silently
-    inflates the dataset while teaching contradictory actions for one image.
+# t_close comes back through JSON, so allow for float round-trip only — not for
+# "near enough". Two grasps in these takes are never closer than ~1.5 s, so a
+# tolerance this tight cannot match the wrong grasp.
+KEEP_T_TOL = 1e-3
+
+
+def load_keep_list(path) -> dict[str, list[float]]:
+    """Read tools/review_grasps.py's keep-list JSON → {episode: [t_close, ...]}."""
+    data = load_json(Path(path))
+    if data is None:
+        raise SystemExit(f"--keep: cannot read {path}")
+    entries = data.get("keep") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        raise SystemExit(f"--keep: {path} has no 'keep' list")
+    out: dict[str, list[float]] = {}
+    for e in entries:
+        ep = e.get("episode")
+        t = e.get("t_close")
+        if ep is None or t is None:
+            raise SystemExit(f"--keep: entry missing episode/t_close: {e!r}")
+        out.setdefault(str(ep), []).append(float(t))
+    return out
+
+
+def filter_by_keep_list(ep, grasps: list[dict]) -> tuple[list[dict], list[float]]:
+    """Keep only grasps this episode's keep-list names. Returns (kept, unmatched).
+
+    ``unmatched`` is the keep-list times that found no grasp — the caller must
+    treat a non-empty list as an error rather than exporting the remainder,
+    because a partial match means the reviewed set and the exported set differ.
+    """
+    wanted = list((KEEP or {}).get(ep.name, []))
+    kept, used = [], set()
+    for g in grasps:
+        t = g.get("t")
+        if t is None:
+            continue
+        for i, w in enumerate(wanted):
+            if i not in used and abs(float(t) - w) <= KEEP_T_TOL:
+                kept.append(g)
+                used.add(i)
+                break
+    missing = [w for i, w in enumerate(wanted) if i not in used]
+    return kept, missing
+
+
+def grasp_windows_indexed(grasps: list[dict], t0: float, t1: float,
+                          pre_s: float, post_s: float) -> list[tuple[int, float, float]]:
+    """``grasp_windows`` but each window keeps the index of the grasp it came from.
+
+    THE RULE LIVES HERE, ONCE. A window that clips to nothing is dropped, so the
+    output can be SHORTER than the input — and without the index the caller has
+    no way to say which grasps survived. review_grasps.py used to treat that
+    length mismatch as "reject the whole episode", which threw away 30 good
+    grasps because a wrist camera died in the last 79 s of a 392 s take, while
+    the exporter happily wrote those same 30. A review tool that shows less than
+    the exporter writes is the same class of lie as one that shows more.
     """
     ts = sorted(float(g["t"]) for g in grasps if g.get("t") is not None)
     out = []
@@ -357,8 +423,22 @@ def grasp_windows(grasps: list[dict], t0: float, t1: float,
         if i + 1 < len(ts):             # never reach forward past the next one
             hi = min(hi, (t + ts[i + 1]) / 2.0)
         if hi > lo:
-            out.append((lo, hi))
+            out.append((i, lo, hi))
     return out
+
+
+def grasp_windows(grasps: list[dict], t0: float, t1: float,
+                  pre_s: float, post_s: float) -> list[tuple[float, float]]:
+    """[close - pre, close + post] per grasp, clipped so windows never overlap.
+
+    Overlap matters: two grasps 2s apart with pre=3/post=2 would otherwise share
+    frames, and the same frames appearing in two training episodes silently
+    inflates the dataset while teaching contradictory actions for one image.
+
+    A thin wrapper over ``grasp_windows_indexed`` — do not fork the rule.
+    """
+    return [(lo, hi) for _, lo, hi in
+            grasp_windows_indexed(grasps, t0, t1, pre_s, post_s)]
 
 
 # ── signals ─────────────────────────────────────────────────────────────────
@@ -558,6 +638,25 @@ def plan_episode(ep: Path, pre_s: float, post_s: float, fps: int, report: Report
                 return None
             continue
         grasps.extend(g)
+
+    # Operator keep-list from tools/review_grasps.py. The reviewer looked at every
+    # window and said which ones go in; nothing else in this file can know that a
+    # bag was placed upside-down or that the grip slipped after the lift, because
+    # neither leaves a trace in the gripper width or the joint stream.
+    if KEEP is not None:
+        grasps, missing = filter_by_keep_list(ep, grasps)
+        if missing:
+            # LOUD, not silent. A keep-list entry that matches nothing means the
+            # annotations were re-generated after the review, so the reviewed
+            # windows and the exported ones are not the same windows.
+            report.reject(ep.name,
+                          f"keep-list names {len(missing)} grasp(s) with no matching "
+                          f"t_close in annotations (re-run review after re-labelling): "
+                          f"{[round(t, 3) for t in missing[:3]]}")
+            return None
+        if not grasps:
+            report.reject(ep.name, "no grasps in the keep-list")
+            return None
     # A bad take is a bad take for every arm in it -- checked even in "full"
     # mode, where the per-arm annotations may legitimately be missing.
     bad = operator_rejected(ep)
@@ -809,9 +908,18 @@ def main(argv=None) -> int:
                     default=IDLE_ARM_DIVERGENCE_MAX_RAD,
                     help="drop a window if an arm that never moved was commanded "
                          "this far (rad) from where it actually was; 0 disables")
+    ap.add_argument("--keep", default=None,
+                    help="JSON keep-list from tools/review_grasps.py: only the grasps "
+                         "it names are exported. An entry that matches no grasp is a "
+                         "hard error, not a silent skip.")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would be exported, write nothing")
     a = ap.parse_args(argv)
+    if a.keep:
+        global KEEP
+        KEEP = load_keep_list(a.keep)
+        print(f"keep-list: {sum(len(v) for v in KEEP.values())} grasps "
+              f"across {len(KEEP)} episodes")
 
     xm = C.GRASP_WORKSPACE_X_MIN if a.zone_x_min is None else a.zone_x_min
     ym = C.GRASP_ZONE_Y_MAX if a.zone_y_max is None else a.zone_y_max
