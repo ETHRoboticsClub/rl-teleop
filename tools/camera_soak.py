@@ -430,7 +430,12 @@ class Soak:
                 continue
             spec = getattr(getattr(h, "_node", None), "_driver_spec", None) or {}
             path = spec.get("fault_file")
-            return Path(path) if path else None
+            if not path:
+                return None
+            # Same redirection SoakCamera applies, so the runner writes where the
+            # driver reads. See SOAK_FAULT_DIR in fault_injection.py.
+            override = os.environ.get("SOAK_FAULT_DIR")
+            return Path(override) / Path(path).name if override else Path(path)
         return None
 
     def _set_driver_fault(self, node: str, mode: str) -> bool:
@@ -530,6 +535,14 @@ class Soak:
         self.log(f"config      : {args.config}")
         self.log(f"ports       : pub={args.pub_port} sub={args.sub_port}  (live bus is 5555/5556)")
         self.log(f"duration    : {args.duration:.0f}s   faults={'on' if args.faults else 'off'}")
+
+        # Each soak gets its own fault directory, so two runs cannot edit each
+        # other's injected faults. Derived from the ports, which are already
+        # unique per run.
+        if not os.environ.get("SOAK_FAULT_DIR"):
+            os.environ["SOAK_FAULT_DIR"] = f"/tmp/soak_faults/{args.pub_port}"
+        Path(os.environ["SOAK_FAULT_DIR"]).mkdir(parents=True, exist_ok=True)
+        self.log(f"fault dir   : {os.environ['SOAK_FAULT_DIR']}")
 
         self.session = load_session(str(args.config), pub_port=args.pub_port, sub_port=args.sub_port)
         if args.save_root:
@@ -690,6 +703,30 @@ class Soak:
             }, indent=2, default=str))
 
 
+def _install_term_handler(soak: "Soak") -> None:
+    """Stop the session cleanly on SIGTERM / SIGINT.
+
+    Python runs `finally` blocks on KeyboardInterrupt but NOT on a default
+    SIGTERM, so `kill <soak pid>` skipped session.stop() and left every camera
+    node orphaned onto init, still holding the bus ports. Anyone who then tried
+    to start a soak got "Address already in use" and a message blaming a running
+    rr-session — a wrong diagnosis produced by our own cleanup path.
+    """
+    def _stop(signum, _frame):
+        soak.log(f"signal {signum} — stopping the session before exiting")
+        try:
+            if soak.session is not None:
+                soak.session.stop()
+        finally:
+            sys.exit(130)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _stop)
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -711,7 +748,9 @@ def main(argv=None) -> int:
     ap.add_argument("--i-know-what-im-doing", action="store_true",
                     help="skip the live-port check. Do not use while a session is up.")
     args = ap.parse_args(argv)
-    return Soak(args).run()
+    soak = Soak(args)
+    _install_term_handler(soak)
+    return soak.run()
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ them.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -270,6 +271,18 @@ class SoakCamera(CameraDriver):
         self._shape = (h, w)
         self.fps = float(fps) or 30.0
         self.device_path = f"soak://{name}"
+        # SOAK_FAULT_DIR redirects the fault files without touching the config.
+        #
+        # Two soaks running at once — a long one and a round runner, say — both
+        # read the fault_file path baked into the YAML, so each was silently
+        # clearing the other's injected fault mid-check. Neither reported a
+        # violation, and neither result meant anything: an experiment whose
+        # independent variable is being edited by another process is not an
+        # experiment. Each run now gets its own directory.
+        if fault_file:
+            override = os.environ.get("SOAK_FAULT_DIR")
+            if override:
+                fault_file = os.path.join(override, os.path.basename(fault_file))
         self.fault_file = fault_file
         self._seq = 0
         self._frozen: Optional[np.ndarray] = None
