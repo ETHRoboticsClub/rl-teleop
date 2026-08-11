@@ -114,22 +114,133 @@ class CameraBridge:
     cockpit's <img src=".../cam/<id>?t=..."> cache-buster re-fetches it live.
     """
 
+    #: How old the newest envelope may be before /cam/<id> stops serving it.
+    #:
+    #: THE BRIDGE USED TO SERVE THE LAST FRAME FOREVER, at a convincing 15 fps,
+    #: with HTTP 200 and a valid 21 KB JPEG. On 2026-08-10 the cockpit showed a
+    #: wrist panel that was one frame repeated for minutes while the bus carried
+    #: nothing at all. An image that keeps arriving is not evidence that a camera
+    #: is alive; it is evidence that something has a copy of an old picture.
+    #:
+    #: 2.0 s is above any legitimate gap (the slowest camera here is 15 Hz) and
+    #: inside the 2 s detection budget the acceptance bar asks for.
+    STALE_AFTER_S = 2.0
+
     def __init__(self, id_to_topic: dict[str, str], host: str = "127.0.0.1",
-                 port: int | None = None):
+                 port: int | None = None, stale_after_s: float | None = None):
         from robots_realtime.runtime.transport.message_bus import DEFAULT_SUB_PORT
         from robots_realtime.runtime.transport.subscriber import Subscriber
         self._id_to_topic = dict(id_to_topic)
         topics = sorted(set(id_to_topic.values()))
-        self._sub = Subscriber(topics, host=host, port=port or DEFAULT_SUB_PORT)
+        # Also subscribe to every mapped camera's health topic, so the cockpit
+        # can show WHY a panel is dark instead of inferring it from a missing
+        # JPEG. "no image" and "the camera says it is reopening" are different
+        # facts and the operator needs the second one.
+        health_topics = sorted({f"{t.split('/')[0]}/health" for t in topics if "/" in t})
+        self._health_topics = {
+            cam_id: f"{topic.split('/')[0]}/health"
+            for cam_id, topic in self._id_to_topic.items() if "/" in topic
+        }
+        self._sub = Subscriber(topics + health_topics, host=host, port=port or DEFAULT_SUB_PORT)
+        self._stale_after_s = float(
+            stale_after_s if stale_after_s is not None else self.STALE_AFTER_S
+        )
+        # Wall clock, deliberately: the envelope's `ts` is wall clock too, and
+        # comparing monotonic against wall clock is how you get an age of 1.7e9.
+        self._started = time.time()
 
-    def frame(self, cam_id: str):
-        """Latest RGB (H,W,3) uint8 frame for a cam id, or None."""
-        # exact id → topic, else the 'default' topic so no panel is blank
-        topic = self._id_to_topic.get(cam_id) or self._id_to_topic.get("default")
+    # ── staleness ────────────────────────────────────────────────────────────
+
+    def age(self, cam_id: str) -> float | None:
+        """Seconds since the newest envelope for this panel, or None if never."""
+        topic = self._id_to_topic.get(cam_id)
         if topic is None:
             return None
         env = self._sub.get_latest(topic)
         if not env:
+            return None
+        ts = env.get("ts")
+        if not isinstance(ts, (int, float)):
+            return None
+        return max(0.0, time.time() - float(ts))
+
+    def camera_health(self, cam_id: str) -> dict | None:
+        """The camera node's own health record for this panel, if it publishes one."""
+        topic = self._health_topics.get(cam_id)
+        if topic is None:
+            return None
+        env = self._sub.get_latest(topic)
+        if not env:
+            return None
+        data = env.get("data")
+        return dict(data) if isinstance(data, dict) else None
+
+    def state(self, cam_id: str) -> dict:
+        """One honest verdict per panel, for the cockpit and for /cam_health.
+
+        ``state`` is one of:
+          ``unmapped``  — this panel id is not wired to any topic (503)
+          ``no_data``   — mapped, but nothing has ever arrived (503)
+          ``stale``     — the newest frame is older than STALE_AFTER_S (503)
+          ``ok``        — a fresh frame is available
+
+        ``camera`` carries the node's own health record when it publishes one,
+        so a stale panel can say "reopening" rather than just "dark".
+        """
+        if cam_id not in self._id_to_topic:
+            return {"id": cam_id, "state": "unmapped", "age_s": None, "camera": None}
+        age = self.age(cam_id)
+        health = self.camera_health(cam_id)
+        if age is None:
+            state = "no_data"
+        elif age > self._stale_after_s:
+            state = "stale"
+        else:
+            state = "ok"
+        # The camera's own verdict can only make things WORSE, never better: a
+        # node that says `failed` while a frame from 100 ms ago is still in the
+        # buffer is not a healthy panel.
+        if state == "ok" and health is not None and not health.get("healthy", True):
+            state = "unhealthy"
+        return {
+            "id": cam_id,
+            "state": state,
+            "age_s": None if age is None else round(age, 3),
+            "topic": self._id_to_topic.get(cam_id),
+            "camera": health,
+        }
+
+    def all_states(self) -> dict:
+        return {
+            "t": time.time(),
+            "stale_after_s": self._stale_after_s,
+            "cams": {cid: self.state(cid) for cid in sorted(self._id_to_topic)},
+        }
+
+    def frame(self, cam_id: str):
+        """Latest RGB (H,W,3) uint8 frame for a cam id, or None if unmapped.
+
+        NO FALLBACK TO 'default'. Until 2026-08-10 an unmapped id served the
+        default topic "so no panel is blank" — so on a right-arm session the
+        Scan and Handgelenk-links panels both rendered camera_top, and the
+        cockpit showed three copies of the same top-down view while looking
+        entirely healthy. An operator cannot tell that from three working
+        cameras, and it is a worse failure than an empty panel: a blank frame
+        says "no source", a wrong frame asserts a source that isn't there.
+        Unmapped now returns None, which the /cam route turns into a 404.
+        """
+        topic = self._id_to_topic.get(cam_id)
+        if topic is None:
+            return None
+        env = self._sub.get_latest(topic)
+        if not env:
+            return None
+        # STALENESS IS A HARD GATE, not a hint. Serving the last envelope forever
+        # is what made a dead wrist camera look like a working one for minutes:
+        # HTTP 200, valid JPEG, 15 fps, and not one message on the bus behind it.
+        # A panel with no source must be visibly empty, not plausibly full.
+        ts = env.get("ts")
+        if isinstance(ts, (int, float)) and (time.time() - float(ts)) > self._stale_after_s:
             return None
         data = env.get("data") or {}
         # CameraNode publishes {"images": {"rgb": (H,W,3) uint8}, ...}; older
@@ -321,6 +432,20 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
                 self._json(st)
             elif self.path == "/events":
                 self._json(labeler.events)
+            elif self.path.startswith("/cam_health"):
+                # ONE honest verdict per cockpit panel, polled by cockpit-cams.js.
+                #
+                # The cockpit used to infer camera health from "did a JPEG
+                # arrive", which is exactly the signal that lies: the bridge
+                # served the last frame forever, so every panel looked alive
+                # while the bus carried nothing. Health has to be read, not
+                # inferred from the artefact whose freshness is in question.
+                if bridge is None:
+                    self._json({"t": time.time(), "cams": {}, "bridge": False})
+                else:
+                    st = bridge.all_states()
+                    st["bridge"] = True
+                    self._json(st)
             elif self.path.startswith("/cam/"):
                 self._proxy_cam(self.path.split("/cam/", 1)[1])
             else:
@@ -420,18 +545,40 @@ def _make_handler(labeler: LiveLabeler, cam_base: str | None,
                     try:
                         while True:
                             f = bridge.jpeg(cam_id)
-                            if f is not None:
-                                self.wfile.write(
-                                    b"--frame\r\nContent-Type: image/jpeg\r\n"
-                                    b"Content-Length: " + str(len(f)).encode()
-                                    + b"\r\n\r\n" + f + b"\r\n")
+                            if f is None:
+                                # END THE STREAM rather than holding the socket
+                                # open emitting nothing. The old loop kept the
+                                # connection alive forever with no frames, which
+                                # reads to a browser as "still connecting" and to
+                                # a checker as a slow stream. A closed stream is
+                                # an unambiguous "this camera has stopped".
+                                return
+                            self.wfile.write(
+                                b"--frame\r\nContent-Type: image/jpeg\r\n"
+                                b"Content-Length: " + str(len(f)).encode()
+                                + b"\r\n\r\n" + f + b"\r\n")
                             time.sleep(1 / 15.0)
                     except (BrokenPipeError, ConnectionResetError):
                         return
                     return
             # 2) optional proxy fallback
             if not cam_base:
-                self.send_error(503); return
+                # 503 with a REASON. "unmapped", "no_data" and "stale" are three
+                # different operator problems (wrong --bus-cams, node never
+                # started, camera stopped mid-session) and a bare 503 makes them
+                # look like one.
+                reason = "no_bridge"
+                if bridge is not None:
+                    reason = str(bridge.state(cam_id).get("state", "unknown"))
+                self.send_response(503)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("X-Cam-State", reason)
+                self._cors()
+                body = f"camera {cam_id}: {reason}\n".encode()
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
                 up = urllib.request.urlopen(f"{cam_base.rstrip('/')}/cam/{cam_id}", timeout=3)
             except Exception:

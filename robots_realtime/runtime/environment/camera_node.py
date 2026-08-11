@@ -27,8 +27,21 @@ import numpy as np
 
 from robots_realtime.runtime.node import Node, NodeRole
 from robots_realtime.sensors.cameras.camera import CameraData, CameraDriver
+from robots_realtime.sensors.cameras.supervised_camera import (
+    STATE_FAILED,
+    CameraUnavailable,
+    SupervisedCamera,
+    realsense_identity,
+    v4l2_identity,
+)
 
 _logger = logging.getLogger(__name__)
+
+#: How often ``<node>/health`` goes out even when nothing has changed.  The
+#: acceptance bar asks for a dead camera to be visible within ~2 s; 2 Hz plus
+#: an immediate publish on every state change leaves plenty of margin for the
+#: cockpit's own poll period on top.
+_HEALTH_PERIOD_S = 0.5
 
 _CAMERA_DRIVER_REGISTRY: dict[str, str] = {
     "ZedCamera":        "robots_realtime.sensors.cameras.zed_camera:ZedCamera",
@@ -47,6 +60,11 @@ _NODE_ONLY_KEYS = {
     "pinned_cpu",
     "realtime_priority",
     "require_realtime",
+    # Supervision knobs live on the node, not on the driver — they must not be
+    # forwarded into the driver's constructor kwargs.
+    "supervise",
+    "read_deadline_s",
+    "freeze_timeout_s",
 }
 
 
@@ -154,7 +172,7 @@ class CameraNode(Node):
     """
 
     role = NodeRole.SENSOR
-    published_topics: list[str] = ["rgb"]
+    published_topics: list[str] = ["rgb", "health"]
     poll_freq: float | None = None
 
     def __init__(
@@ -168,11 +186,22 @@ class CameraNode(Node):
         publish_resize_mode: str = "center_crop",
         extrinsics: dict[str, Any] | None = None,
         extrinsics_file: str | None = None,
+        supervise: bool = True,
+        read_deadline_s: float = 1.0,
+        freeze_timeout_s: float = 3.0,
+        driver_factory=None,
         **kwargs,
     ) -> None:
         super().__init__(name=name, writer=writer, **kwargs)
         self._driver = driver
         self._driver_spec = _driver_spec
+        self._driver_factory = driver_factory
+        self._supervise = bool(supervise)
+        self._read_deadline_s = float(read_deadline_s)
+        self._freeze_timeout_s = float(freeze_timeout_s)
+        self._supervised: SupervisedCamera | None = None
+        self._last_health_pub = 0.0
+        self._last_health_state = ""
         self.poll_freq = poll_freq
         if extrinsics is not None and extrinsics_file is not None:
             raise ValueError("CameraNode accepts either extrinsics or extrinsics_file, not both")
@@ -196,13 +225,115 @@ class CameraNode(Node):
             self._publish_resize = None
             self._publish_resize_fn = None
 
+    # ------------------------------------------------------------------
+    # Supervision
+    # ------------------------------------------------------------------
+
+    def _make_factory(self):
+        """Return a zero-arg callable that builds a FRESH driver.
+
+        Reopening a camera means constructing a new driver object, because both
+        ``OpencvCamera`` and ``RealSenseCamera`` open their device in
+        ``__post_init__``.  A driver injected as an instance (tests, and the
+        ``driver=`` kwarg) cannot be rebuilt, so it is handed back as-is and
+        reopen degenerates to "reuse the same object" — which is honest for a
+        fake and irrelevant for a real rig, where the driver always comes from
+        ``_driver_spec``.
+        """
+        if self._driver_factory is not None:
+            return self._driver_factory
+        if self._driver_spec is not None:
+            spec = dict(self._driver_spec)
+            return lambda: _instantiate_camera_driver(spec)
+        driver = self._driver
+        if driver is None:
+            raise RuntimeError(
+                f"[{self.name}] CameraNode.driver is None — inject a camera driver before starting."
+            )
+        return lambda: driver
+
+    def _identity_fn(self):
+        """Pick the identity check that matches how this camera is addressed."""
+        spec = self._driver_spec or {}
+        if spec.get("device_path") or getattr(self._driver, "device_path", None):
+            return v4l2_identity
+        if spec.get("device_id") or getattr(self._driver, "device_id", None):
+            return realsense_identity
+        return None
+
     def setup(self) -> None:
-        if self._driver is None:
-            if self._driver_spec is None:
-                raise RuntimeError(
-                    f"[{self.name}] CameraNode.driver is None — inject a camera driver before starting."
-                )
-            self._driver = _instantiate_camera_driver(self._driver_spec)
+        if not self._supervise:
+            # Escape hatch only. An unsupervised camera has no bounded read and
+            # no health topic, which is precisely the configuration that
+            # produced failure #4. Say so at ERROR, every time.
+            _logger.error(
+                "[%s] running UNSUPERVISED (supervise: false) — no bounded read, "
+                "no health topic. A stale device handle will hang this node "
+                "silently. This is not a supported production setting.",
+                self.name,
+            )
+            if self._driver is None:
+                if self._driver_spec is None:
+                    raise RuntimeError(
+                        f"[{self.name}] CameraNode.driver is None — inject a camera driver before starting."
+                    )
+                self._driver = _instantiate_camera_driver(self._driver_spec)
+            return
+
+        spec = self._driver_spec or {}
+        resolution = spec.get("resolution")
+        expected_shape = None
+        if isinstance(resolution, (list, tuple)) and len(resolution) == 2:
+            # Driver configs carry (width, height); frames are (height, width).
+            expected_shape = (int(resolution[1]), int(resolution[0]))
+
+        supervised = SupervisedCamera(
+            self._make_factory(),
+            name=self.name,
+            read_deadline_s=self._read_deadline_s,
+            freeze_timeout_s=self._freeze_timeout_s,
+            expected_shape=expected_shape,
+            target_fps=spec.get("fps"),
+            identity_fn=self._identity_fn(),
+            device_path=str(spec.get("device_path") or spec.get("device_id") or ""),
+        )
+        self._supervised = supervised
+        self._driver = supervised
+        # Wait for the FIRST open to resolve so a camera that cannot be opened at
+        # all is reported before the session declares itself started. Do not
+        # raise on failure: the node must stay alive to keep publishing
+        # health=failed, which is the whole point — a node that dies at setup is
+        # exactly the invisible failure this replaces.
+        if not supervised.wait_until_open(timeout=30.0):
+            _logger.error("[%s] camera did not finish its first open within 30s", self.name)
+        self._publish_health(force=True)
+
+    def _publish_health(self, force: bool = False) -> None:
+        """Publish ``<name>/health``: every state change, and at 2 Hz regardless.
+
+        ``record=False`` deliberately: the writers are video writers keyed on
+        image topics, and health is bus-only telemetry. It must never end up in
+        the mp4 path, both because it would confuse the writer and because
+        health has to be measurable INDEPENDENTLY of what got recorded — the
+        recording path already lies (Publisher.publish writes before the ZMQ
+        send, so a perfect mp4 proves nothing about delivery).
+        """
+        if self._supervised is None:
+            return
+        health = self._supervised.health()
+        state = str(health.get("state", ""))
+        now = time.monotonic()
+        if not force and state == self._last_health_state and now - self._last_health_pub < _HEALTH_PERIOD_S:
+            return
+        self._last_health_pub = now
+        self._last_health_state = state
+        try:
+            self.publish("health", health, record=False)
+        except Exception as exc:                                   # noqa: BLE001
+            # A publish failure must not take the node down on the HEALTH path;
+            # the rgb path below is still allowed to, because a node that cannot
+            # publish frames should die loudly rather than pretend.
+            _logger.warning("[%s] health publish failed: %s", self.name, exc)
 
     def step(self) -> None:
         if self._driver is None:
@@ -210,6 +341,23 @@ class CameraNode(Node):
         driver = self._driver
         try:
             data: CameraData = driver.read()
+        except CameraUnavailable as exc:
+            # THE FIX FOR FAILURE #4. The old code let a stale handle spin inside
+            # read() forever: step() never returned, _tick() never ran, and the
+            # node published nothing at all — not even its heartbeat — while
+            # staying alive and green in the TUI.
+            #
+            # Now every device-loss shape arrives here as a bounded, named event.
+            # We publish health, return normally so _tick() runs and the
+            # heartbeat keeps flowing, and let the supervisor reopen. A camera
+            # that is failing is now a camera that is SAYING it is failing.
+            self._publish_health(force=True)
+            level = _logger.error if exc.state == STATE_FAILED else _logger.warning
+            level("[%s] no frame (%s): %s", self.name, exc.reason, exc.detail)
+            # Back off a little so a hard-down camera does not spin this loop at
+            # full tilt; the deadline inside read() already paces the normal case.
+            time.sleep(0.05)
+            return
         except Exception as exc:
             _logger.error("[%s] camera read failed: %s", self.name, exc)
             if hasattr(driver, "stop"):
@@ -265,10 +413,15 @@ class CameraNode(Node):
                 "ts": imu.timestamp,
             }, ts=ts)
 
+        self._publish_health()
+
     def cleanup(self) -> None:
+        # SupervisedCamera.stop() also joins its supervisor thread and closes the
+        # inner driver, so one call covers both the supervised and the bare case.
         driver = self._driver
         if driver is not None and hasattr(driver, "stop"):
             driver.stop()
+        self._supervised = None
 
     @classmethod
     def build_kwargs(cls, params: dict) -> dict:
@@ -279,6 +432,9 @@ class CameraNode(Node):
             "publish_resize_mode": params.get("publish_resize_mode", "center_crop"),
             "extrinsics": params.get("extrinsics"),
             "extrinsics_file": params.get("extrinsics_file"),
+            "supervise": params.get("supervise", True),
+            "read_deadline_s": params.get("read_deadline_s", 1.0),
+            "freeze_timeout_s": params.get("freeze_timeout_s", 3.0),
         }
         if "driver" in params:
             driver_kwargs = {k: v for k, v in params.items() if k not in _NODE_ONLY_KEYS}

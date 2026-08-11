@@ -198,6 +198,10 @@ def _load_from_yaml(
         episode_timeout=episode_timeout,
         instruction=instruction,
         instruction_mappings=instruction_mappings,
+        # Opt-in strict recording: refuse to start an episode while any camera
+        # is unhealthy, instead of recording it with a degraded marker. Default
+        # is False — see the rationale block above Session.start_episode.
+        require_healthy_cameras=bool(session_cfg.get("require_healthy_cameras", False)),
     )
     if resolved_pub_port is not None or resolved_sub_port is not None:
         session.configure_bus_ports(

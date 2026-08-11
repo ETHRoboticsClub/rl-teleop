@@ -373,8 +373,14 @@ def _host_worker(
                 try:
                     node.start_recording(save_dir)
                 except Exception as e:
-                    pass  # best-effort; don't crash the control loop
-                ctrl.send(_CTRL_OK)
+                    # Still must not crash the control loop — but replying OK
+                    # after a failed open told the parent this node was
+                    # recording when it was not, and the episode then finished
+                    # missing that node's data with nothing logged anywhere.
+                    # Report the failure; the parent raises and Session logs it.
+                    ctrl.send(f"ERR:{type(e).__name__}: {e}".encode())
+                else:
+                    ctrl.send(_CTRL_OK)
             elif msg == b"STOP_RECORDING":
                 try:
                     node.stop_recording()
@@ -431,6 +437,15 @@ class ProcessHost:
         self._proc: mp.Process | None = None
         self._ctx = zmq.Context.instance()
         self._ctrl: zmq.Socket | None = None
+        # ZMQ REQ enforces strict send→recv alternation. Two callers overlapping
+        # on this socket leave it in a state where every later send() raises
+        # "Operation cannot be accomplished in current state" — permanently, for
+        # this node only, with the node's own loop and publishing unaffected. It
+        # then records nothing for the rest of the session while the TUI shows it
+        # green. There are at least three concurrent callers on this rig: the TUI
+        # keys, the HTTP control server (:8792, which the cockpit REC button
+        # drives), and end_episode's parallel stop_recording threads.
+        self._ctrl_lock = threading.Lock()
 
     def start(self, timeout: float = 10.0, log_path: Path | None = None) -> None:
         """Spawn subprocess and wait until its control socket is bound."""
@@ -447,52 +462,97 @@ class ProcessHost:
         self._ctrl = self._ctx.socket(zmq.REQ)
         self._ctrl.connect(self._ctrl_addr)
 
+    def _request(self, payload: bytes) -> bytes:
+        """One REQ/REP round trip, serialized. THE LOCK IS THE POINT — see __init__.
+
+        The reply is returned so callers can distinguish OK from an error the
+        child reports; it used to be discarded, which is why a node that failed
+        to open its writer still looked like it had succeeded.
+        """
+        assert self._ctrl is not None
+        with self._ctrl_lock:
+            self._ctrl.send(payload)
+            return self._ctrl.recv()
+
+    def _request_checked(self, payload: bytes, what: str) -> None:
+        """_request, but raise if the child reports a failure instead of OK."""
+        reply = self._request(payload)
+        if reply != _CTRL_OK:
+            raise RuntimeError(
+                f"node {self._node.name!r} failed to {what}: "
+                f"{reply.decode(errors='replace')}"
+            )
+
     def send_start(self) -> None:
         """Tell the node subprocess to begin its loop."""
-        assert self._ctrl is not None
-        self._ctrl.send(b"START")
-        self._ctrl.recv()
+        self._request(b"START")
 
     def start_recording(self, save_dir: str) -> None:
         """Tell the node subprocess to start recording into save_dir."""
-        assert self._ctrl is not None
-        self._ctrl.send(f"START_RECORDING:{save_dir}".encode())
-        self._ctrl.recv()
+        self._request_checked(f"START_RECORDING:{save_dir}".encode(), "start recording")
 
     def stop_recording(self) -> str:
         """Tell the node subprocess to stop recording.  Returns empty string."""
-        assert self._ctrl is not None
-        self._ctrl.send(b"STOP_RECORDING")
-        self._ctrl.recv()
+        self._request(b"STOP_RECORDING")
         return ""
 
     def pause(self) -> None:
         """Tell the node subprocess to enter its paused state."""
-        assert self._ctrl is not None
-        self._ctrl.send(b"PAUSE")
-        self._ctrl.recv()
+        self._request(b"PAUSE")
 
     def resume(self) -> None:
         """Tell the node subprocess to exit its paused state."""
-        assert self._ctrl is not None
-        self._ctrl.send(b"RESUME")
-        self._ctrl.recv()
+        self._request(b"RESUME")
 
     def stop(self, timeout: float = 8.0) -> None:
         if self._ctrl is not None:
-            self._ctrl.setsockopt(zmq.RCVTIMEO, 2000)  # 2 s receive timeout
-            self._ctrl.send(_CTRL_STOP)
-            try:
-                self._ctrl.recv()
-            except zmq.ZMQError:
-                pass  # timeout or error — proceed to kill
-            self._ctrl.close(linger=0)
-            self._ctrl = None
+            # Same lock as every other control call: a concurrent request racing
+            # a shutdown is one of the ways the REQ socket ends up wedged.
+            with self._ctrl_lock:
+                self._ctrl.setsockopt(zmq.RCVTIMEO, 2000)  # 2 s receive timeout
+                self._ctrl.send(_CTRL_STOP)
+                try:
+                    self._ctrl.recv()
+                except zmq.ZMQError:
+                    pass  # timeout or error — proceed to kill
+                self._ctrl.close(linger=0)
+                self._ctrl = None
         if self._proc is not None and self._proc.is_alive():
             self._proc.join(timeout=timeout)
             if self._proc.is_alive():
                 self._proc.kill()  # SIGKILL — cleanup already had its chance
             self._proc = None
+
+    def is_alive(self) -> bool:
+        """True while the node's subprocess is running.
+
+        THIS IS WHY THE TUI DOT COULD NEVER TURN RED. ``NodeStatus.alive`` was
+        initialised True and assigned nowhere in the repository, and
+        ``_proc.is_alive()`` was called in exactly one place — ``stop()``. A
+        camera node that died in ``setup()`` (``RuntimeError: No device
+        connected``) left a defunct process inside a live session for eleven
+        minutes while the TUI showed it green and three cockpit panels pointed
+        at it.
+
+        ``Process.is_alive()`` also reaps: it calls ``waitpid`` internally on a
+        finished child, so polling this clears the zombie rather than letting it
+        accumulate for the life of the session.
+        """
+        proc = self._proc
+        if proc is None:
+            return False
+        return bool(proc.is_alive())
+
+    @property
+    def exitcode(self) -> int | None:
+        proc = self._proc
+        return None if proc is None else proc.exitcode
+
+    @property
+    def pid(self) -> int | None:
+        """OS pid of the node subprocess, for process-level fault injection."""
+        proc = self._proc
+        return None if proc is None else proc.pid
 
     @property
     def node_name(self) -> str:

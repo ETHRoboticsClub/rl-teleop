@@ -11,6 +11,10 @@ import numpy as np
 from robots_realtime.sensors.cameras.camera import CameraData, CameraDriver
 
 
+class OpencvCameraReadError(RuntimeError):
+    """A bounded read failed. Raised instead of spinning forever — see read()."""
+
+
 @dataclass
 class OpencvCamera(CameraDriver):
     """
@@ -33,6 +37,10 @@ class OpencvCamera(CameraDriver):
     auto_exposure_max: int = 200
     auto_exposure_speed: float = 0.25
     auto_exposure_period_s: float = 0.5
+    # How long read() may keep retrying a failing cap.read() before it raises.
+    # Long enough to ride out a dropped USB frame (a frame is 33 ms at 30 Hz),
+    # short enough that device loss is reported well inside the 2 s budget.
+    read_timeout_s: float = 1.0
     name: Optional[str] = None
 
     def __repr__(self) -> str:
@@ -43,6 +51,17 @@ class OpencvCamera(CameraDriver):
         self._exposure: Optional[int] = None
         self._apply_v4l2_controls()
         self.cap = cv2.VideoCapture(self.device_path)
+        # Fail at OPEN, not silently at read. cv2.VideoCapture on a device node
+        # that does not exist (or is already claimed) returns a perfectly usable
+        # object whose read() just answers (False, None) forever — which is the
+        # exact shape of failure #4, arrived at by a different road. An
+        # unopenable camera must say so while there is still a stack to say it in.
+        if not self.cap.isOpened():
+            raise OpencvCameraReadError(
+                f"{self.device_path}: cv2.VideoCapture could not open the device "
+                f"(missing device node, wrong by-path link, or already claimed by "
+                f"another process)"
+            )
         if self.fourcc:
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.fourcc))
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
@@ -134,17 +153,59 @@ class OpencvCamera(CameraDriver):
         return []
 
     def read(self) -> CameraData:
+        """Read one frame, or raise ``OpencvCameraReadError`` within a deadline.
+
+        THIS LOOP USED TO BE UNBOUNDED, and that single fact is the root cause of
+        failure #4 in ``CAMERA-RELIABILITY-FINDINGS.md``. It was:
+
+            ret, frame = self.cap.read()
+            while not ret:                 # no timeout, no log, no raise, no bound
+                ret, frame = self.cap.read()
+                time.sleep(0.01)
+
+        A UVC handle that has gone stale — after a replug, a port change, or the
+        device dropping off the bus — returns ``(False, None)`` forever without
+        raising. So the loop never exited. ``CameraNode.step()`` never returned,
+        ``Node._tick()`` never ran, and the node published NOTHING (not even its
+        ``_step_hz`` heartbeat) while staying alive, keeping a green TUI dot, and
+        leaving a perfectly valid mp4 behind. Reproduced: 797 ``cap.read()`` calls
+        in 5 s, zero bus messages, ``alive=True  step_hz=29.3``, frozen.
+
+        Now it is bounded and it RAISES, which makes the OpenCV path behave the
+        same way the RealSense path already did. Same event, same behaviour, one
+        contract — and ``SupervisedCamera`` turns that raise into a reopen with
+        backoff plus a health record, so the recovery is automatic and the
+        failure is loud. Retrying at all (rather than raising on the first
+        ``ret=False``) is deliberate: a single dropped USB frame under bandwidth
+        pressure is normal on these webcams and must not trigger a reopen.
+        """
+        deadline = time.monotonic() + self.read_timeout_s
+        attempts = 0
         try:
             ret, frame = self.cap.read()
             capture_time_ms = time.time() * 1000
             while not ret:
-                # If read failed, retry and update capture time
+                attempts += 1
+                if time.monotonic() >= deadline:
+                    raise OpencvCameraReadError(
+                        f"{self.device_path}: cap.read() returned ret=False "
+                        f"{attempts} times over {self.read_timeout_s:.2f}s — the "
+                        f"device handle is stale (replug / port change / bus drop)"
+                    )
+                # Monotonic, never time.time(): a wall-clock step backwards must
+                # not extend this deadline into a hang.
+                time.sleep(0.005)
                 ret, frame = self.cap.read()
                 capture_time_ms = time.time() * 1000
-                time.sleep(0.01)
+        except OpencvCameraReadError:
+            raise
         except Exception as e:
             logging.error(f"Error reading frame: {e}")
             raise e
+        if frame is None:
+            # ret=True with no buffer. Seen on truncated MJPEG; treat it exactly
+            # like a failed read rather than crashing in ascontiguousarray.
+            raise OpencvCameraReadError(f"{self.device_path}: cap.read() returned ret=True but no frame")
         frame = np.ascontiguousarray(frame)
         self._update_auto_exposure(frame)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

@@ -134,11 +134,25 @@ def _date_label(date: str) -> str:
     return f"{date[6:8]}.{date[4:6]}.{date[0:4]}" if DATE_RE.match(date) else date
 
 
+def _annotations_path(d: Path, arm: str) -> Path:
+    """This arm's annotations file. Delegates to label_episode, which owns the
+    naming, so the two can never drift apart. Imported lazily: label_episode
+    pulls in numpy and the FK stack, and the archive is meant to start fast."""
+    from robots_realtime.labeling.label_episode import annotations_path
+    return annotations_path(d, arm)
+
+
 def summarise(d: Path, arm: str) -> dict:
     """Everything the archive card needs, from the files on disk alone."""
     date, ep_id = d.parent.name, d.name
     meta = _read_json(d / "session_meta.json")
-    ann = _read_json(d / "annotations.json")
+    # Arm-aware: label_episode writes annotations.json for LEFT and
+    # annotations_<arm>.json for every other arm (label_episode.annotations_path
+    # is the authority). This used to hardcode the left name, so a right-arm
+    # episode came back labeled=False / grasps=0 even when its annotations
+    # existed — and the archive card renders as an unlabelled stub. Silent, and
+    # indistinguishable from "the labeller found nothing".
+    ann = _read_json(_annotations_path(d, arm))
     kit = _read_json(d / "kit.json")
 
     cams = []
@@ -445,8 +459,9 @@ def make_handler(archive: Archive):
                     self._send_file(d, parts[4])
                     return
                 if what == "annotations":
-                    self._json(_read_json(d / "annotations.json") or {"ok": False,
-                                                                     "error": "not labeled"})
+                    # Same arm-aware lookup as summarise(); see _annotations_path.
+                    self._json(_read_json(_annotations_path(d, archive.arm))
+                               or {"ok": False, "error": "not labeled"})
                     return
                 if what == "thumb":
                     self._send_thumb(d, date, ep_id, (q.get("cam") or [None])[0])
