@@ -254,6 +254,8 @@ class SupervisedCamera(CameraDriver):
         open_timeout_s: float = 20.0,
         give_up_after: int = 5,
         geometry_give_up: int = 3,
+        freeze_give_up: int = 2,
+        min_healthy_frames: int = 3,
         expected_shape: Optional[Tuple[int, int]] = None,
         target_fps: Optional[float] = None,
         identity_fn: Optional[Callable[[CameraDriver], str]] = None,
@@ -269,6 +271,12 @@ class SupervisedCamera(CameraDriver):
         self._open_timeout_s = float(open_timeout_s)
         self._give_up_after = int(give_up_after)
         self._geometry_give_up = int(geometry_give_up)
+        # How many freeze incidents may be "cured" by a reopen before the camera
+        # is declared failed instead of being reopened round and round.
+        self._freeze_give_up = int(freeze_give_up)
+        # Consecutive DISTINCT frames required before a recovering camera is
+        # allowed to call itself ok. See _accept.
+        self._min_healthy_frames = max(1, int(min_healthy_frames))
         self._expected_shape = tuple(expected_shape) if expected_shape else None
         self._min_period_s = (1.0 / float(target_fps)) if target_fps else 0.0
         self._identity_fn = identity_fn
@@ -292,6 +300,8 @@ class SupervisedCamera(CameraDriver):
         self._last_fingerprint: Optional[str] = None
         self._frozen_since: Optional[float] = None
         self._geometry_failures = 0
+        self._freeze_incidents = 0
+        self._healthy_streak = 0
         self._orphans: list[threading.Thread] = []
 
         self._health = CameraHealth(
@@ -363,9 +373,21 @@ class SupervisedCamera(CameraDriver):
         # hang: a driver blocked inside a C call, and a driver spinning on a
         # stale handle returning (False, None) — the pump makes them identical
         # from here, which is the point.
-        self._on_failure("timeout", f"no frame within {self._read_deadline_s:.2f}s")
-        raise CameraUnavailable("timeout", self._health.state,
-                                f"no frame within {self._read_deadline_s:.2f}s")
+        with self._lock:
+            have_driver = self._driver is not None
+            prior_reason = self._health.reason
+        if have_driver:
+            reason = "timeout"
+            detail = f"no frame within {self._read_deadline_s:.2f}s"
+        else:
+            # DON'T RELABEL THE CAUSE. With no device open at all, "no frame
+            # within 0.40s" is true but useless — it describes the symptom and
+            # buries the fact that the camera could not be opened in the first
+            # place. Keep the reason the supervisor established.
+            reason = prior_reason or "no_device"
+            detail = "no camera device is open"
+        self._on_failure(reason, detail)
+        raise CameraUnavailable(reason, self._health.state, detail)
 
     def read_calibration_data_intrinsics(self) -> Dict[str, Any]:
         with self._lock:
@@ -429,6 +451,17 @@ class SupervisedCamera(CameraDriver):
         assert state in _ALL_STATES
         with self._lock:
             prev = self._health.state
+            # FAILED IS STICKY. A camera that has been declared failed keeps
+            # retrying, and each retry passes through `reopening` and a `warmup`
+            # `degraded` — so without this, a hard-down camera flickers between
+            # three states forever and an operator glancing at the cockpit sees
+            # a busy-looking panel rather than a broken one. Only an earned
+            # recovery to `ok` (or a different terminal reason) clears it. The
+            # reason/detail below still update, so the record stays current.
+            if prev == STATE_FAILED and state in (STATE_DEGRADED, STATE_REOPENING):
+                self._health.reason = reason or self._health.reason
+                self._health.detail = (detail or self._health.detail)[:300]
+                return
             self._health.state = state
             self._health.reason = reason
             self._health.detail = detail[:300]
@@ -480,11 +513,30 @@ class SupervisedCamera(CameraDriver):
             raise CameraUnavailable("geometry", self._health.state, detail)
 
         fp = _fingerprint(arr)
-        if fp == self._last_fingerprint:
+        distinct = fp != self._last_fingerprint
+        if not distinct:
             if self._frozen_since is None:
                 self._frozen_since = mono
             elif mono - self._frozen_since >= self._freeze_timeout_s:
-                detail = f"identical frames for {mono - self._frozen_since:.1f}s"
+                self._freeze_incidents += 1
+                detail = (
+                    f"identical frames for {mono - self._frozen_since:.1f}s "
+                    f"(incident {self._freeze_incidents})"
+                )
+                # A REOPEN DOES NOT ALWAYS CURE A FREEZE, and when it does not,
+                # the naive version of this code flapped: detect -> reopen ->
+                # accept the first frame as healthy -> freeze again, forever.
+                # The camera then spent most of its life reporting `ok` while
+                # publishing one repeated image, which is the exact failure the
+                # freeze check exists to catch, reintroduced by the cure.
+                if self._freeze_incidents >= self._freeze_give_up:
+                    self._set_state(
+                        STATE_FAILED, "frozen",
+                        f"{self._freeze_incidents} freeze incidents; reopening is not "
+                        f"clearing it — the device is delivering one repeated buffer",
+                    )
+                    self._reopen_request.set()
+                    raise CameraUnavailable("frozen", STATE_FAILED, detail)
                 self._on_failure("frozen", detail)
                 raise CameraUnavailable("frozen", self._health.state, detail)
             # Inside the freeze grace period the frame is still delivered: a
@@ -498,7 +550,16 @@ class SupervisedCamera(CameraDriver):
             self._health.frames += 1
             self._health.consecutive_failures = 0
             self._geometry_failures = 0
-        if self._health.state != STATE_OK and not self._health.terminal:
+            # OK IS EARNED, NOT ASSUMED. Only a frame whose CONTENT differs from
+            # the previous one counts towards recovery. One frame proves the
+            # handle is open; it does not prove the sensor is producing. A
+            # camera stuck on one buffer therefore never accumulates a streak and
+            # never climbs back to `ok`, which is what stops the flap above.
+            self._healthy_streak = self._healthy_streak + 1 if distinct else 0
+            streak = self._healthy_streak
+        if streak >= self._min_healthy_frames and self._health.state != STATE_OK \
+                and not self._health.terminal:
+            self._freeze_incidents = 0
             self._set_state(STATE_OK)
         return data
 
@@ -510,6 +571,7 @@ class SupervisedCamera(CameraDriver):
             if self._health.terminal:
                 return
             self._health.consecutive_failures += 1
+            self._healthy_streak = 0
             n = self._health.consecutive_failures
         logger.warning("[%s] camera read failure #%d (%s): %s", self.name, n, reason, detail)
         self._set_state(STATE_REOPENING, reason, detail)
@@ -624,6 +686,7 @@ class SupervisedCamera(CameraDriver):
                 self._pump_error = None
                 self._last_fingerprint = None
                 self._frozen_since = None
+                self._healthy_streak = 0
             if old is not None:
                 self._safe_stop_driver(old)
                 self._set_state(STATE_REOPENING, self._health.reason, self._health.detail)

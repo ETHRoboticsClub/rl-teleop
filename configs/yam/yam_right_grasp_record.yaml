@@ -173,8 +173,6 @@ nodes:
       # Added 2026-08-11 alongside re-enabling the camera_scan node below. The rule
       # this file keeps repeating still holds: a panel is added in the SAME edit as
       # its publisher, never before, because a black panel reads as a dark scene.
-      scan: camera_scan/rgb
-      left: camera_left/rgb
       # Added 2026-08-10 in the SAME edit that enabled the camera_right node below,
       # which is the rule the original comment here laid down: never a panel
       # without a publisher, because black reads as "dark scene", not "no camera".
@@ -206,39 +204,6 @@ nodes:
     extrinsics:
       position: [0.0, 0.0, 0.4]
       rpy_radians: [1.2, 3.1416, 1.2]
-
-  # ── SCAN CAMERA: RE-ENABLED 2026-08-11, replugged on a different controller. ──
-  # D435i 241222077246, mounted top-down over the box — the label/OCR "scan" view.
-  #
-  # fps IS 15, NOT 30, AND THAT IS NOT A TYPO. The D435i now enumerates on bus 1,
-  # which is USB 2.0 (480 Mbit); the D455 is on bus 4 at 5000 Mbit. At USB 2.0 this
-  # camera's colour profiles are:
-  #     1920x1080 @ 8 Hz | 1280x720 @ 15/10/6 Hz | 640x480 @ 30/15/6 Hz
-  # Asking for the old 1280x720@30 gets `RuntimeError: Couldn't resolve requests`
-  # out of pipe.start() and the node dies before publishing anything.
-  #
-  # Resolution is the axis that must not move: this camera exists to OCR part
-  # numbers, and the measured decode floor is ~800 px across the label (640x480
-  # reads nothing, 800x600 reads 3/3 — MORNING.md). Frame rate is not load-bearing
-  # for reading a stationary label, so 720p@15 is the right trade at USB 2.0.
-  # Moving it to a USB 3 port restores 720p@30; nothing else needs to change.
-  - type: CameraNode
-    name: camera_scan
-    driver: RealSenseCamera
-    device_id: "241222077246"
-    resolution: [1280, 720]   # 720p so the scan-cam OCR can read the part numbers
-    fps: 15                   # USB 2.0 ceiling at this resolution — see above
-    enable_depth: false
-    # Bus copy only. The DISK recording keeps the full 1280x720 (camera_node.py
-    # publishes with record_data=msg), so OCR and training data are unaffected —
-    # this shrinks what four simultaneous cameras push through one ZMQ proxy.
-    publish_resize: [270, 480]   # [HEIGHT, WIDTH] — NOT [W,H]
-    # pad, NOT the center_crop DEFAULT: center_crop keeps only the largest
-    # SQUARE of the frame (720x720 out of 1280x720) and throws the left and
-    # right thirds away — the cockpit then shows a small centre crop instead
-    # of the scene. pad preserves the full field of view, and since these
-    # targets match each camera's aspect ratio exactly there is no letterbox.
-    publish_resize_mode: pad
 
   # ── RIGHT WRIST CAMERA: NOT CONFIGURED. See BLOCKER 2. ────────────────────
   # This block is a TEMPLATE, not a setting. The device_path below is copied from
@@ -291,49 +256,6 @@ nodes:
     name: camera_right
     driver: OpenCVCamera
     device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.2:1.0-video-index0
-    resolution: [640, 480]
-    fps: 30
-    publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]   # bus copy only; disk keeps 640x480
-    # pad, NOT the center_crop DEFAULT: center_crop keeps only the largest
-    # SQUARE of the frame (720x720 out of 1280x720) and throws the left and
-    # right thirds away — the cockpit then shows a small centre crop instead
-    # of the scene. pad preserves the full field of view, and since these
-    # targets match each camera's aspect ratio exactly there is no letterbox.
-    publish_resize_mode: pad
-    v4l2_controls:
-      brightness: 0
-      contrast: 28
-      saturation: 64
-  #     white_balance_automatic: 1
-  #     gamma: 100
-  #     gain: 0
-  #     power_line_frequency: 1
-  #     sharpness: 3
-  #     auto_exposure: 1
-  #     exposure_time_absolute: 50
-  #   auto_exposure_enabled: true
-  #   auto_exposure_target: 120
-  #   auto_exposure_min: 20
-  #   auto_exposure_max: 130
-
-  # ── LEFT WRIST CAMERA ─────────────────────────────────────────────────────
-  # Added 2026-08-11. This is the LEFT arm's wrist camera, and it is present in a
-  # right-arm config on purpose: the operator wants all four cameras visible on
-  # the cockpit at once, and a CameraNode only opens a USB device — it commands
-  # no arm. The left follower is not in this config and is not energised by it.
-  #
-  # usb-0:1.3 is the LEFT wrist, verified by frame content (jaws over the dark
-  # mat) and by matching the live left kitting config. usb-0:1.1 is the right.
-  # The two Innomakers share a serial, so the by-path port IS the identity —
-  # re-verify after any replug or reboot, never assume.
-  #
-  # No fourcc: MJPG, matching the left kitting config: this webcam ships truncated
-  # MJPEG under bandwidth pressure and libjpeg renders that as a torn green/grey
-  # frame. Raw YUYV at 640x480x2x30 fits USB 2 and cannot truncate that way.
-  - type: CameraNode
-    name: camera_left
-    driver: OpenCVCamera
-    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.3:1.0-video-index0
     resolution: [640, 480]
     fps: 30
     publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]   # bus copy only; disk keeps 640x480

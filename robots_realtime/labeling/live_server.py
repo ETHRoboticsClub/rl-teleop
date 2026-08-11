@@ -165,7 +165,13 @@ class CameraBridge:
         return max(0.0, time.time() - float(ts))
 
     def camera_health(self, cam_id: str) -> dict | None:
-        """The camera node's own health record for this panel, if it publishes one."""
+        """The camera node's own health record for this panel, if it publishes one.
+
+        The record carries its OWN age and a ``stale`` flag. A health topic that
+        has stopped updating is not evidence of health — SIGSTOP a camera node
+        and it publishes nothing at all, leaving a cheerful ``ok`` sitting on the
+        bus for as long as anyone cares to read it.
+        """
         topic = self._health_topics.get(cam_id)
         if topic is None:
             return None
@@ -173,7 +179,18 @@ class CameraBridge:
         if not env:
             return None
         data = env.get("data")
-        return dict(data) if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        out = dict(data)
+        ts = env.get("ts")
+        if isinstance(ts, (int, float)):
+            age = max(0.0, time.time() - float(ts))
+            out["health_age_s"] = round(age, 3)
+            if age > self._stale_after_s:
+                out["stale"] = True
+                out["healthy"] = False
+                out["state"] = "stale"
+        return out
 
     def state(self, cam_id: str) -> dict:
         """One honest verdict per panel, for the cockpit and for /cam_health.
@@ -241,6 +258,14 @@ class CameraBridge:
         # A panel with no source must be visibly empty, not plausibly full.
         ts = env.get("ts")
         if isinstance(ts, (int, float)) and (time.time() - float(ts)) > self._stale_after_s:
+            return None
+        # AND the camera's own verdict. Freshness of the ENVELOPE is not enough:
+        # a frozen camera publishes a brand-new message every 33 ms carrying the
+        # same picture, so the age check waves it straight through. That is the
+        # exact failure this bridge is supposed to stop lying about, arriving by
+        # a different road. One definition of healthy, honoured everywhere.
+        health = self.camera_health(cam_id)
+        if health is not None and not health.get("healthy", True):
             return None
         data = env.get("data") or {}
         # CameraNode publishes {"images": {"rgb": (H,W,3) uint8}, ...}; older
@@ -899,6 +924,13 @@ def main(argv=None):
                     ))
     ap.add_argument("--control-url", default="http://localhost:8792",
                     help="rr-session control surface, used by --episode-mode grasp")
+    ap.add_argument("--bus-sub-port", type=int, default=None,
+                    help="bus XPUB port to subscribe to (default 5556). Point this at "
+                         "5566 to bridge a soak session without touching the live bus.")
+    ap.add_argument("--cam-stale-after", type=float, default=CameraBridge.STALE_AFTER_S,
+                    help="seconds before /cam/<id> stops serving the last frame and "
+                         "starts returning 503. Serving a stale frame forever is the "
+                         "bug this exists to prevent; raise it only with a reason.")
     args = ap.parse_args(argv)
 
     labeler = LiveLabeler(open_ref=args.open_ref, closed_ref=args.closed_ref)
@@ -924,8 +956,12 @@ def main(argv=None):
     bridge = None
     if args.bus_cams:
         id_to_topic = dict(p.split("=", 1) for p in args.bus_cams.split(",") if "=" in p)
-        bridge = CameraBridge(id_to_topic, host="127.0.0.1")
-        print(f"Camera bridge: {id_to_topic}")
+        bridge = CameraBridge(
+            id_to_topic, host="127.0.0.1",
+            port=args.bus_sub_port, stale_after_s=args.cam_stale_after,
+        )
+        print(f"Camera bridge: {id_to_topic} (bus sub port "
+              f"{args.bus_sub_port or 'default'}, stale after {args.cam_stale_after}s)")
 
     # Packet detector: reads the scan cam, finds each kit packet's box + part id so
     # the cockpit can draw the "pick this next" box. Optional — needs easyocr; if it

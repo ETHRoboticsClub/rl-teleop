@@ -236,6 +236,107 @@ class FaultyDriverFactory:
         return FaultyDriver(self._spec, self._name)
 
 
+class SoakCamera(CameraDriver):
+    """A YAML-constructible synthetic camera, for hardware-free rig soaks.
+
+    WHY IT EXISTS. Tier B (real processes, SIGSTOP/SIGKILL, port squatting,
+    broker death, cold start) needs real subprocesses but does NOT need real
+    devices. Separating those two is what makes the process-level tier runnable
+    while the operator's session owns all four physical cameras — Mode B in the
+    handoff, where opening a RealSense a second time would steal it.
+
+    Faults are driven through a FILE rather than through this object, because
+    the driver lives in a node subprocess that the soak runner cannot reach
+    in-process. Writing a mode name into ``fault_file`` flips the camera; an
+    absent or empty file means healthy. That is also how the operator reproduces
+    a fault by hand:
+
+        echo frozen  > /tmp/soak_faults/camera_top
+        echo ret_false > /tmp/soak_faults/camera_left
+        : > /tmp/soak_faults/camera_top      # healthy again
+    """
+
+    def __init__(
+        self,
+        name: str = "soak",
+        resolution: tuple[int, int] | list[int] = (640, 480),
+        fps: float = 30.0,
+        fault_file: Optional[str] = None,
+        **_ignored: Any,
+    ) -> None:
+        self.name = name
+        w, h = int(resolution[0]), int(resolution[1])
+        self.resolution = (w, h)
+        self._shape = (h, w)
+        self.fps = float(fps) or 30.0
+        self.device_path = f"soak://{name}"
+        self.fault_file = fault_file
+        self._seq = 0
+        self._frozen: Optional[np.ndarray] = None
+        self._next_t = time.monotonic()
+        self._stopped = threading.Event()
+
+    def _mode(self) -> str:
+        if not self.fault_file:
+            return MODE_OK
+        try:
+            with open(self.fault_file, encoding="utf-8") as f:
+                return f.read().strip() or MODE_OK
+        except FileNotFoundError:
+            return MODE_OK
+        except Exception:
+            return MODE_OK
+
+    def read(self) -> CameraData:
+        # Pace like a real camera so the node's loop rate is realistic.
+        self._next_t += 1.0 / self.fps
+        delay = self._next_t - time.monotonic()
+        if delay > 0:
+            self._stopped.wait(delay)
+        else:
+            self._next_t = time.monotonic()
+
+        mode = self._mode()
+        self._seq += 1
+
+        if mode == MODE_HANG:
+            self._stopped.wait()
+            raise FaultyDriverError("stopped while hung")
+        if mode in (MODE_RAISE, MODE_GONE):
+            raise FaultyDriverError(f"{self.name}: device not connected ({mode})")
+        if mode == MODE_RET_FALSE:
+            raise FaultyDriverError(f"{self.name}: cap.read() returned ret=False (stale handle)")
+        if mode == MODE_FROZEN:
+            if self._frozen is None:
+                self._frozen = _frame(self._shape, self._seq)
+            return CameraData(images={"rgb": self._frozen}, timestamp=time.time() * 1000)
+        if mode == MODE_RESOLUTION_CHANGE:
+            h, w = self._shape
+            return CameraData(
+                images={"rgb": _frame((h // 2, w // 2), self._seq)}, timestamp=time.time() * 1000
+            )
+        if mode == MODE_NONE:
+            return CameraData(images={"rgb": None}, timestamp=time.time() * 1000)  # type: ignore[dict-item]
+
+        self._frozen = None
+        return CameraData(images={"rgb": _frame(self._shape, self._seq)}, timestamp=time.time() * 1000)
+
+    def read_calibration_data_intrinsics(self) -> Dict[str, Any]:
+        return {}
+
+    def get_camera_info(self) -> Dict[str, Any]:
+        return {
+            "device_id": self.name,
+            "width": self.resolution[0],
+            "height": self.resolution[1],
+            "fps": self.fps,
+            "synthetic": True,
+        }
+
+    def stop(self) -> None:
+        self._stopped.set()
+
+
 def fake_identity(driver: CameraDriver) -> str:
     """Identity function for the fakes — reads the shared spec, so a test can
     swap the physical camera behind the path by assigning ``spec.identity``."""

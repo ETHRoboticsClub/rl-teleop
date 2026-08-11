@@ -91,7 +91,14 @@ class BusAudit:
     def __init__(self, sub_port: int) -> None:
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.SUB)
-        self._sock.setsockopt(zmq.RCVHWM, 4000)
+        # BOUND THE AUDITOR'S OWN QUEUE. Unpacking and hashing four cameras'
+        # worth of full-resolution frames is not free, and when this thread falls
+        # behind, ZMQ buffers on our side: at the first draft's 4000-message HWM
+        # that is 4000 x ~2.7 MB. The auditor then grew half a gigabyte and the
+        # soak report blamed the system under test. Counts become approximate
+        # under load, which is fine — this measures whether CONTENT is changing,
+        # not exact throughput.
+        self._sock.setsockopt(zmq.RCVHWM, 100)
         self._sock.connect(f"tcp://127.0.0.1:{sub_port}")
         self._sock.setsockopt(zmq.SUBSCRIBE, b"")
         self._lock = threading.Lock()
@@ -125,7 +132,9 @@ class BusAudit:
                     except Exception:
                         continue
                     with self._lock:
-                        self.health[topic.split("/")[0]] = dict(data)
+                        rec = dict(data)
+                        rec["_rx_mono"] = now
+                        self.health[topic.split("/")[0]] = rec
                     continue
                 if not topic.endswith("/rgb"):
                     continue
@@ -209,25 +218,55 @@ class Soak:
         return [h for h in self.session._hosts if h.node_name.startswith("camera")]
 
     def node_health(self, node: str) -> dict:
-        assert self.audit is not None
-        return self.audit.health.get(node, {})
+        """The node's health record, with STALENESS APPLIED.
 
-    def rss_kb(self) -> int:
-        """Our own RSS plus every node subprocess's, in kB."""
-        total = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        A health message that stopped arriving is not a healthy camera. RED found
+        this by SIGSTOPping a node: it published nothing at all, so the last
+        `ok` sat on the bus indefinitely and every health reader believed it.
+        The auditor must age this signal exactly as it ages frames.
+        """
+        assert self.audit is not None
+        rec = dict(self.audit.health.get(node, {}))
+        if not rec:
+            return rec
+        rx = rec.pop("_rx_mono", None)
+        if rx is not None and time.monotonic() - rx > DETECT_BUDGET_S:
+            rec["healthy"] = False
+            rec["state"] = "stale"
+            rec["health_age_s"] = round(time.monotonic() - rx, 2)
+        return rec
+
+    @staticmethod
+    def _proc_rss_kb(pid: int) -> int:
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1])
+        except Exception:
+            pass
+        return 0
+
+    def rss_kb(self) -> dict:
+        """CURRENT RSS, split runner vs nodes.
+
+        Split, and current rather than peak, because the first version of this
+        reported one combined number using ru_maxrss — a HIGH-WATER MARK that
+        never falls. It showed +579 MB over two minutes and could not say whether
+        the leak was in the system under test or in the auditor watching it.
+        A measurement that cannot localise what it measures is not much better
+        than no measurement.
+        """
+        nodes = {}
         for host in self.session._hosts:
             pid = getattr(host, "pid", None)
-            if not pid:
-                continue
-            try:
-                with open(f"/proc/{pid}/status", encoding="utf-8") as f:
-                    for line in f:
-                        if line.startswith("VmRSS:"):
-                            total += int(line.split()[1])
-                            break
-            except Exception:
-                pass
-        return total
+            if pid:
+                nodes[host.node_name] = self._proc_rss_kb(pid)
+        return {
+            "runner": self._proc_rss_kb(os.getpid()),
+            "nodes": nodes,
+            "nodes_total": sum(nodes.values()),
+        }
 
     # -- the invariant --------------------------------------------------
 
@@ -343,6 +382,66 @@ class Soak:
         except FileNotFoundError:
             pass          # fully reaped, which is what we want
 
+    # -- driver-level faults, via the fault file (fake config only) ------
+
+    def _fault_file(self, node: str) -> Path | None:
+        """The file SoakCamera polls for this node, if the config uses one."""
+        for h in self.session._hosts:
+            if h.node_name != node:
+                continue
+            spec = getattr(getattr(h, "_node", None), "_driver_spec", None) or {}
+            path = spec.get("fault_file")
+            return Path(path) if path else None
+        return None
+
+    def _set_driver_fault(self, node: str, mode: str) -> bool:
+        path = self._fault_file(node)
+        if path is None:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("" if mode == "ok" else mode)
+        return True
+
+    def _driver_fault(self, host, mode: str, recover: bool = True) -> None:
+        """Flip a synthetic camera into a fault mode and check the invariant.
+
+        This is the shape the hermetic tier cannot reach: the fault happens
+        inside a REAL node subprocess, publishing over REAL ZMQ, watched by the
+        REAL session monitor.
+        """
+        node = host.node_name
+        if not self._set_driver_fault(node, mode):
+            return
+        self.log(f"  fault: driver mode {mode!r} on {node}")
+        time.sleep(DETECT_BUDGET_S + (4.0 if mode == "frozen" else 0.0))
+        try:
+            self.check_invariant(f"DRIVER_{mode.upper()}", node, expect_streaming=False)
+        finally:
+            if recover:
+                self._set_driver_fault(node, "ok")
+        if recover:
+            if not self.await_recovery(f"DRIVER_{mode.upper()}", node, timeout=30.0):
+                self.violation(f"DRIVER_{mode.upper()}", node,
+                               "did not recover within 30 s after the fault was cleared")
+            else:
+                self.check_invariant(f"DRIVER_{mode.upper()}", node, expect_streaming=True)
+
+    def fault_driver_frozen(self, host) -> None:
+        """Fault 4: the same frame forever, no error. The one the cockpit lied about."""
+        self._driver_fault(host, "frozen")
+
+    def fault_driver_ret_false(self, host) -> None:
+        """Fault 1: the stale UVC handle. THE known failure."""
+        self._driver_fault(host, "ret_false")
+
+    def fault_driver_hang(self, host) -> None:
+        """Fault 2: read() blocks and never returns."""
+        self._driver_fault(host, "hang")
+
+    def fault_driver_gone(self, host) -> None:
+        """Fault 7: the device disappears, then comes back."""
+        self._driver_fault(host, "gone")
+
     def fault_cpu_starve(self, host) -> None:
         """Pin heavy load onto the box; the camera must degrade, not freeze silently."""
         node = host.node_name
@@ -416,7 +515,21 @@ class Soak:
                 return 3
 
             hosts = [h for h in self.camera_hosts() if h.node_name in up]
-            faults = [self.fault_sigstop, self.fault_sigkill, self.fault_cpu_starve]
+            # Driver-level faults come first in the rotation and are recoverable;
+            # SIGKILL is last because it permanently removes a node from play.
+            faults = [
+                self.fault_driver_frozen,
+                self.fault_sigstop,
+                self.fault_driver_ret_false,
+                self.fault_cpu_starve,
+                self.fault_driver_gone,
+                self.fault_driver_hang,
+                self.fault_sigkill,
+            ]
+            if not any(self._fault_file(h.node_name) for h in hosts):
+                # Real cameras: no fault file to write, so only process faults apply.
+                faults = [self.fault_sigstop, self.fault_cpu_starve, self.fault_sigkill]
+                self.log("  (real-hardware config: driver-level faults unavailable)")
             n = 0
             next_fault = time.monotonic() + args.fault_period
 
@@ -484,11 +597,27 @@ class Soak:
         if self.rss_samples:
             t0, r0 = self.rss_samples[0]
             t1, r1 = self.rss_samples[-1]
-            growth = r1 - r0
-            print(f"RSS: {r0/1024:.0f} MB -> {r1/1024:.0f} MB over {t1-t0:.0f}s "
-                  f"({growth/1024:+.1f} MB)")
-            if t1 - t0 > 600 and growth > 200 * 1024:
-                print("  ** RSS grew by more than 200 MB — investigate before trusting a long run **")
+            span = max(1.0, t1 - t0)
+            print(f"RSS over {span:.0f}s:")
+            print(f"  soak runner : {r0['runner']/1024:7.0f} MB -> {r1['runner']/1024:7.0f} MB "
+                  f"({(r1['runner']-r0['runner'])/1024:+.1f} MB)   [the auditor, not the system under test]")
+            print(f"  nodes total : {r0['nodes_total']/1024:7.0f} MB -> {r1['nodes_total']/1024:7.0f} MB "
+                  f"({(r1['nodes_total']-r0['nodes_total'])/1024:+.1f} MB)")
+            for name, kb in sorted(r1["nodes"].items()):
+                was = r0["nodes"].get(name, 0)
+                print(f"    {name:14s} {was/1024:7.0f} MB -> {kb/1024:7.0f} MB ({(kb-was)/1024:+.1f} MB)")
+            node_growth = r1["nodes_total"] - r0["nodes_total"]
+            # Only the NODES are the system under test. Per-hour, a camera node
+            # holding a few frames should be flat; 100 MB/h is generous.
+            per_hour = node_growth / 1024 * 3600 / span
+            print(f"  node growth : {per_hour:+.0f} MB/h extrapolated")
+            if span > 300 and per_hour > 100:
+                self.violations.append({
+                    "t": time.time(), "fault": "SOAK", "node": "nodes",
+                    "why": f"node RSS grew {per_hour:.0f} MB/h — a leak across fault cycles",
+                    "evidence": {"first": r0, "last": r1},
+                })
+                print("  ** NODE MEMORY IS GROWING — invariant 5 (clean recovery) is violated **")
         for v in self.violations:
             print(f"  VIOLATION [{v['fault']} / {v['node']}] {v['why']}")
             if v["evidence"]:

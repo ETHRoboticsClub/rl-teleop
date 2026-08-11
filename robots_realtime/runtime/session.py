@@ -158,6 +158,7 @@ class NodeStatus:
     _timestamps: dict[str, deque] = field(default_factory=dict, repr=False)
     _last_msg_t: float | None = field(default=None, repr=False)
     _last_step_t: float | None = field(default=None, repr=False)
+    _last_health_t: float | None = field(default=None, repr=False)
 
     @property
     def hz(self) -> float:
@@ -195,11 +196,43 @@ class NodeStatus:
         if self.step_hz and (self._last_step_t is None or now - self._last_step_t > stale_after):
             self.step_hz = 0.0
 
+    def record_health(self, health: dict) -> None:
+        self._last_health_t = time.perf_counter()
+        self.health = health
+
+    @property
+    def health_age_s(self) -> float | None:
+        """Seconds since the last health message, or None if there never was one."""
+        if self._last_health_t is None:
+            return None
+        return time.perf_counter() - self._last_health_t
+
+    @property
+    def health_is_stale(self) -> bool:
+        """True when this node's health record has itself stopped updating.
+
+        FOUND BY RED, and it is the same bug one level up. SIGSTOP a camera node
+        and it publishes NOTHING — including no health. The last health message
+        on the bus still said ``ok``, so anything reading the health topic saw a
+        healthy camera that had been frozen for as long as you cared to wait. A
+        health record that cannot go stale is exactly the fossil that
+        ``pub_hz`` used to be; the cure for the disease had the disease.
+        """
+        age = self.health_age_s
+        return age is not None and age > _STALE_AFTER_S
+
     @property
     def camera_state(self) -> str | None:
-        """``ok``/``degraded``/``reopening``/``failed`` for camera nodes."""
+        """``ok``/``degraded``/``reopening``/``failed`` for camera nodes.
+
+        Reports ``stale`` when the record itself has stopped arriving — that is
+        a different fact from any state the camera last claimed, and collapsing
+        the two is what made SIGSTOP invisible.
+        """
         if not self.health:
             return None
+        if self.health_is_stale:
+            return "stale"
         return str(self.health.get("state") or "") or None
 
     @property
@@ -207,8 +240,11 @@ class NodeStatus:
         """Everything the session knows, combined into one honest verdict."""
         if not self.alive:
             return False
-        if self.health is not None and not self.health.get("healthy", False):
-            return False
+        if self.health is not None:
+            if self.health_is_stale:
+                return False
+            if not self.health.get("healthy", False):
+                return False
         return True
 
 
@@ -877,7 +913,7 @@ class Session:
                 if topic_suffix == "health":
                     try:
                         envelope = unpack(payload_b)
-                        self._status[node_name].health = dict(envelope.get("data", {}))
+                        self._status[node_name].record_health(dict(envelope.get("data", {})))
                     except Exception:
                         pass
                     continue
@@ -1007,6 +1043,10 @@ class Session:
                     "pub_hz": round(st.pub_hz, 2),
                     "step_hz": round(st.step_hz, 2),
                     "healthy": st.is_healthy,
+                    "camera_state": st.camera_state,
+                    "health_age_s": (
+                        None if st.health_age_s is None else round(st.health_age_s, 2)
+                    ),
                     "camera": st.health,
                 }
                 for st in self._status.values()

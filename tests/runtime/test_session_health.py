@@ -122,6 +122,42 @@ def test_camera_health_topic_makes_a_live_node_unhealthy(tmp_path: Path) -> None
     assert s.unhealthy_nodes() == ["camera_right"]
 
 
+def test_a_health_record_that_stops_arriving_is_not_evidence_of_health(
+    tmp_path: Path,
+) -> None:
+    """RED found this by SIGSTOPping a camera node on the rig.
+
+    A stopped process publishes NOTHING — including no health. The last health
+    message still said ``ok``, so every consumer of the health topic reported a
+    perfectly healthy camera that had not moved for as long as you cared to
+    wait. That is the same fossil-signal bug as the frozen pub_hz, one level up:
+    the cure for the disease had caught the disease.
+
+    Health must be aged by whoever reads it, exactly like a frame.
+    """
+    s, _ = _session(tmp_path, ["camera_scan"])
+    st = s._status["camera_scan"]
+    st.record_health({"state": "ok", "healthy": True})
+    assert st.is_healthy is True
+    assert st.camera_state == "ok"
+
+    # ...and now the node stops publishing entirely.
+    st._last_health_t = time.perf_counter() - 10.0
+    assert st.health_is_stale is True
+    assert st.camera_state == "stale", "a frozen health record must not read as ok"
+    assert st.is_healthy is False
+    assert "camera_scan" in s.unhealthy_nodes()
+
+
+def test_a_node_that_never_publishes_health_is_not_penalised(tmp_path: Path) -> None:
+    """Only camera nodes publish health; everything else must stay healthy."""
+    s, _ = _session(tmp_path, ["gello_right"])
+    st = s._status["gello_right"]
+    assert st.health is None
+    assert st.health_is_stale is False
+    assert st.is_healthy is True
+
+
 def test_health_snapshot_is_plain_serializable_data(tmp_path: Path) -> None:
     s, _ = _session(tmp_path, ["camera_top", "camera_left"])
     s._supervise_nodes(period_s=0.0)
