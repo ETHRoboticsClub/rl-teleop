@@ -168,6 +168,9 @@ class CameraHealth:
     #: never happened. The cumulative number is the one worth alarming on.
     orphans_total: int = 0
     identity: str = ""
+    #: Frames per second actually DELIVERED, and the rate the config asked for.
+    fps: float = 0.0
+    target_fps: float = 0.0
     terminal: bool = False
     since: float = 0.0          # wall-clock time the current state was entered
 
@@ -189,6 +192,8 @@ class CameraHealth:
             "orphaned_readers": self.orphaned_readers,
             "orphans_total": self.orphans_total,
             "identity": self.identity,
+            "fps": round(self.fps, 2),
+            "target_fps": round(self.target_fps, 2),
             "terminal": self.terminal,
             "since": self.since,
             "healthy": self.state == STATE_OK,
@@ -259,6 +264,9 @@ class SupervisedCamera(CameraDriver):
         min_healthy_frames: int = 3,
         stall_window: int = 30,
         stall_distinct_ratio: float = 0.34,
+        slow_ratio: float = 0.5,
+        slow_recover_ratio: float = 0.75,
+        slow_grace_s: float = 2.0,
         expected_shape: Optional[Tuple[int, int]] = None,
         target_fps: Optional[float] = None,
         identity_fn: Optional[Callable[[CameraDriver], str]] = None,
@@ -285,6 +293,26 @@ class SupervisedCamera(CameraDriver):
         self._stall_distinct_ratio = float(stall_distinct_ratio)
         self._recent_fps: deque[str] = deque(maxlen=max(4, int(stall_window)))
         self._stalled_since: Optional[float] = None
+
+        # DELIVERED RATE. Found by starving a node of CPU: it kept delivering
+        # fresh, distinct, well-formed frames — just far too few of them — and
+        # every check passed, because nothing in the health model had an opinion
+        # about HOW MANY frames a camera owes you. A camera running at a
+        # sixtieth of its configured rate is not a healthy camera; it is a
+        # camera that will quietly ruin a training set.
+        #
+        # Reported as `degraded`, never `failed`, and it never triggers a reopen:
+        # the cause is load, not the device, and reopening under load would make
+        # it worse. Hysteresis (fall below `slow_ratio`, recover above
+        # `slow_recover_ratio`) so a camera hovering at the threshold does not
+        # rattle between states.
+        self._target_fps = float(target_fps) if target_fps else None
+        self._slow_grace_s = float(slow_grace_s)
+        self._slow_ratio = float(slow_ratio)
+        self._slow_recover_ratio = float(slow_recover_ratio)
+        self._frame_times: deque[float] = deque(maxlen=45)
+        self._slow_since: Optional[float] = None
+        self._is_slow = False
         self._expected_shape = tuple(expected_shape) if expected_shape else None
         self._min_period_s = (1.0 / float(target_fps)) if target_fps else 0.0
         self._identity_fn = identity_fn
@@ -602,26 +630,95 @@ class SupervisedCamera(CameraDriver):
             self._healthy_streak = self._healthy_streak + 1 if distinct else 0
             streak = self._healthy_streak
 
-        # RECOVERY IS JUDGED OVER THE WHOLE WINDOW, not over the last few frames.
-        # A device cycling a ring of buffers passes "N consecutive distinct
-        # frames" trivially — A,B,A,B is distinct at every step — so with only
-        # the streak test it climbed back to `ok` after every reopen and the
-        # incident counter reset with it. It never converged, exactly like the
-        # ring-of-1 flap. The window has to be FULL and genuinely varied before
-        # this camera is allowed to call itself healthy again.
+        # TWO SEPARATE GATES, because they answer different questions.
+        #
+        # Entering `ok` must be FAST: a camera coming up from cold has an empty
+        # window, and requiring a full one made every node sit in `degraded
+        # (warmup)` for a second or two after startup. That is long enough for
+        # an auto-record episode — which starts 0.3 s after the session does —
+        # to be stamped degraded every single time. A marker that cries wolf on
+        # every clean take is worth nothing, and worse, it trains the operator
+        # to ignore it. So a partial window does not block recovery.
+        #
+        # Clearing the FREEZE INCIDENT COUNT must be SLOW: that is what makes a
+        # persistent fault converge instead of flapping. A device cycling a ring
+        # of buffers satisfies "N consecutive distinct frames" trivially
+        # (A,B,A,B is distinct at every step), so if the counter reset the moment
+        # the state went `ok`, the camera would loop reopen → ok → stall →
+        # reopen forever. The count only clears once a FULL window has proved
+        # genuinely varied.
         window_full = len(self._recent_fps) == self._recent_fps.maxlen
-        window_varied = window_full and (
-            len(set(self._recent_fps)) / len(self._recent_fps) > self._stall_distinct_ratio
+        window_ratio = (
+            len(set(self._recent_fps)) / len(self._recent_fps) if self._recent_fps else 1.0
         )
+        # WHICH GATE APPLIES DEPENDS ON WHAT THIS CAMERA HAS JUST DONE. A camera
+        # with no freeze history gets the lenient one (fast start, see above). A
+        # camera that has ALREADY been caught delivering stalled content has to
+        # prove itself over a full, varied window — otherwise it walks back to
+        # `ok` on the first three frames after each reopen and the flap is
+        # straight back, this time clearing a `failed` state on its way through.
+        strict = self._freeze_incidents > 0
+        window_ok = (
+            (window_full and window_ratio > self._stall_distinct_ratio) if strict
+            else ((not window_full) or window_ratio > self._stall_distinct_ratio)
+        )
+
+        slow = self._update_rate(mono)
+
         if (
             streak >= self._min_healthy_frames
-            and window_varied
+            and window_ok
+            and not slow
             and self._health.state != STATE_OK
             and not self._health.terminal
         ):
-            self._freeze_incidents = 0
             self._set_state(STATE_OK)
+        if window_full and window_ratio > self._stall_distinct_ratio:
+            self._freeze_incidents = 0
         return data
+
+    def _update_rate(self, mono: float) -> bool:
+        """Track delivered fps against the configured rate. True while too slow.
+
+        Deliberately NOT a failure and never a reopen trigger: the cause is load
+        (or a bus that cannot carry the configured rate), not the device, and reopening
+        under load makes it worse. But it must not read as `ok` either — a camera
+        delivering three frames a second where thirty were asked for is not a
+        camera anyone should be recording training data from.
+        """
+        self._frame_times.append(mono)
+        if self._target_fps is None or len(self._frame_times) < 8:
+            return False
+        span = self._frame_times[-1] - self._frame_times[0]
+        if span <= 0:
+            return False
+        achieved = (len(self._frame_times) - 1) / span
+        with self._lock:
+            self._health.fps = achieved
+            self._health.target_fps = self._target_fps
+
+        floor = self._target_fps * self._slow_ratio
+        ceiling = self._target_fps * self._slow_recover_ratio
+        if not self._is_slow:
+            if achieved < floor:
+                if self._slow_since is None:
+                    self._slow_since = mono
+                elif mono - self._slow_since >= self._slow_grace_s:
+                    self._is_slow = True
+                    self._slow_since = None
+                    self._set_state(
+                        STATE_DEGRADED, "slow",
+                        f"delivering {achieved:.1f} Hz against a configured "
+                        f"{self._target_fps:.1f} Hz",
+                    )
+            else:
+                self._slow_since = None
+        elif achieved >= ceiling:
+            # Hysteresis: recover well clear of the threshold so a camera sitting
+            # on it does not rattle between states.
+            self._is_slow = False
+            self._slow_since = None
+        return self._is_slow
 
     # ── failure handling ─────────────────────────────────────────────────────
 
@@ -749,6 +846,9 @@ class SupervisedCamera(CameraDriver):
                 self._healthy_streak = 0
                 self._recent_fps.clear()
                 self._stalled_since = None
+                self._frame_times.clear()
+                self._slow_since = None
+                self._is_slow = False
             if old is not None:
                 self._safe_stop_driver(old)
                 self._set_state(STATE_REOPENING, self._health.reason, self._health.detail)

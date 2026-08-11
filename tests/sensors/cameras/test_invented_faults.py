@@ -17,6 +17,7 @@ import pytest
 
 from robots_realtime.sensors.cameras.camera import CameraData, CameraDriver
 from robots_realtime.sensors.cameras.supervised_camera import (
+    STATE_DEGRADED,
     STATE_FAILED,
     STATE_OK,
     CameraUnavailable,
@@ -170,6 +171,133 @@ def test_recovery_from_a_ring_requires_a_varied_window_not_two_good_frames() -> 
         cam.wait_until_open(5.0)
         _drive(cam, 5.0)
         assert cam.state == STATE_FAILED
+    finally:
+        cam.stop()
+
+
+def test_a_healthy_camera_reaches_ok_quickly_from_cold() -> None:
+    """Recovery must not require a full stall window, or startup cries wolf.
+
+    The stall check needs 30 frames to judge a ring of buffers. Making the
+    `ok` transition wait for that too left every node in `degraded (warmup)` for
+    a second or more after startup — long enough for an auto-record episode,
+    which begins 0.3 s after the session does, to be stamped degraded on every
+    single clean take. A marker that fires on good episodes is worth less than
+    no marker: it teaches the operator to ignore it.
+    """
+    cam = _cam(StaticSceneCamera)
+    try:
+        assert cam.wait_until_open(5.0)
+        t0 = time.monotonic()
+        deadline = t0 + 3.0
+        while time.monotonic() < deadline and cam.state != STATE_OK:
+            try:
+                cam.read()
+            except CameraUnavailable:
+                pass
+        elapsed = time.monotonic() - t0
+        assert cam.state == STATE_OK, f"still {cam.state!r} after {elapsed:.2f}s from cold"
+        assert elapsed < 1.0, f"took {elapsed:.2f}s to report ok from cold"
+    finally:
+        cam.stop()
+
+
+# ── invented fault G — delivering, but nowhere near the configured rate ─────
+
+
+class SlowCamera(CameraDriver):
+    """Perfect frames, far too few of them. Found by starving a node of CPU.
+
+    Every existing check passed: the frames were fresh, distinct, well-formed
+    and correctly shaped. Nothing in the health model had an opinion about HOW
+    MANY frames a camera owes you, so a camera running at a fraction of its
+    configured rate reported ``ok`` indefinitely.
+    """
+
+    def __init__(self, period_s: float = 0.2) -> None:
+        self.period_s = period_s
+        self.n = 0
+        self.device_path = "/dev/fake-slow"
+
+    def read(self) -> CameraData:
+        time.sleep(self.period_s)
+        self.n += 1
+        return CameraData(
+            images={"rgb": np.full((*SHAPE, 3), self.n % 251, np.uint8)},
+            timestamp=time.time() * 1000,
+        )
+
+    def read_calibration_data_intrinsics(self):
+        return {}
+
+    def get_camera_info(self):
+        return {}
+
+    def stop(self) -> None:
+        pass
+
+
+def test_a_camera_delivering_far_below_its_configured_rate_is_degraded() -> None:
+    """5 Hz where 30 was configured must not read as healthy."""
+    cam = _cam(lambda: SlowCamera(0.2), target_fps=30.0, slow_grace_s=0.5,
+               read_deadline_s=2.0)
+    try:
+        cam.wait_until_open(5.0)
+        # Drive reads for a fixed span. NOT "while state == ok": a camera that is
+        # slow from cold never reaches ok in the first place, so that loop exits
+        # before issuing a single read and the test proves nothing.
+        _drive(cam, 6.0)
+        h = cam.health()
+        assert cam.state != STATE_OK, "a camera at 5 Hz of a configured 30 reported ok"
+        assert h["reason"] == "slow"
+        assert h["healthy"] is False
+        assert 0 < h["fps"] < 15, f"reported fps {h['fps']} is not the delivered rate"
+        assert h["target_fps"] == 30.0
+    finally:
+        cam.stop()
+
+
+def test_a_camera_at_its_configured_rate_is_not_called_slow() -> None:
+    """The control: a false 'slow' would blank a working panel."""
+    cam = _cam(StaticSceneCamera, target_fps=30.0, slow_grace_s=0.5)
+    try:
+        cam.wait_until_open(5.0)
+        first, _ = _drive(cam, 4.0)
+        assert first is None
+        assert cam.state == STATE_OK, f"a healthy camera was marked {cam.state!r}"
+    finally:
+        cam.stop()
+
+
+def test_a_slow_camera_recovers_when_the_rate_comes_back() -> None:
+    """Slow is degraded, never failed, and never triggers a reopen — the cause
+    is load, not the device, and reopening under load makes it worse."""
+    holder = {"period": 0.2}
+
+    class Variable(SlowCamera):
+        def read(self):
+            self.period_s = holder["period"]
+            return super().read()
+
+    cam = _cam(Variable, target_fps=30.0, slow_grace_s=0.5, read_deadline_s=2.0)
+    try:
+        cam.wait_until_open(5.0)
+        _drive(cam, 6.0)
+        assert cam.state == STATE_DEGRADED, f"expected degraded, got {cam.state!r}"
+        assert cam.health()["reason"] == "slow"
+        reopens_while_slow = cam.health()["reopens"]
+
+        holder["period"] = 1.0 / 120.0         # the load goes away
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and cam.state != STATE_OK:
+            try:
+                cam.read()
+            except CameraUnavailable:
+                pass
+        assert cam.state == STATE_OK, "never recovered when the rate came back"
+        assert cam.health()["reopens"] == reopens_while_slow, (
+            "being slow triggered a reopen — that makes a loaded box worse"
+        )
     finally:
         cam.stop()
 
