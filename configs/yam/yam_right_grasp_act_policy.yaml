@@ -1,0 +1,153 @@
+version: "1"
+# RIGHT ARM, ACT GRASP POLICY — source box -> mat. Deployment of
+# outputs/train/act_grasp_right_night_20260812.
+#
+# This is the DEPLOY twin of yam_right_grasp_record.yaml, which recorded the 43
+# demonstrations this policy was trained on. Same arm, same camera, same task:
+# "fill the mat from the source box: reach in, grasp a bag, place it flat on the
+# mat".
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THE ARM HAS NO BRAKES, AND THIS FILE COMMANDS IT
+#
+# start_paused: true below. RobotNode commands are GATED on startup, so nothing
+# moves until the operator presses [space] in the TUI. Do not remove it. A
+# policy config that starts live snaps the arm to wherever the first inference
+# points, from whatever pose it happens to be in.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS DOES NOT USE act_runner.py / sort_server.py
+#
+# Both right-arm configs carry BLOCKER 4 in capitals: nothing in
+# yam-pick-pipeline is calibrated for this arm. calibration.json, keepout.json
+# and tray_box.json are all in the LEFT arm's base frame, and act_runner's
+# clearance checks, keep-out volume and scan-camera shadow are computed in that
+# frame. Pointing them at the right arm would not fail loudly — it would compute
+# confident, wrong clearances.
+#
+# So this deployment carries none of that machinery. The agent
+# (LeRobotACTAgent) is the smallest thing that can run a visuomotor policy:
+# wrist image + joint state in, joint targets out. The 43 demonstrations are the
+# only prior. What remains for safety is what is genuinely there: RobotNode's
+# joint limits, the pause gate, and a per-tick step clamp in the agent.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THE CAMERA MUST NOT BE DOWNSIZED
+#
+# The policy consumes the BUS copy of camera_right, and it was trained on the
+# full-resolution 640x480 recordings. The teleop configs publish the wrist
+# cameras with `publish_resize: [240, 320]` to fit four cameras through one ZMQ
+# proxy — doing that here would feed the policy an image a quarter the size it
+# trained on. There is NO publish_resize on camera_right below, deliberately.
+# The agent checks the shape at runtime and holds position rather than running
+# on the wrong geometry.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# CAMERAS THIS DOES NOT NEED
+#
+# camera_top and camera_scan are absent from this file on purpose. The
+# checkpoint's input_features are exactly:
+#     observation.state          (7,)
+#     observation.images.wrist   (3, 480, 640)
+# so the D455 and the D435i are not required, which is what makes this
+# deployable while the ASMedia controller at 0000:71:00.0 is dead. Do not add
+# them "for the cockpit" — an unused RealSense node here would fight the sort
+# pipeline for the device and, while the D455 is sick, hang librealsense.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# LAUNCH
+#
+#   cd ~/Desktop/kitting-v2/rl-teleop
+#   ./.venv/bin/python3 -m robots_realtime.rr_session_cli \
+#       configs/yam/yam_right_grasp_act_policy.yaml --control-port 8792
+#
+#   Then, with a hand near the arm, press [space] to unpause.
+#   Cockpit: the wrist view is on camera_right/rgb.
+
+session:
+  save_root: recordings
+  # Gated on startup. THIS IS THE SAFETY PROPERTY — see the header.
+  start_paused: true
+  record_on_unpause: false
+
+nodes:
+  # ── the policy ────────────────────────────────────────────────────────────
+  - type: AgentNode
+    name: act_right
+    agent_class: robots_realtime.agents.policy_learning.lerobot_act_agent:LeRobotACTAgent
+    agent_kwargs:
+      # 070000 of 100000. Mid-to-late: far enough in to have converged, short of
+      # the end where an ACT run on 43 episodes is most likely to have overfit.
+      # Nothing has been evaluated on hardware yet — this is a starting point,
+      # not a ranking. Every 10k step from 010000 to 100000 exists, and swapping
+      # is a one-line change here.
+      checkpoint_path: outputs/train/act_grasp_right_night_20260812/checkpoints/070000/pretrained_model
+      state_key: state
+      image_key: wrist
+      model_image_key: observation.images.wrist
+      # Consume 8 of each predicted chunk before re-inferring. Lower is more
+      # reactive and costs more GPU; the chunk itself is 30.
+      n_action_steps: 8
+      device: cuda
+      # Per-tick clamp, in radians, on how far any joint may be commanded from
+      # where it is. A visuomotor policy's characteristic bad output is one large
+      # jump, and there are no brakes to absorb it. Raise only after watching it
+      # run — a clamp that fires constantly is a policy that is not tracking.
+      max_step_rad: 0.12
+    state_topics:
+      state: yam_right/joint_state
+    image_topics:
+      wrist: camera_right/rgb
+    # 30 Hz: the rate the demonstrations were recorded at.
+    poll_freq: 30
+
+  # ── the arm ───────────────────────────────────────────────────────────────
+  - type: RobotNode
+    name: yam_right
+    pinned_cpu: 4          # 2 is the left follower's pin; 4 matches the bimanual config
+    realtime_priority: 85
+    robot_config: robot_configs/yam/right.yaml
+    # The policy drives the arm. This is the only difference from the record
+    # config, where this said gello_right/joint_pos.
+    cmd_topic: act_right/joint_pos
+    poll_freq: 200
+    ramp_duration_s: 1.5
+    # IN-DISTRIBUTION START POSE. Measured from the 43 demonstrations this
+    # policy trained on — the median first-frame state, with the gripper open:
+    #     median [-0.363  2.059  1.664 -0.736 -0.072 -0.527  0.964]
+    #     p10    [-0.587  1.446  1.296 -1.175 -0.552 -0.974  0.000]
+    #     p90    [ 0.197  2.388  1.947 -0.457  0.224 -0.186  1.000]
+    #
+    # NOT the all-zeros pose the record config uses. yam_bimanual_act_policy
+    # learned this the hard way and says so: all-zeros puts the arm fully
+    # stretched out, which is out of distribution, and an ACT policy fed a state
+    # it never saw in training produces erratic predictions. Starting inside the
+    # demonstrations' own distribution is the difference between a policy that
+    # tracks and one that thrashes.
+    startup_joint_pos: [-0.363, 2.059, 1.664, -0.736, -0.072, -0.527, 1.0]
+    startup_duration_s: 3.0
+    # SHUTDOWN PARKS AT HOME, not at the start pose. The startup pose is a
+    # REACHING pose — that is the whole point of it, it is where the demos begin,
+    # over the source box. But shutdown is followed by the motors being released,
+    # and this arm has no brakes: it sags from wherever it is left. Sagging from
+    # home is a short drop beside itself; sagging from a reaching pose swings the
+    # arm through whatever is in front of it. Matches the parking pose
+    # yam_right_grasp_record.yaml uses for the same arm.
+    shutdown_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    shutdown_duration_s: 3.0
+
+  # ── the one camera the policy needs ───────────────────────────────────────
+  # RIGHT wrist. Verified by FRAME CONTENT on 2026-08-12 (it sees the red source
+  # bin; camera_left sees the dark mat), because both Innomakers report USB
+  # serial SN0001 and this port has now been 1.1 -> 1.2 -> 1.1 across replugs.
+  # NO publish_resize — see the header.
+  - type: CameraNode
+    name: camera_right
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.1:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+    v4l2_controls:
+      brightness: 0
+      contrast: 28
+      saturation: 64

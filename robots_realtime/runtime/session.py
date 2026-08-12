@@ -746,21 +746,13 @@ class Session:
         if getattr(self, "_is_paused", False):
             return
         self._is_paused = True
-        for host in self._hosts:
-            try:
-                host.pause()
-            except Exception:
-                pass
+        self._gate_all("pause")
 
     def resume(self) -> None:
         if not getattr(self, "_is_paused", False):
             return
         self._is_paused = False
-        for host in self._hosts:
-            try:
-                host.resume()
-            except Exception:
-                pass
+        self._gate_all("resume")
         # Optional: prime recording when the operator unpauses. Lets a policy
         # eval config capture every rollout from the instant of handoff.
         if self._record_on_unpause and not self._is_recording:
@@ -768,6 +760,76 @@ class Session:
                 self.start_episode()
             except Exception:
                 pass
+
+    def park(self, duration_s: float | None = None) -> dict:
+        """Bring every arm home. THE ONE CALL THAT MUST ALWAYS WORK.
+
+        Independent of the bus, of any agent, and of the pause bookkeeping — see
+        RobotNode.park() for why each of those mattered on 2026-08-12, when a
+        dead agent node left the right arm energised in a reaching pose with no
+        software route home at all.
+
+        Dead hosts are SKIPPED rather than waited on, because waiting on one is
+        exactly what broke resume(). Every outcome is returned AND logged, so
+        "the arm is parked" is something you can check rather than assume.
+        """
+        results: dict[str, str] = {}
+        failed: list[str] = []
+        for host in self._hosts:
+            name = getattr(host, "node_name", "<unknown>")
+            if not getattr(host, "is_alive", lambda: True)():
+                results[name] = "skipped: node is not running"
+                continue
+            try:
+                results[name] = host.park(duration_s)
+            except Exception as exc:
+                results[name] = f"FAILED: {exc}"
+                failed.append(name)
+                logger.error("PARK FAILED for node %r: %s", name, exc)
+        # Parking takes the gate; say so, so the session's own view matches.
+        self._is_paused = True
+        if failed:
+            logger.error(
+                "PARK INCOMPLETE — these nodes did not confirm: %s. Do NOT assume "
+                "the arm is home; check it before releasing anything.",
+                ", ".join(failed),
+            )
+        else:
+            logger.info("PARK complete: %s", results)
+        return {"ok": not failed, "results": results, "failed": failed}
+
+    def _gate_all(self, verb: str) -> list[str]:
+        """pause() or resume() every host; return the names that REFUSED.
+
+        The failures used to be `except Exception: pass`. That mattered more than
+        it looks: `_is_paused` is set on the session BEFORE this walk, so a host
+        that never got the message left the session reporting one thing over HTTP
+        and the hardware doing another. On 2026-08-12 a dead agent node made
+        `resume` hang before it reached the arm — /status said `paused: false`
+        while the arm node was still gating every command, and the arm could not
+        be moved with nothing anywhere saying why.
+
+        A node that will not take the gate is now named in the log, and the
+        caller can see which.
+        """
+        refused: list[str] = []
+        for host in self._hosts:
+            name = getattr(host, "node_name", "<unknown>")
+            try:
+                getattr(host, verb)()
+            except Exception as exc:
+                refused.append(name)
+                logger.error(
+                    "%s REFUSED by node %r: %s. The session now considers itself "
+                    "%sd, but that node does NOT — treat its state as unknown.",
+                    verb.upper(), name, exc, verb,
+                )
+        if refused:
+            logger.error(
+                "%s incomplete: %s did not take it. is_paused=%s is the SESSION's "
+                "view only.", verb, ", ".join(refused), self._is_paused,
+            )
+        return refused
 
     def toggle_pause(self) -> None:
         if self.is_paused:

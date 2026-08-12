@@ -37,6 +37,21 @@ class Subscriber:
     ) -> None:
         self._latest: dict[str, dict] = {}
         self._lock = threading.Lock()
+        # A SECOND LOCK, FOR THE SOCKET ITSELF. ZeroMQ sockets are not
+        # thread-safe, and this class hands the same socket to two threads: the
+        # background _drain_loop, and whichever thread calls drain()/drain_one().
+        # Node._run_subscriber_driven() does exactly that on every tick, so any
+        # subscriber-driven node had two threads inside recv_multipart() at once.
+        #
+        # The symptom is not a clean error. Interleaved recv_multipart() calls
+        # tear message framing apart, so one caller receives a buffer containing
+        # somebody else's bytes and msgpack raises
+        #     ExtraData: unpack(b) received extra data
+        # from deep inside deserialization, with nothing pointing at threading.
+        # Observed 2026-08-12: it killed an ACT policy agent node ~15 s after
+        # start, every time, once the subscribed topics included camera frames
+        # (bigger messages widen the interleaving window).
+        self._sock_lock = threading.Lock()
         self._stop = threading.Event()
 
         self._ctx = zmq.Context.instance()
@@ -54,18 +69,48 @@ class Subscriber:
         )
         self._thread.start()
 
+    def _recv_pending(self) -> list[list[bytes]]:
+        """Take every message currently queued, holding the socket lock.
+
+        The lock is the point — see _sock_lock in __init__. Decoding happens
+        OUTSIDE the lock so a large msgpack payload never blocks the other
+        thread's receives.
+        """
+        out: list[list[bytes]] = []
+        with self._sock_lock:
+            try:
+                while True:
+                    out.append(self._sock.recv_multipart(zmq.NOBLOCK))
+            except zmq.Again:
+                pass
+            except zmq.ZMQError:
+                pass
+        return out
+
+    def _store(self, messages: list[list[bytes]]) -> int:
+        stored = 0
+        for parts in messages:
+            if len(parts) < 2:
+                continue
+            try:
+                envelope = unpack(parts[1])
+            except Exception:
+                # A single undecodable message must not kill the drain thread and
+                # take the node with it.
+                continue
+            with self._lock:
+                self._latest[parts[0].decode()] = envelope
+            stored += 1
+        return stored
+
     def _drain_loop(self) -> None:
         """Background thread: drain socket and keep latest per topic."""
         while not self._stop.is_set():
-            if self._sock.poll(5):  # 5 ms timeout
-                try:
-                    parts = self._sock.recv_multipart(zmq.NOBLOCK)
-                    if len(parts) >= 2:
-                        envelope = unpack(parts[1])
-                        with self._lock:
-                            self._latest[parts[0].decode()] = envelope
-                except zmq.Again:
-                    pass
+            messages = self._recv_pending()
+            if not messages:
+                self._stop.wait(0.002)
+                continue
+            self._store(messages)
 
     def drain_one(self, timeout_ms: int = 50) -> bool:
         """Block up to *timeout_ms* waiting for any new message."""
@@ -98,16 +143,13 @@ class Subscriber:
     def close(self) -> None:
         self._stop.set()
         self._thread.join(timeout=1.0)
-        self._sock.close(linger=0)
+        with self._sock_lock:
+            self._sock.close(linger=0)
 
     def drain(self) -> None:
-        """Drain all pending messages from the socket (non-blocking)."""
-        try:
-            while True:
-                parts = self._sock.recv_multipart(zmq.NOBLOCK)
-                if len(parts) >= 2:
-                    envelope = unpack(parts[1])
-                    with self._lock:
-                        self._latest[parts[0].decode()] = envelope
-        except zmq.Again:
-            pass
+        """Drain all pending messages from the socket (non-blocking).
+
+        Safe to call from a different thread than the background drain loop —
+        both go through _recv_pending(), which serialises socket access.
+        """
+        self._store(self._recv_pending())

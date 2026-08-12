@@ -95,6 +95,10 @@ class RobotNode(Node):
         # Default to parking at the zero pose on shutdown; override in YAML with
         # a custom list, or set `shutdown_joint_pos: null` to skip parking.
         shutdown_joint_pos: list[float] | None = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        # Where park() sends the arm. Defaults to the shutdown pose, which is
+        # already "the pose this arm is safe to be left in" on every config here.
+        home_joint_pos: list[float] | None = None,
+        park_duration_s: float = 4.0,
         shutdown_duration_s: float = 2.0,
         ramp_duration_s: float = 1.5,
         resume_gap_s: float = 0.2,
@@ -117,6 +121,8 @@ class RobotNode(Node):
         # publisher owns the arm. LATCHED ONCE and never re-read -- see step().
         self._hold_q: np.ndarray | None = None
         self._shutdown_joint_pos = shutdown_joint_pos
+        self._home_joint_pos = home_joint_pos
+        self._park_duration_s = float(park_duration_s)
         self._shutdown_duration_s = shutdown_duration_s
         # Safe-handoff ramp state. On the first command and after any gap
         # longer than resume_gap_s, seed _ramp_seed from the robot's actual
@@ -261,6 +267,67 @@ class RobotNode(Node):
 
         self.publish("joint_state", self._robot.get_observations(), ts=ts)
 
+    def park(self, duration_s: float | None = None) -> str:
+        """Ramp to the home pose and hold there. THE ALWAYS-AVAILABLE WAY HOME.
+
+        WHY THIS EXISTS. On 2026-08-12 a policy agent node died at startup and
+        the right arm could not be brought home at all. Every route was blocked:
+
+          * the arm was gated by `start_paused`, so nothing published on the
+            command topic could move it;
+          * ungating meant Session.resume(), which walks every host in turn and
+            hung on the dead agent's control socket before it ever reached the
+            arm — while /status cheerfully reported `paused: false`;
+          * the agent that owned the command topic was the thing that had died,
+            so there was no publisher left to command a pose with.
+
+        The arm ended up energised, holding a reaching pose over the source box,
+        and the only way out was to kill the session and have a human hold it
+        while it sagged. On an arm with no brakes that is the exact situation
+        the whole runtime is supposed to prevent.
+
+        So this path deliberately depends on NOTHING except this node:
+
+          * not the bus — it calls the robot driver directly, like the startup
+            and shutdown ramps already do;
+          * not the command topic, so a dead or missing agent is irrelevant;
+          * not the pause gate — it takes the gate rather than waiting for it,
+            because parking is precisely what you want when the thing that was
+            driving has gone wrong;
+          * not the other nodes — it arrives over this node's own control
+            socket, and ProcessHost skips hosts that are already dead.
+
+        Pausing FIRST is what makes it safe: step() returns early while paused
+        and issues no commands, so the ramp below is the only thing talking to
+        the robot. The node stays paused afterwards — whatever was driving is
+        not getting the arm back without someone saying so.
+        """
+        home = self._home_joint_pos
+        if home is None:
+            home = self._shutdown_joint_pos
+        if home is None:
+            raise RuntimeError(
+                f"[{self.name}] no home_joint_pos and no shutdown_joint_pos — "
+                f"nothing to park to. Set one in the config."
+            )
+        if self._robot is None:
+            raise RuntimeError(f"[{self.name}] park() called before setup()")
+
+        secs = float(duration_s if duration_s is not None else self._park_duration_s)
+        self._paused = True
+        # Let the 200 Hz step loop observe the flag before we touch the driver.
+        time.sleep(0.05)
+        print(f"[{self.name}] PARK: ramping to {list(home)} over {secs:.1f}s")
+        self._move_to_pose(home, secs)
+        self._hold_q = np.asarray(home, dtype=np.float64)
+        self._ramping = False
+        self._ramp_seed = None
+        # Force a fresh handoff ramp if anything is ever unpaused onto this arm
+        # again, instead of snapping to a stale target from before the park.
+        self._last_msg_ts = 0.0
+        print(f"[{self.name}] PARK: at home, holding, node left PAUSED")
+        return f"parked at {list(home)}"
+
     def cleanup(self) -> None:
         if self._shutdown_joint_pos is not None and self._robot is not None:
             print(f"[{self.name}] Parking at shutdown pose over {self._shutdown_duration_s:.1f}s")
@@ -293,6 +360,9 @@ class RobotNode(Node):
             "cmd_topic": params.get("cmd_topic"),
             "robot_config": params.get("robot_config"),
         }
+        for key in ("home_joint_pos", "park_duration_s"):
+            if key in params:
+                kwargs[key] = params[key]
         # Pass through poll_freq if specified
         if "poll_freq" in params:
             kwargs["poll_freq"] = params["poll_freq"]

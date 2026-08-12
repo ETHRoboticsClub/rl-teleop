@@ -156,6 +156,15 @@ class Node(ABC):
     def resume(self) -> None:
         self._paused = False
 
+    def park(self, duration_s: float | None = None) -> str:
+        """Bring this node's hardware to a safe resting state.
+
+        Default: nothing to do. RobotNode overrides it to ramp the arm home.
+        Every node answers PARK so the session can ask them all without knowing
+        which ones actuate.
+        """
+        return "no-op"
+
     @property
     def is_paused(self) -> bool:
         return self._paused
@@ -393,6 +402,20 @@ def _host_worker(
                 except Exception:
                     pass
                 ctrl.send(_CTRL_OK)
+            elif msg.startswith(b"PARK"):
+                # PARK IS A SAFETY COMMAND AND IT ANSWERS EVEN WHEN PAUSED.
+                # It arrives on this node's own control socket, so it works when
+                # the bus is silent, when the agent that owned the command topic
+                # is dead, and when the session's pause bookkeeping disagrees
+                # with reality — which is exactly when it is needed.
+                arg = msg[len(b"PARK:"):].decode() if msg.startswith(b"PARK:") else ""
+                try:
+                    secs = float(arg) if arg else None
+                    result = node.park(secs)
+                except Exception as e:
+                    ctrl.send(f"ERR:{type(e).__name__}: {e}".encode())
+                else:
+                    ctrl.send(("OK:" + str(result)).encode())
             elif msg == b"RESUME":
                 try:
                     node.resume()
@@ -462,17 +485,52 @@ class ProcessHost:
         self._ctrl = self._ctx.socket(zmq.REQ)
         self._ctrl.connect(self._ctrl_addr)
 
-    def _request(self, payload: bytes) -> bytes:
+    def _request(self, payload: bytes, timeout_ms: int = 4000) -> bytes:
         """One REQ/REP round trip, serialized. THE LOCK IS THE POINT — see __init__.
 
         The reply is returned so callers can distinguish OK from an error the
         child reports; it used to be discarded, which is why a node that failed
         to open its writer still looked like it had succeeded.
+
+        A DEAD NODE MUST NOT HANG THE CALLER. There was no receive timeout here,
+        so a request to a node whose process had exited blocked forever on
+        recv(). Session.pause()/resume() walk every host in turn, so one dead
+        node stopped the walk dead — and because the session sets its own
+        _is_paused flag BEFORE the walk, the result was a session reporting
+        `paused: false` over HTTP while the arm node had never received RESUME
+        and was still gating commands.
+
+        Observed on the rig 2026-08-12: a policy agent node died at startup, and
+        every later attempt to unpause hung, left /status disagreeing with the
+        arm, and made the arm uncommandable with nothing saying so. A status that
+        contradicts the hardware is the failure this whole runtime change exists
+        to remove, so: skip nodes already known dead, and bound the wait for the
+        rest.
         """
         assert self._ctrl is not None
+        if not self.is_alive():
+            raise RuntimeError(
+                f"node {self._node.name!r} is not running (exitcode="
+                f"{self.exitcode}); refusing to wait on its control socket"
+            )
         with self._ctrl_lock:
+            self._ctrl.setsockopt(zmq.RCVTIMEO, int(timeout_ms))
             self._ctrl.send(payload)
-            return self._ctrl.recv()
+            try:
+                return self._ctrl.recv()
+            except zmq.ZMQError as exc:
+                # The REQ socket is now stuck mid-cycle and unusable for further
+                # requests; drop it so later calls fail fast and loudly instead
+                # of raising the confusing "Operation cannot be accomplished in
+                # current state" from somewhere unrelated.
+                try:
+                    self._ctrl.close(linger=0)
+                finally:
+                    self._ctrl = None
+                raise RuntimeError(
+                    f"node {self._node.name!r} did not answer its control socket "
+                    f"within {timeout_ms} ms"
+                ) from exc
 
     def _request_checked(self, payload: bytes, what: str) -> None:
         """_request, but raise if the child reports a failure instead of OK."""
@@ -503,6 +561,20 @@ class ProcessHost:
     def resume(self) -> None:
         """Tell the node subprocess to exit its paused state."""
         self._request(b"RESUME")
+
+    def park(self, duration_s: float | None = None, timeout_ms: int = 40000) -> str:
+        """Ramp this node's hardware home and hold. Bounded, and never silent.
+
+        The timeout is generous because a park is a real physical ramp of
+        several seconds — but it is finite, because the whole point of this path
+        is that it cannot leave a caller hanging the way resume() did.
+        """
+        payload = b"PARK" if duration_s is None else f"PARK:{float(duration_s)}".encode()
+        reply = self._request(payload, timeout_ms=timeout_ms)
+        text = reply.decode(errors="replace")
+        if text.startswith("ERR:"):
+            raise RuntimeError(f"node {self._node.name!r} failed to park: {text[4:]}")
+        return text[3:] if text.startswith("OK:") else text
 
     def stop(self, timeout: float = 8.0) -> None:
         if self._ctrl is not None:

@@ -200,6 +200,29 @@ def make_handler(session):
                 _rerecord(session, ACTION_LOCK)
                 self._json({"ok": True, "accepted": True, **_status_payload(session)})
 
+            elif path == "/park":
+                # ALWAYS AVAILABLE, including while paused and while other nodes
+                # are dead. This is the endpoint you reach for when something has
+                # gone wrong and the arm is somewhere it should not be left.
+                #
+                # Runs INLINE rather than through fire(): a park that returns
+                # "accepted" tells you nothing, and the one thing a caller needs
+                # from this endpoint is whether the arm actually got home. It is
+                # bounded — the ramp is a few seconds and every control request
+                # underneath it has a timeout — and it deliberately ignores the
+                # busy lock, because the moment you need to park is exactly the
+                # moment something else is stuck holding that lock.
+                secs = None
+                if "?" in self.path:
+                    from urllib.parse import parse_qs
+                    raw = parse_qs(self.path.split("?", 1)[1]).get("secs", [""])[0]
+                    try:
+                        secs = float(raw) if raw else None
+                    except ValueError:
+                        secs = None
+                result = session.park(secs)
+                self._json({"ok": result["ok"], "accepted": True, **result,
+                            **_status_payload(session)}, 200 if result["ok"] else 500)
             elif path == "/pause":
                 # toggle_pause is cheap and non-blocking; call it inline so
                 # the reply already carries the new state
