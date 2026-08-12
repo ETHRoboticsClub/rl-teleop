@@ -427,6 +427,23 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/manifest":
             rows = [r for r in read_manifest() if not r.get("deleted")]
             return self._send(200, {"rows": rows, "counts": counts(rows)})
+        if u.path == "/runlog":
+            # Live console tail for the cockpit's run-log panel. Offset-based so
+            # the client only ever fetches what is new; the file is the Tee
+            # mirror sort_right_checked writes.
+            q = parse_qs(u.query)
+            off = int((q.get("off") or ["0"])[0])
+            lp = Path("/tmp/run_console.log")
+            if not lp.exists():
+                return self._send(200, {"off": 0, "text": ""})
+            size = lp.stat().st_size
+            if off > size:
+                off = 0                      # log was truncated/rotated
+            with lp.open("rb") as f:
+                f.seek(off)
+                chunk = f.read(200_000)
+            return self._send(200, {"off": off + len(chunk),
+                                    "text": chunk.decode("utf-8", "replace")})
         if u.path.startswith("/img/"):
             p = (ROOT / u.path[len("/img/"):]).resolve()
             if ROOT.resolve() not in p.parents or not p.exists():
