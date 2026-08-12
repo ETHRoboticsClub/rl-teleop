@@ -210,8 +210,9 @@ def check_episode(d: Path) -> list[str]:
 
 # ── report ────────────────────────────────────────────────────────────────────
 
-def run_once(secs: float, base: str, cams: list[str] | None) -> bool:
-    bus = sample_bus(secs)
+def run_once(secs: float, base: str, cams: list[str] | None,
+             sub_port: int = DEFAULT_SUB_PORT) -> bool:
+    bus = sample_bus(secs, port=sub_port)
     rgb = sorted(t for t in bus["counts"] if t.endswith("/rgb"))
     print(f"── bus ({secs:.0f}s) " + "─" * 46)
     if not rgb:
@@ -262,6 +263,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--secs", type=float, default=6.0)
+    ap.add_argument("--sub-port", type=int, default=DEFAULT_SUB_PORT,
+                    help="bus XPUB port to audit (default 5556, the live bus). Point it "
+                         "at a soak bus to audit that instead — without this the tool "
+                         "silently audits the WRONG bus and reports 'no camera topics at "
+                         "all', which reads like a dead rig rather than a wrong port.")
     ap.add_argument("--base", default=DEFAULT_LAB)
     ap.add_argument("--cam", action="append", dest="cams",
                     help="cockpit cam id (repeatable). Default: top, wristR")
@@ -277,7 +283,7 @@ def main(argv=None) -> int:
         print()
 
     if not a.watch:
-        ok = run_once(a.secs, a.base, a.cams)
+        ok = run_once(a.secs, a.base, a.cams, a.sub_port)
         print(("\nALL STREAMS OK" if ok else "\nPROBLEMS FOUND — see above"))
         return 0 if ok else 1
 
@@ -287,7 +293,7 @@ def main(argv=None) -> int:
         while True:
             n += 1
             print(f"═══ check #{n}  t+{time.strftime('%H:%M:%S')} " + "═" * 28)
-            run_once(a.secs, a.base, a.cams)
+            run_once(a.secs, a.base, a.cams, a.sub_port)
             print()
             time.sleep(max(0.0, a.watch - a.secs))
     except KeyboardInterrupt:

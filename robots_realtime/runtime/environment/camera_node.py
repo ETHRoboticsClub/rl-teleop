@@ -252,6 +252,31 @@ class CameraNode(Node):
             )
         return lambda: driver
 
+    def _presence_check(self):
+        """A cheap callable answering "is this device on the bus at all".
+
+        Only for the shapes we can answer cheaply and correctly. Returning None
+        (no check) is always safe — it just means the open attempt happens.
+        """
+        spec = self._driver_spec or {}
+        path = spec.get("device_path") or getattr(self._driver, "device_path", None)
+        if path and str(path).startswith("/dev/"):
+            import os  # noqa: PLC0415
+            return lambda p=str(path): os.path.exists(p)
+
+        serial = spec.get("device_id") or getattr(self._driver, "device_id", None)
+        if serial:
+            def _realsense_present(want=str(serial)) -> bool:
+                import pyrealsense2 as rs  # noqa: PLC0415
+                # query_devices() only — deliberately NOT get_stream_profiles(),
+                # which is the expensive part of the failing open path.
+                return want in [
+                    d.get_info(rs.camera_info.serial_number)
+                    for d in rs.context().query_devices()
+                ]
+            return _realsense_present
+        return None
+
     def _identity_fn(self):
         """Pick the identity check that matches how this camera is addressed."""
         spec = self._driver_spec or {}
@@ -295,6 +320,7 @@ class CameraNode(Node):
             expected_shape=expected_shape,
             target_fps=spec.get("fps"),
             identity_fn=self._identity_fn(),
+            presence_check=self._presence_check(),
             device_path=str(spec.get("device_path") or spec.get("device_id") or ""),
         )
         self._supervised = supervised

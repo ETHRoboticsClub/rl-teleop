@@ -11,6 +11,7 @@ Prints one machine-readable line per event on stdout, then blocks until killed.
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import time
 from pathlib import Path
@@ -36,6 +37,25 @@ def main() -> int:
 
     session = load_session(args.config, pub_port=args.pub_port, sub_port=args.sub_port)
     session._save_root = Path(args.save_root)
+
+    # Stop the session on SIGTERM. Python runs `finally` on KeyboardInterrupt but
+    # NOT on a default SIGTERM, so `kill <runner pid>` left every camera node
+    # orphaned onto init, still holding the bus ports — and the next start then
+    # failed with "Address already in use" and a message blaming a running
+    # rr-session. A wrong diagnosis manufactured by our own cleanup path.
+    def _stop(signum, _frame):
+        print(f"SIGNAL {signum} — stopping the session", flush=True)
+        try:
+            session.stop()
+        finally:
+            sys.exit(0)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _stop)
+        except (OSError, ValueError):
+            pass
+
     session.start()
     print("STARTED", flush=True)
     time.sleep(args.warmup)

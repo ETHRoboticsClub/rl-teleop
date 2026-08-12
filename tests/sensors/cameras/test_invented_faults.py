@@ -302,6 +302,64 @@ def test_a_slow_camera_recovers_when_the_rate_comes_back() -> None:
         cam.stop()
 
 
+# ── invented fault H — an absent device silences its own health topic ───────
+
+
+def test_an_absent_device_is_not_opened_at_all() -> None:
+    """Measured on the rig, and the fix for a real degradation.
+
+    Opening an ABSENT RealSense makes five attempts, each enumerating every
+    connected device's sensors and stream profiles. That is seconds of C code
+    holding the GIL, which freezes every Python thread in the node — including
+    the one publishing health. Measured with the top-down camera absent: FOUR
+    health messages in twenty-five seconds, against two per second everywhere
+    else. Nothing lied (consumers correctly reported `stale`), but "the camera
+    that cannot be opened is also the camera whose health stops arriving" is a
+    poor trade, and it hammers a controller that may be dying.
+
+    A cheap presence check turns five expensive failures into zero.
+    """
+    opens = {"n": 0}
+
+    def factory():
+        opens["n"] += 1
+        raise RuntimeError("No device connected")
+
+    cam = _cam(factory, presence_check=lambda: False, give_up_after=2)
+    try:
+        assert cam.wait_until_open(5.0)
+        _drive(cam, 2.0)
+        h = cam.health()
+        assert opens["n"] == 0, f"the factory was called {opens['n']}x for an absent device"
+        assert h["state"] == STATE_FAILED
+        assert h["reason"] == "device_absent"
+        assert h["healthy"] is False
+    finally:
+        cam.stop()
+
+
+def test_a_device_that_appears_is_opened_and_recovers() -> None:
+    """The presence check must not become a way to never try again."""
+    present = {"yes": False}
+
+    cam = _cam(StaticSceneCamera, presence_check=lambda: present["yes"], give_up_after=2)
+    try:
+        cam.wait_until_open(5.0)
+        _drive(cam, 1.5)
+        assert cam.health()["reason"] == "device_absent"
+
+        present["yes"] = True                      # the camera is plugged back in
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and cam.state != STATE_OK:
+            try:
+                cam.read()
+            except CameraUnavailable:
+                pass
+        assert cam.state == STATE_OK, "never opened the device once it appeared"
+    finally:
+        cam.stop()
+
+
 # ── invented fault B — the wall clock steps backwards under the publisher ────
 
 

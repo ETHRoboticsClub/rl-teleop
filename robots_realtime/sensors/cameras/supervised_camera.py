@@ -282,6 +282,7 @@ class SupervisedCamera(CameraDriver):
         expected_shape: Optional[Tuple[int, int]] = None,
         target_fps: Optional[float] = None,
         identity_fn: Optional[Callable[[CameraDriver], str]] = None,
+        presence_check: Optional[Callable[[], bool]] = None,
         device_path: str = "",
         max_orphans: int = 4,
         autostart: bool = True,
@@ -328,6 +329,7 @@ class SupervisedCamera(CameraDriver):
         self._expected_shape = tuple(expected_shape) if expected_shape else None
         self._min_period_s = (1.0 / float(target_fps)) if target_fps else 0.0
         self._identity_fn = identity_fn
+        self._presence_check = presence_check
         self._max_orphans = int(max_orphans)
 
         self._driver: Optional[CameraDriver] = None
@@ -870,6 +872,21 @@ class SupervisedCamera(CameraDriver):
                 if self._stop_event.wait(wait):
                     break
 
+            # Do not pay for an open we can already tell will fail.
+            if self._device_is_present() is False:
+                attempt += 1
+                with self._lock:
+                    self._health.open_failures += 1
+                    failures = self._health.open_failures
+                self._set_state(
+                    STATE_FAILED if failures >= self._give_up_after else STATE_REOPENING,
+                    "device_absent",
+                    "the device is not on the bus; not attempting to open it",
+                )
+                self._first_open_done.set()
+                self._reopen_request.set()
+                continue
+
             driver = self._open_once()
             if driver is None:
                 attempt += 1
@@ -921,6 +938,31 @@ class SupervisedCamera(CameraDriver):
             # Not ok yet — ok is only asserted by a validated frame arriving.
             self._set_state(STATE_DEGRADED, "warmup", "waiting for first frame")
             self._first_open_done.set()
+
+    def _device_is_present(self) -> Optional[bool]:
+        """Cheap "is the device even there" check, or None if we cannot tell.
+
+        WHY THIS IS WORTH A ROUND TRIP. Opening an ABSENT RealSense is not cheap
+        and not quiet: ``_open_with_retries`` makes five attempts, and each one
+        enumerates every connected device's sensors and stream profiles before
+        failing. That is seconds of C code holding the GIL, during which every
+        Python thread in the node — including the one publishing health — is
+        frozen. Measured on this rig with the top-down camera absent: **four
+        health messages in twenty-five seconds**, against the two-per-second the
+        rest of the system manages. The health topic went stale, which every
+        consumer correctly reported as `stale` — nothing lied — but "the camera
+        that cannot be opened is also the camera whose health stops arriving" is
+        a poor trade, and it hammers a controller that may be dying.
+
+        One cheap check first turns five expensive failures into zero.
+        """
+        if self._presence_check is None:
+            return None
+        try:
+            return bool(self._presence_check())
+        except Exception as exc:                                  # noqa: BLE001
+            logger.debug("[%s] presence check failed: %s", self.name, exc)
+            return None
 
     def _open_once(self) -> Optional[CameraDriver]:
         """Call the factory with a timeout; None on failure.
