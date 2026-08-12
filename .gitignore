@@ -42,3 +42,8 @@ sweeps/results-smoke.jsonl
 /outputs
 /recordings
 sweeps/*-driver.log
+
+# Sweep checkpoints are artifacts, not source. A 197MB safetensors in an
+# unpushed commit blocked pushing main entirely (GitHub 100MB limit) and had
+# to be filter-branched out on 2026-08-12. Keep them out of git.
+sweeps/**/*.safetensors
