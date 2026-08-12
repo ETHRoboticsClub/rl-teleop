@@ -103,7 +103,11 @@ nodes:
   - type: CameraNode
     name: camera_right
     driver: OpenCVCamera
-    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.1:1.0-video-index0
+    # MOVED 2026-08-12 ~20:5x: operator swapped it into hub port 4 (the leader's
+    # old slot). Third hub port for this camera today (1.1 and 1.2 both failed
+    # under motion) — same hub though, so this tests the PORT hypothesis, not
+    # the controller. Verified by frame content: 1.4 sees the red source bin.
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.4:1.0-video-index0
     resolution: [640, 480]
     fps: 30
     publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]
