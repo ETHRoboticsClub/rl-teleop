@@ -1,0 +1,116 @@
+version: "1"
+# Cameras only — no arm, no leader, nothing that can move or be dropped.
+#
+# WHY THIS FILE EXISTS. Viewing the cameras should not require energising a
+# brakeless arm. record_kitting.sh starts the full right-arm session (RobotNode
+# included), so using it just to look at a panel means powering the arm, and
+# stopping it again means the arm sags — measured at joint2 +48.65° during one
+# power gap while parked at home. This config contains NO RobotNode and NO
+# AgentNode, so starting and stopping it is mechanically free.
+#
+# It is for LOOKING, not for recording. Recording is session-owned and driven
+# over per-node control sockets (runtime/node.py:131), so a camera session
+# cannot write into someone else's episode dir. Use record_kitting.sh for data.
+#
+# The camera blocks are copied verbatim from yam_right_kitting_teleop.yaml —
+# that file stays the source of truth for device paths and tuning. If a path
+# changes there, change it here in the same edit.
+#
+# camera_top (D455 203522250539) IS DELIBERATELY ABSENT. It is configured for
+# 1280x720@30, and since the 2026-08-12 reboot it negotiates a 480 Mbit link
+# where 720p offers 5/10/15 Hz only, so the node cannot start. The fix is the
+# CABLE, not the fps: usb1 (480 Mbit) and usb2 (20000 Mbit) are two halves of
+# controller 0000:0d:00.0, so a device on usb1 negotiated USB 2 while sitting in
+# a USB 3 port. Check with `cat /sys/bus/usb/devices/1-1/speed` — want 5000+.
+# Once that reads 5000+, add the camera_top block back from the right config
+# unchanged. Do not add it here at a lower fps: that hides a cable fault in a
+# config value, and it would stay hidden long after the cable was replaced.
+# Panels `top` and `egocentric` therefore have no publisher and 503 honestly,
+# which the cockpit renders as KEIN SIGNAL — better than a plausible lie.
+session:
+  save_root: recordings
+
+nodes:
+  # D455 — angled overview / egocentric view of the whole cell.
+  # RE-ENABLED 2026-08-12 14:2x: the operator replugged it and it now links at
+  # 5000 Mbit (was 480 in a USB 3 socket, i.e. a cable/seating fault, exactly as
+  # rule 3 of skills/ethrc-computer predicts). 720p30 needs that link.
+  #
+  # ⚠ IT IS ON 0000:71:00.0 — the ASMedia ASM4242, the one controller cameras
+  # must never use. 1368 of 1368 `bad transfer trb length` errors in the journal
+  # name it and nothing else; it has died completely TWICE, both times under
+  # RealSense load at this exact profile, taking every device on it down until a
+  # reboot or a physical move. Both CAN adapters are on 0d:00.0 and 73:00.4, so a
+  # death cannot drop the arm — the blast radius is this camera. MOVE IT to usb2
+  # (0d:00.0, 5x20G) or usb6/usb8 (73:00.3/73:00.4, CPU-native); all eleven
+  # SuperSpeed connectors on this box are currently empty.
+  #
+  # Identified by SERIAL, not by path, so a replug does not invalidate this line
+  # the way it does for the by-path Innomakers.
+  - type: CameraNode
+    name: camera_top
+    driver: RealSenseCamera
+    device_id: "203522250539"
+    resolution: [1280, 720]
+    fps: 30
+    enable_depth: false
+    publish_resize: [270, 480]   # [HEIGHT, WIDTH] — NOT [W,H]
+    publish_resize_mode: pad
+
+  # camera_scan (D435i 241222077246) IS ALSO ABSENT, for a different reason than
+  # camera_top — this one is BANDWIDTH, not a cable.
+  #
+  # The reboot moved it onto the shared USB 2.0 hub. It used to sit on its own
+  # controller (`usb-0000:0d:00.0-4` before 2026-08-12); it now enumerates at
+  # `9-1.2`, behind the same 480 Mbit hub as BOTH wrist cameras (9-1.1, 9-1.3).
+  # Two wrist cams at 640x480 raw @30 are ~18.4 MB/s each — ~37 MB/s of a hub
+  # whose practical ceiling is ~40 MB/s. Adding 720p15 (~27 MB/s) is over budget,
+  # and the D435i loses: it opens the device and then gets nothing —
+  #   RealSenseCamera: no color/infrared frame during startup warmup
+  #   [camera_scan] camera open did not return within 20s — thread orphaned
+  # which reads like a broken camera and is not one. It retried 5 times, so
+  # leaving it configured here costs open attempts on a hub that is already full.
+  #
+  # THE FIX IS TO MOVE IT BACK OFF THIS HUB, onto a port on 0000:0d:00.0 where it
+  # lived until the reboot — not to lower its resolution. 720p is load-bearing:
+  # the scan camera exists to OCR part numbers and the measured decode floor is
+  # ~800 px across a label. Re-add the block from yam_right_kitting_teleop.yaml
+  # unchanged once `ls /sys/bus/usb/devices/*/product | xargs grep -l 435i` shows
+  # it off `9-*`.
+  #
+  # Note this makes all four cameras a single-USB-2-hub problem right now: with
+  # camera_top's cable also negotiating USB 2, every camera on the rig is on a
+  # 480 Mbit link, three of them on one hub. That is the thing to fix, not the
+  # individual nodes.
+
+  # Wrist RIGHT — the camera the ACT grasp policy consumes, and the one that
+  # died on usb-0:1.2 at 23:46 on 08-11 and came back on usb-0:1.1 after the
+  # reboot. The two Innomakers share serial SN0001, so the by-path port IS the
+  # identity: verify by frame content (right sees the red SOURCE BIN, left sees
+  # the dark MAT), never by remembering the number.
+  - type: CameraNode
+    name: camera_right
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.1:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+    publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]
+    publish_resize_mode: pad     # NOT the center_crop default — it crops to a square
+    v4l2_controls:
+      brightness: 0
+      contrast: 28
+      saturation: 64
+
+  # Wrist LEFT — unchanged across the reboot.
+  - type: CameraNode
+    name: camera_left
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.3:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+    publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]
+    publish_resize_mode: pad
+    v4l2_controls:
+      brightness: 0
+      contrast: 28
+      saturation: 64

@@ -1,0 +1,93 @@
+version: "1"
+# RIGHT arm, gello leader, NO cameras. For recording the jaw dataset.
+#
+#   ./.venv/bin/rr-session configs/yam/yam_right_teleop_nocams.yaml --attach-bus --no-tui
+#
+# WHY THIS EXISTS. Capturing empty-vs-full jaw frames needs the operator to drive
+# the arm by hand — into the bin, onto a packet, closed on nothing beside one —
+# while tools/jaw_capture_server.py records what the wrist sees. Neither existing
+# config allows that:
+#
+#   yam_right_commanded_nocams.yaml  takes ik_cmd/joint_pos. The leader is not
+#       wired to it at all, so the arm simply ignores the gello. That is the
+#       config the arm is usually left in after a policy run.
+#   yam_right_kitting_teleop.yaml    takes the leader, but also owns all four
+#       CameraNodes. Starting it while cameras_only_view.yaml is up means two
+#       sessions opening the same /dev/video*, and the second one loses — which
+#       on this rig reads as "the wrist camera is broken" rather than "two
+#       processes want it".
+#
+# So: the leader and the arm from the teleop config, the camera nodes left out,
+# exactly as yam_left_commanded_nocams.yaml does for the commanded case.
+#
+# THE CAMERA SESSION MUST ALREADY BE UP. This config publishes no images, and
+# the capture tool reads camera_right/rgb off the bus. Start
+# configs/yam/cameras_only_view.yaml first, or the capture UI will show a dead
+# feed and (by design) refuse every capture.
+#
+# SAFETY. Starting this after a commanded session means the arm changes hands
+# while powered. startup_hold latches wherever it is, so there is no motion at
+# startup — but the FIRST leader reading then becomes the target, and RobotNode
+# ramps to it over ramp_duration_s. Match the leader to the arm's pose BEFORE
+# starting, or that ramp is a fast unplanned move. The arm has no brakes.
+
+session:
+  save_root: recordings
+
+nodes:
+  # The leader. Every value here is copied verbatim from
+  # yam_right_kitting_teleop.yaml — it is the only calibrated RIGHT leader on
+  # this rig (re-derived 2026-08-10 against a zero reference pose). If it drifts,
+  # fix it THERE and re-copy, so the two files cannot disagree about the same
+  # physical hardware.
+  - type: AgentNode
+    name: gello_right
+    pinned_cpu: 8          # 6 is the LEFT leader's pin; do not reuse it
+    realtime_priority: 70
+    agent_class: robots_realtime.agents.teleoperation.dynamixel_gello_leader_agent:DynamixelGelloLeaderAgent
+    agent_kwargs:
+      port: /dev/leader-right
+      robot_name: right
+      motor_ids: [8, 9, 10, 11, 12, 13, 14]
+      baudrate: 1000000
+      include_gripper: true
+      joint_offsets_ticks: [-484, -988, 691, 1014, 1014, -44]
+      # joint 3 negative on the right, joint 2 on the left. A real difference
+      # between the two leaders, not a typo.
+      joint_scales: [1, 1, 1, -1, 1, 1]
+      joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      gripper_open_ticks: 2280
+      gripper_closed_ticks: 2000
+      gripper_scale: 1.0
+      stale_timeout_s: 1.0
+      max_delta_rad: 3.14
+      # The spring is what makes this dataset recordable at all: it lets the
+      # operator hold the jaws SHUT on nothing without fighting the leader, which
+      # is the empty-class pose. Without it every empty capture is a wrestle.
+      gripper_spring: true
+      gripper_spring_current_limit: 100
+    arm_key: right
+    loop_mode: flat_out
+
+  - type: RobotNode
+    name: yam_right
+    pinned_cpu: 4          # 2 is the LEFT follower's pin
+    realtime_priority: 85
+    robot_config: robot_configs/yam/right.yaml
+    cmd_topic: gello_right/joint_pos      # the leader, not ik_cmd
+    poll_freq: 200
+
+    # No startup_joint_pos: coming up must not MOVE the arm. startup_hold: it
+    # must not go limp either — a brakeless YAM with nothing commanding it sinks
+    # into the table.
+    startup_hold: true
+
+    # 1.5 s covers the handover from startup_hold to the first leader reading.
+    # If the leader is far from the arm's real pose when this starts, that is a
+    # 1.5 s sweep to wherever the leader happens to be sitting.
+    ramp_duration_s: 1.5
+
+    # shutdown_joint_pos DEFAULTS to all-zeros, which would park the arm on exit.
+    # `null` disables parking: stopping this session must not move the arm.
+    shutdown_joint_pos: null
+    shutdown_duration_s: 0.0
