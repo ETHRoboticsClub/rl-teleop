@@ -1,0 +1,45 @@
+# Gripper stall supervisor — fixes 4 and 6 from research/gripper-mat-contact.md.
+#
+# OPT-IN ONLY. This file activates nothing by itself: pipeline code must load it
+# (GripperStallSupervisorConfig.from_yaml) and construct a GripperStallSupervisor,
+# which refuses to construct unless `enabled: true`. Nothing in rl-teleop reads
+# this file automatically.
+#
+# Load with:
+#   from robots_realtime.robots.gripper_stall_supervisor import (
+#       GripperStallSupervisorConfig, GripperStallSupervisor,
+#       MotorChainGripperIO, set_gripper_force_limit,
+#   )
+#   cfg = GripperStallSupervisorConfig.from_yaml("configs/yam/gripper_stall_supervisor.yaml")
+
+gripper_stall_supervisor:
+  enabled: false            # flip to true in the PIPELINE's copy to opt in
+
+  # Fix 4: run the close under a force limit (Newtons), via the i2rt
+  # GripperForceLimiter (the robot YAML's limit_gripper_force, retuned at
+  # runtime). null = leave the robot's configured limit untouched.
+  close_force_newtons: null
+
+  close_target: 0.0         # normalized gripper command; 0 = fully closed
+  close_reached_eps: 0.03   # |pos - target| below this counts as closed (empty)
+  close_timeout_s: 4.0
+  sample_rate_hz: 50.0
+
+  # Fix 6: stall verdict = encoder static AND position error high AND effort
+  # at limit, for N consecutive samples. pos_error_threshold must stay above
+  # the residual opening of a legitimately held object (thin packets close the
+  # jaws almost fully), or a good grasp reads as a stall.
+  detector:
+    encoder_eps: 0.004            # normalized pos delta/sample considered static
+    pos_error_threshold: 0.15     # normalized |target - pos|
+    effort_stall_threshold: 0.45  # Nm (linear_4310 clog threshold is 0.5)
+    consecutive_samples: 25       # ~0.5 s at 50 Hz
+
+  # Bounded recovery: open, lift, small lateral shift (alternating sides),
+  # lower, retry. max_attempts counts CLOSE attempts, so 3 = 2 recoveries.
+  recovery:
+    lift_height_m: 0.015
+    lateral_shift_m: 0.005
+    max_attempts: 3
+    open_pos: 1.0
+    settle_time_s: 0.25
