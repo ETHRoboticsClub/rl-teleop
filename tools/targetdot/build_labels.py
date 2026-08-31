@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Per-dataset-frame target points for ETHRC/yam_grasp_right_20260812.
+"""Per-dataset-frame target points for the grasp-window datasets.
 
-Joins mapping.json (dataset frame -> camera_right frame index, from
+Joins mapping-<dataset>.json (dataset frame -> wrist camera frame index, from
 map_dataset.py) with the SAM2 auto-label masks (study's work/ + this repo's
 work/ for the events the study's long-hold filter missed) and writes
-labels.json:
+labels-<dataset>.json:
 
     [ { "episode_index": 0, "recording": ..., "t_close": ...,
         "points": [[x, y] | null, ...] },     # one per dataset frame_index
       ... ]
 
+Points are in NATIVE wrist-camera pixels (640x480) — burn the dot into frames
+of that geometry (the plain 20260812 cache, or the 20260814 *_wristnative
+cache), never into the _bus caches, whose frames are resized+padded and would
+need a coordinate transform.
+
 Label policy (documented for the PR):
   * pre-close frames: centroid of the tracked target mask at the NEAREST
     labeled camera frame within +-3 frames (the tracker ran at stride 2, so
     this bridges the stride but never invents a distant label);
-  * frames at/after the seed frame (close-3, i.e. the close and the 2 s lift):
+  * frames at/after the seed frame (close-3, i.e. the close and the lift):
     the LAST tracked centroid, held constant — the packet is between the jaws
     and static relative to the wrist camera (the motion-still observation in
     the research doc); at inference the tracker equally keeps its last lock on
@@ -27,6 +32,7 @@ Label policy (documented for the PR):
 """
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import os
@@ -37,13 +43,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STUDY_WORK = ("/home/tommaso/Desktop/kitting-v2-worktrees/yam-pick-pipeline/"
               "target-selector-offline/tools/target_selector_eval/work")
 MY_WORK = os.path.join(HERE, "work")
-RECORDINGS = "/home/tommaso/Desktop/kitting-v2/rl-teleop/recordings/20260811"
+RECORDINGS = "/home/tommaso/Desktop/kitting-v2/rl-teleop/recordings"
+DAY = {"20260812": "20260811", "20260814": "20260814"}  # dataset -> recording day
 
-MATCH_TOL_S = 1.0     # keep grasp <-> auto-label event, close-time distance
+MATCH_TOL_S = 1.0     # dataset grasp <-> auto-label event, close-time distance
 NEAR_FRAMES = 3       # max |camera frame| distance to borrow a mask from
 
 
-def load_events(recording: str, ts: np.ndarray) -> list[dict]:
+def load_events(rec_root: str, recording: str, ts: np.ndarray) -> list[dict]:
     """Every auto-labeled event for one recording, with per-frame centroids."""
     events = []
     for src in (STUDY_WORK, MY_WORK):
@@ -79,15 +86,20 @@ def point_for(ev: dict, cam: int):
 
 
 def main() -> int:
-    mapping = json.load(open(os.path.join(HERE, "mapping.json")))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", choices=sorted(DAY), default="20260812")
+    a = ap.parse_args()
+    rec_root = os.path.join(RECORDINGS, DAY[a.dataset])
+    mapping = json.load(open(os.path.join(HERE, f"mapping-{a.dataset}.json")))
+
     ts_cache, ev_cache = {}, {}
     out, dotted, total = [], 0, 0
     for ep in mapping:
         rec = ep["recording"]
         if rec not in ts_cache:
             ts_cache[rec] = np.load(os.path.join(
-                RECORDINGS, rec, "camera_right-rgb-timestamp.npy")).astype(np.float64)
-            ev_cache[rec] = load_events(rec, ts_cache[rec])
+                rec_root, rec, "camera_right-rgb-timestamp.npy")).astype(np.float64)
+            ev_cache[rec] = load_events(rec_root, rec, ts_cache[rec])
         events = ev_cache[rec]
         dts = [abs(e["t_close"] - ep["t_close"]) for e in events]
         i = int(np.argmin(dts))
@@ -105,7 +117,7 @@ def main() -> int:
         print(f"  ep {ep['episode_index']:>2} {rec} close={ep['t_close']:.2f}: "
               f"{n}/{len(pts)} frames dotted "
               f"(event {os.path.basename(ev['npz'])}, dt={dts[i]*1000:.0f}ms)")
-    path = os.path.join(HERE, "labels.json")
+    path = os.path.join(HERE, f"labels-{a.dataset}.json")
     json.dump(out, open(path, "w"))
     print(f"\nlabel coverage: {dotted}/{total} frames "
           f"({100.0 * dotted / total:.1f}%) -> {path}")
