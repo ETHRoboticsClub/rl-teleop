@@ -59,6 +59,14 @@ class RealSenseCamera(CameraDriver):
 
     Args:
         device_id: RealSense serial number. ``None`` = first enumerated device.
+        device_model: Model substring (e.g. ``"D455"``, ``"D435"``) used as a
+            FALLBACK identity when ``device_id`` is not among the enumerated
+            serials. RealSense units get swapped for spares, and this repo pins
+            the serial in 20+ config files — a swap used to mean editing all of
+            them or getting an error that never mentions "wrong camera".
+            The fallback only fires when EXACTLY ONE enumerated device matches
+            the model, so it can never silently pick the wrong RealSense out of
+            a D455 + D435i pair; anything ambiguous keeps the original error.
         resolution: ``"WxH"``, preset name, or ``(w, h)`` tuple. Default ``"VGA"``.
         fps: Frame rate. Default 30.
         auto_exposure: Enable auto-exposure on the stereo / color sensor.
@@ -75,6 +83,7 @@ class RealSenseCamera(CameraDriver):
     """
 
     device_id: Optional[str] = None
+    device_model: Optional[str] = None
     resolution: Any = "VGA"
     fps: int = 30
     auto_exposure: bool = True
@@ -144,6 +153,68 @@ class RealSenseCamera(CameraDriver):
                 logger.debug("RealSenseCamera serial read failed: %s", exc)
         return None
 
+    def _resolve_device_identity(self) -> None:
+        """Fall back from a stale pinned serial to an unambiguous model match.
+
+        A RealSense that is physically present but carries a different serial
+        than the config pins fails at ``pipe.start()`` with "No device connected"
+        — an error that names neither the serial nor the camera, and that reads
+        exactly like an unplugged cable.
+
+        Worth knowing while debugging that: the librealsense serial and the USB
+        string descriptor are DIFFERENT NUMBERS for the same unit. This rig's
+        D455 is ``203522250539`` to librealsense but logs ``201523063286`` in
+        dmesg; the D435i is ``241222077246`` vs ``235523060846``. So a serial
+        that "does not match dmesg" is NOT evidence of a wrong config — only
+        ``rs-enumerate-devices -s`` settles it.
+
+        Rewriting ``self.device_id`` (rather than threading an "effective id"
+        through the driver) is deliberate: the post-start serial assertion in
+        ``_start_pipeline_once`` and ``get_camera_info`` then both report what was
+        actually opened, so nothing downstream can claim the pinned serial.
+        """
+        if self.device_model is None or self.device_id is None:
+            return
+        rs = self._rs
+        try:
+            devices = list(rs.context().query_devices())
+        except Exception as exc:
+            logger.debug("RealSenseCamera enumeration during identity resolve failed: %s", exc)
+            return
+
+        serials = []
+        for dev in devices:
+            try:
+                serials.append((dev.get_info(rs.camera_info.serial_number),
+                                dev.get_info(rs.camera_info.name)))
+            except Exception as exc:
+                logger.debug("RealSenseCamera info read failed: %s", exc)
+
+        if any(serial == self.device_id for serial, _ in serials):
+            return  # pinned serial is present; nothing to do
+
+        matches = [serial for serial, name in serials
+                   if self.device_model.lower() in name.lower()]
+        if len(matches) != 1:
+            # 0 = not plugged in; >1 = ambiguous. Both must keep the original
+            # error rather than guess which camera the operator meant.
+            logger.warning(
+                "RealSenseCamera: pinned serial %s absent and %d device(s) match "
+                "model %r — not substituting. Enumerated: %s",
+                self.device_id, len(matches), self.device_model,
+                [f"{n} {s}" for s, n in serials] or "none",
+            )
+            return
+
+        logger.warning(
+            "RealSenseCamera: pinned serial %s did not enumerate. Exactly one %s is "
+            "present (%s) — using it. This is a safety net for a swapped unit, not "
+            "a fix: confirm with `rs-enumerate-devices -s` and update the config if "
+            "the camera really was replaced.",
+            self.device_id, self.device_model, matches[0],
+        )
+        self.device_id = matches[0]
+
     def _open_with_retries(self, max_retries: int = 5) -> None:
         """Open the pipeline; retry on transient RealSense startup errors."""
         last_exc: Exception | None = None
@@ -179,6 +250,10 @@ class RealSenseCamera(CameraDriver):
 
     def _start_pipeline_once(self) -> None:
         rs = self._rs
+        # Re-resolve on every attempt, not once in __post_init__: SupervisedCamera
+        # reopens after a failure, and a camera that re-enumerated in between may
+        # come back before this driver next looks for it.
+        self._resolve_device_identity()
         has_color = self._device_has_color_sensor()
 
         pipe = rs.pipeline()

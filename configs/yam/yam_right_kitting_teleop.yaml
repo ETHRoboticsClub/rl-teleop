@@ -111,7 +111,13 @@ nodes:
       #   left  [1, 1, -1,  1, 1, 1]
       #   right [1, 1,  1, -1, 1, 1]
       # That is a real difference between the two leaders, not a typo.
-      joint_offsets_ticks: [-484, -988, 691, 1014, 1014, -44]
+      # RE-DERIVED 2026-08-31 with tools/calibrate_gello_leader.py --solve at a
+      # zero reference pose (leader AND follower physically zeroed by the
+      # operator); rounding residual 0.00 deg on every joint. Correction
+      # applied (deg): [0.26, 0.00, -0.62, 2.72, 0.18, 0.18] -- joint 4 carried
+      # nearly all of it. Previous values, for rollback:
+      #   [-484, -988, 691, 1014, 1014, -44]
+      joint_offsets_ticks: [-487, -988, 698, 1045, 1012, -46]
       joint_scales: [1, 1, 1, -1, 1, 1]
       joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
       gripper_open_ticks: 2280
@@ -186,6 +192,14 @@ nodes:
     name: camera_top
     driver: RealSenseCamera
     device_id: "203522250539"
+    # Fallback identity, added 2026-08-31. NOTE: the serial above is the
+    # LIBREALSENSE serial and does NOT match the USB string descriptor the
+    # kernel logs — this D455 reads 201523063286 in dmesg/lsusb. So you CANNOT
+    # check the line above against dmesg; only against `rs-enumerate-devices -s`.
+    # This fallback covers a unit swap: it substitutes ONLY when the pinned
+    # serial is absent AND exactly one D455 is present, so a D455 + D435i pair
+    # can never be confused. Anything ambiguous still fails as before.
+    device_model: "D455"
     resolution: [1280, 720]
     # 720p30 needs a USB 3 link. Deliberately NOT lowered to fit a degraded one:
     # dropping fps here would hide a cable fault as a config value, and the fps
@@ -240,6 +254,14 @@ nodes:
     name: camera_scan
     driver: RealSenseCamera
     device_id: "241222077246"
+    # Fallback identity, added 2026-08-31. NOTE: the serial above is the
+    # LIBREALSENSE serial and does NOT match the USB string descriptor the
+    # kernel logs — this D435 reads 235523060846 in dmesg/lsusb. So you CANNOT
+    # check the line above against dmesg; only against `rs-enumerate-devices -s`.
+    # This fallback covers a unit swap: it substitutes ONLY when the pinned
+    # serial is absent AND exactly one D435 is present, so a D455 + D435i pair
+    # can never be confused. Anything ambiguous still fails as before.
+    device_model: "D435"
     resolution: [1280, 720]   # 720p so the scan-cam OCR can read the part numbers
     fps: 15                   # USB 2.0 ceiling at this resolution — see above
     enable_depth: false
@@ -327,7 +349,10 @@ nodes:
   - type: CameraNode
     name: camera_right
     driver: OpenCVCamera
-    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.1:1.0-video-index0
+    # REPLACED 2026-08-13: NEW camera (ELE01, idVendor 114d) after the Innomaker
+    # cable died. Chipset controller 0000:0d:00.0 rear port — off the saturated
+    # 74:00.0 hub entirely. Same edit as cameras_right_top.yaml (kept in sync).
+    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:1:1.0-video-index0
     resolution: [640, 480]
     fps: 30
     publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]   # bus copy only; disk keeps 640x480
@@ -338,11 +363,23 @@ nodes:
     # targets match each camera's aspect ratio exactly there is no letterbox.
     publish_resize_mode: pad
     v4l2_controls:
-      brightness: 0
-      contrast: 28
-      saturation: 64
-  #     white_balance_automatic: 1
-  #     gamma: 100
+      # 1 = 50 Hz. THE SENSOR POWERS UP AT 2 (60 Hz); the mains here is 50 Hz, so
+      # the anti-flicker filter beat against the lighting. Measured 2026-08-14 on a
+      # STATIC scene, off the bus: mean frame brightness swung 34.87 grey levels
+      # peak-to-peak with a 34.73 jump BETWEEN CONSECUTIVE FRAMES (std 14.97). The
+      # D455 beside it, same scene, same instant: std 0.01. Setting 50 Hz took the
+      # ELE01 to std 0.02 / p2p 0.10 — steadier than the RealSense.
+      #
+      # IT MUST LIVE HERE, not in a one-off `v4l2-ctl --set-ctrl`.
+      # OpenCVCamera._apply_v4l2_controls() runs on EVERY open, and SupervisedCamera
+      # reopens the camera on failure — so a runtime-only fix is undone by the first
+      # reopen, mid-recording, and the only trace is flashing training data.
+      power_line_frequency: 1
+    # Still no brightness/contrast/saturation: the old block (0 / 28 / 64) was tuned
+    # to the Innomaker's ranges; the ELE01 is 0-255 with 128 = neutral, so brightness
+    # 0 would render near-black. auto_exposure deliberately stays ON (3, aperture
+    # priority) — real exposure variation is robustness that dark_noise augmentation
+    # complements, and tools/exposure_wobble.py cycles it on purpose for the jaw data.
   #     gain: 0
   #     power_line_frequency: 1
   #     sharpness: 3

@@ -58,6 +58,14 @@ nodes:
     name: camera_top
     driver: RealSenseCamera
     device_id: "203522250539"
+    # Fallback identity, added 2026-08-31. NOTE: the serial above is the
+    # LIBREALSENSE serial and does NOT match the USB string descriptor the
+    # kernel logs — this D455 reads 201523063286 in dmesg/lsusb. So you CANNOT
+    # check the line above against dmesg; only against `rs-enumerate-devices -s`.
+    # This fallback covers a unit swap: it substitutes ONLY when the pinned
+    # serial is absent AND exactly one D455 is present, so a D455 + D435i pair
+    # can never be confused. Anything ambiguous still fails as before.
+    device_model: "D455"
     resolution: HD720
     fps: 30
 

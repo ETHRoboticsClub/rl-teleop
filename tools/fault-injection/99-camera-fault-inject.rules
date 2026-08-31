@@ -41,6 +41,19 @@ ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="6366"
 #ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="8086", ATTR{idProduct}=="0b3a", \
 #  RUN+="/bin/sh -c 'chgrp video /sys%p/authorized && chmod 0664 /sys%p/authorized'"
 
-# ── top-down camera (RealSense D455) ─ OPT-IN, same caveat ─────────────────────────
-#ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="8086", ATTR{idProduct}=="0b5c", \
-#  RUN+="/bin/sh -c 'chgrp video /sys%p/authorized && chmod 0664 /sys%p/authorized'"
+# ── top-down camera (RealSense D455) ─ ENABLED 2026-08-31 ──────────────────────────
+# Opted in deliberately. On 2026-08-31 this camera enumerated correctly at SuperSpeed
+# but its colour sensor would not start in ANY format or rate ("Failed to resolve the
+# request" for rgb8/bgr8/yuyv at 30 and 15) after 37 SuperSpeed link resets caught it
+# mid-initialisation. The ONLY recovery is a power cycle, and without this line that
+# means walking to the rig — an agent cannot clear it, and hardware_reset() is banned.
+# This is bus-level deauthorize/reauthorize, NOT a firmware reset. See the header.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="8086", ATTR{idProduct}=="0b5c", \
+  RUN+="/bin/sh -c 'chgrp video /sys%p/authorized && chmod 0664 /sys%p/authorized'"
+
+# ── right wrist camera (ELE01, Alpha Imaging) ─ ADDED 2026-08-31 ───────────────────
+# This camera did not exist when the rule was written: it replaced the right-wrist
+# Innomaker on 2026-08-13 when that camera's cable died. Without this line the rule
+# covers a camera the rig no longer has and misses one it does.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="114d", ATTR{idProduct}=="8589", \
+  RUN+="/bin/sh -c 'chgrp video /sys%p/authorized && chmod 0664 /sys%p/authorized'"

@@ -1,0 +1,48 @@
+# camera_right ALONE, at full 640x480 on the bus.
+#
+# WHY THIS EXISTS. cameras_right_top.yaml also opens the D455 (camera_top), and
+# the D455 is routinely held by whichever LEFT-arm session is running -- so
+# bringing up the right-arm cameras meant killing the left arm's session, which
+# unpowers a brakeless arm. That is a heavy price for a policy that does not use
+# the top camera at all: grep finds ZERO references to camera_top in
+# sort_right_checked.py or rightarm/*.py, and the wrist-only checkpoints
+# (act_grasp_right_night_20260812, and anything exported with --cameras wrist)
+# declare only observation.images.wrist, so act_runner.load_policy prunes the
+# top binding and never subscribes.
+#
+# camera_right lives on the CHIPSET controller 0000:0d:00.0, and no left-arm
+# config opens it, so this session and a left recording session coexist with no
+# device contention.
+#
+# NO publish_resize. The bus carries the same 640x480 the mp4s hold, so a
+# checkpoint declaring 480x640 is matched and act_runner's scale guard passes.
+# See tools/act_bus_geometry.py for what that guard exists to prevent.
+#
+#   tmux new-session -d -s cams -c ~/Desktop/kitting-v2/rl-teleop \
+#     './.venv/bin/rr-session configs/yam/cameras_right_only.yaml \
+#      --attach-bus --no-tui --control-port 8794'
+version: "1"
+session:
+  save_root: recordings
+
+nodes:
+  # Wrist RIGHT -- ELE01, the camera the ACT grasp policy consumes.
+  # Identity is by-path: the two Innomakers share serial SN0001, so the USB port
+  # IS the identity. Re-verify by frame content after any physical change (this
+  # one sees the red SOURCE BIN; the left wrist sees the dark mat).
+  - type: CameraNode
+    name: camera_right
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:1:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+    v4l2_controls:
+      # 1 = 50 Hz. THE SENSOR POWERS UP AT 2 (60 Hz) and the mains here is 50 Hz,
+      # so the anti-flicker filter beats against the lighting: measured on a
+      # static scene, 34.87 grey levels peak-to-peak with a 34.73 jump between
+      # consecutive frames. Setting 50 Hz took it to p2p 0.10. It MUST live in
+      # the config, not a one-off v4l2-ctl -- OpenCVCamera._apply_v4l2_controls()
+      # runs on every open and SupervisedCamera reopens on failure, so a runtime
+      # fix is undone by the first reopen, mid-run, and the only trace is
+      # flashing training data.
+      power_line_frequency: 1

@@ -70,6 +70,27 @@ class OpencvCamera(CameraDriver):
 
         # Try setting FPS to 30
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+
+        # Warm-up: absorb first-frame latency HERE, not in read(). Some cameras
+        # need >1s from STREAMON to their first frame (ELE01 wrist cam: measured
+        # 1.10s, then rock-solid 30 fps), which is longer than read()'s 1.0s
+        # stale-handle deadline — without this, the supervisor reopens forever
+        # against a device that was 100ms from working. Open runs under
+        # SupervisedCamera's own 20s watchdog, so a bounded wait is safe here,
+        # and read()'s deadline stays tight where it matters: mid-run.
+        warmup_deadline = time.monotonic() + 5.0
+        while True:
+            ok, _ = self.cap.read()
+            if ok:
+                break
+            if time.monotonic() >= warmup_deadline:
+                self.cap.release()
+                raise OpencvCameraReadError(
+                    f"{self.device_path}: no frame within 5s of open — device "
+                    f"opened but is not delivering (format mismatch or dead sensor)"
+                )
+            time.sleep(0.02)
+
         if self.auto_exposure_enabled:
             self._exposure = self._get_v4l2_control("exposure_time_absolute")
 

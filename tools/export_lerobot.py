@@ -587,13 +587,23 @@ def arm_activity(state: np.ndarray, action: np.ndarray) -> dict:
     return {"ptp_rad": ptp, "divergence_rad": div, "moving": ptp > ARM_MOVING_PTP_RAD}
 
 
-def read_arm(ep: Path, arm: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def read_arm(ep: Path, arm: str,
+             open_ref: float | None = None,
+             closed_ref: float | None = None,
+             ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """(t_state, state, t_action, action) for one arm, gripper channel normalised.
 
     action = gello (leader, what the operator commanded), observation.state =
     yam (follower, where the arm actually was). Swapping them trains a policy to
     predict where the arm already is: the loss curve looks fine and the policy
     is useless on hardware. Pinned by test.
+
+    ``open_ref``/``closed_ref`` are the gripper's PHYSICAL limits. Passing them
+    makes the channel absolute; leaving them None keeps the historical
+    per-episode percentile scale, which is only valid when the episode happens
+    to span the full open→closed range. That distinction bites hardest on SHORT
+    episodes — one grasp-and-place cycle per take — where the same physical jaw
+    opening otherwise lands on a different number in every episode.
     """
     t_yam, p_yam = read_positions(ep / f"yam_{arm}.mcap", f"yam_{arm}")
     t_gel, p_gel = read_positions(ep / f"gello_{arm}.mcap", f"gello_{arm}")
@@ -602,8 +612,10 @@ def read_arm(ep: Path, arm: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
     # Gripper scale over the WHOLE episode so all its windows share one scale.
     state = p_yam.astype(np.float32).copy()
     action = p_gel.astype(np.float32).copy()
-    state[:, C.GRIPPER_JOINT_INDEX] = normalize_gripper(state[:, C.GRIPPER_JOINT_INDEX])
-    action[:, C.GRIPPER_JOINT_INDEX] = normalize_gripper(action[:, C.GRIPPER_JOINT_INDEX])
+    state[:, C.GRIPPER_JOINT_INDEX] = normalize_gripper(
+        state[:, C.GRIPPER_JOINT_INDEX], open_ref, closed_ref)
+    action[:, C.GRIPPER_JOINT_INDEX] = normalize_gripper(
+        action[:, C.GRIPPER_JOINT_INDEX], open_ref, closed_ref)
     return t_yam, state, t_gel, action
 
 
@@ -611,7 +623,9 @@ def plan_episode(ep: Path, pre_s: float, post_s: float, fps: int, report: Report
                  x_min: float | None = None, y_max: float | None = None,
                  cameras: dict | None = None,
                  arms: tuple[str, ...] | None = None,
-                 window_mode: str = "grasp"):
+                 window_mode: str = "grasp",
+                 open_ref: float | None = None,
+                 closed_ref: float | None = None):
     """Everything needed to write this episode's windows, or None if unusable.
 
     ``arms`` is one or more physical arms; with more than one the per-arm state
@@ -667,7 +681,7 @@ def plan_episode(ep: Path, pre_s: float, post_s: float, fps: int, report: Report
     streams = {}
     try:
         for arm in arms:
-            streams[arm] = read_arm(ep, arm)
+            streams[arm] = read_arm(ep, arm, open_ref, closed_ref)
     except GripperRangeUnknown as e:
         # Used to be silently exported as an all-open (or all-shut) gripper channel.
         report.reject(ep.name, f"gripper channel unusable: {e}")
@@ -781,7 +795,9 @@ def export(root: Path, repo_id: str, out: Path | None, fps: int,
            cameras: dict | None = None,
            arms: tuple[str, ...] | None = None,
            window_mode: str = "grasp",
-           max_idle_divergence: float = IDLE_ARM_DIVERGENCE_MAX_RAD) -> Report:
+           max_idle_divergence: float = IDLE_ARM_DIVERGENCE_MAX_RAD,
+           open_ref: float | None = None,
+           closed_ref: float | None = None) -> Report:
     cameras = resolve_cameras(cameras)
     arms = resolve_arms(arms)
     report = Report()
@@ -793,7 +809,7 @@ def export(root: Path, repo_id: str, out: Path | None, fps: int,
     plans = []
     for ep in eps:
         plan = plan_episode(ep, pre_s, post_s, fps, report, x_min, y_max, cameras,
-                            arms, window_mode)
+                            arms, window_mode, open_ref, closed_ref)
         if plan:
             plans.append(plan)
             report.kept.append(ep.name)
@@ -912,6 +928,14 @@ def main(argv=None) -> int:
                     help="JSON keep-list from tools/review_grasps.py: only the grasps "
                          "it names are exported. An entry that matches no grasp is a "
                          "hard error, not a silent skip.")
+    ap.add_argument("--gripper-open-ref", type=float, default=None,
+                    help="gripper's PHYSICAL open value (this rig: 1.0). Given "
+                         "together with --gripper-closed-ref the channel becomes "
+                         "absolute and comparable across episodes; omitted, each "
+                         "episode is scaled by its own percentiles, which is only "
+                         "valid when it spans the full open->closed range.")
+    ap.add_argument("--gripper-closed-ref", type=float, default=None,
+                    help="gripper's PHYSICAL closed value (this rig: 0.0)")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would be exported, write nothing")
     a = ap.parse_args(argv)
@@ -931,9 +955,19 @@ def main(argv=None) -> int:
     print(f"arms            : {a.arms}  -> {len(joint_names(arms))}-DoF "
           f"state/action, windows={a.window_mode}")
 
+    if (a.gripper_open_ref is None) != (a.gripper_closed_ref is None):
+        ap.error("--gripper-open-ref and --gripper-closed-ref go together: one "
+                 "alone would silently fall back to the percentile scale")
+    if a.gripper_open_ref is not None:
+        print(f"gripper         : absolute, open={a.gripper_open_ref} "
+              f"closed={a.gripper_closed_ref}")
+    else:
+        print("gripper         : per-episode percentile scale (no refs given)")
+
     rep = export(Path(a.root), a.repo_id, Path(a.out) if a.out else None,
                  a.fps, a.pre_s, a.post_s, a.dry_run, a.zone_x_min, a.zone_y_max,
-                 cams, arms, a.window_mode, a.max_idle_divergence)
+                 cams, arms, a.window_mode, a.max_idle_divergence,
+                 a.gripper_open_ref, a.gripper_closed_ref)
 
     print(f"\nepisodes kept   : {len(rep.kept)}")
     print(f"grasp windows   : {rep.windows}")

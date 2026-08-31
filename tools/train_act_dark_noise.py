@@ -66,7 +66,17 @@ from lerobot.configs import parser  # noqa: E402
 from lerobot.configs.train import TrainPipelineConfig  # noqa: E402
 from lerobot.scripts.lerobot_train import train as _train  # noqa: E402
 
-from tools.act_aug import dark_noise_config, register_transforms  # noqa: E402
+from tools.act_aug import AUG_RECIPES, aug_config, register_transforms  # noqa: E402
+from tools import act_bus_geometry  # noqa: E402
+
+# Which recipe to train with. An ENV VAR rather than a CLI flag on purpose:
+# @parser.wrap() hands argv to LeRobot's own config parser, which rejects any
+# argument it does not know, so adding --aug here would break the invocation.
+# Default is dark_noise, so every existing call site behaves exactly as before.
+AUG = os.environ.get("ACT_AUG", "dark_noise")
+if AUG not in AUG_RECIPES:
+    raise SystemExit(f"ACT_AUG={AUG!r} is not a recipe; "
+                     f"choose from {sorted(AUG_RECIPES)}")
 
 
 @parser.wrap()
@@ -74,15 +84,28 @@ def main(cfg: TrainPipelineConfig):
     # Must happen before make_dataset() builds ImageTransforms, which resolves
     # make_transform_from_config by module-global name at call time.
     register_transforms()
-    cfg.dataset.image_transforms = dark_noise_config()
+    cfg.dataset.image_transforms = aug_config(AUG)
+
+    # Train at the geometry the BUS publishes rather than the geometry the mp4s
+    # hold. Default OFF (env unset) so every call site before 2026-08-15 keeps
+    # its behaviour byte for byte. Installed here, after predecoded_patch has
+    # rebound decode_video_frames and before make_dataset runs, because it wraps
+    # the former and patches the latter. Augmentation is applied by
+    # LeRobotDataset.__getitem__ AFTER the decode, so the recipe above operates
+    # on the resized frame -- which is what we want: augment what the policy
+    # sees, not what the disk holds.
+    act_bus_geometry.install()
 
     tfs = cfg.dataset.image_transforms
     print("=" * 66)
-    print("augmentation: dark_noise "
-          f"(max {tfs.max_num_transforms} of {len(tfs.tfs)} per sample, "
-          f"random_order={tfs.random_order})")
-    for name, t in tfs.tfs.items():
-        print(f"  {name:20} w={t.weight:<4} {t.type:<19} {t.kwargs}")
+    if not tfs.enable:
+        print(f"augmentation: {AUG} — DISABLED, images pass through untouched")
+    else:
+        print(f"augmentation: {AUG} "
+              f"(max {tfs.max_num_transforms} of {len(tfs.tfs)} per sample, "
+              f"random_order={tfs.random_order})")
+        for name, t in tfs.tfs.items():
+            print(f"  {name:20} w={t.weight:<4} {t.type:<19} {t.kwargs}")
     print("=" * 66, flush=True)
 
     # __wrapped__ is the undecorated train(); calling `_train` directly would

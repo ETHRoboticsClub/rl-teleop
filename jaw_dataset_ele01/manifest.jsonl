@@ -1,0 +1,7 @@
+{"ep": "tmp_ep_193752", "label": "empty", "kind": "close_on_air", "release_diff": 29.89611053466797}
+{"ep": "tmp_ep_193800", "label": "empty", "kind": "close_on_air", "release_diff": 30.381710052490234}
+{"ep": "tmp_ep_193808", "label": "empty", "kind": "close_on_air", "release_diff": 28.396068572998047}
+{"ep": "tmp_ep_193816", "label": "empty", "kind": "close_on_air", "release_diff": 26.888931274414062}
+{"ep": "tmp_ep_193824", "label": "empty", "kind": "close_on_air", "release_diff": 26.88123893737793}
+{"ep": "tmp_ep_193832", "label": "unknown", "kind": "ambiguous_release", "release_diff": 45.25478744506836, "threshold": 35.808669466522645}
+{"ep": "tmp_ep_193929", "label": "unknown", "kind": "ambiguous_release", "release_diff": 43.30277633666992, "threshold": 35.808669466522645}

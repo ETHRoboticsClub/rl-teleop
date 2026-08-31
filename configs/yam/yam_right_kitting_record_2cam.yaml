@@ -1,0 +1,346 @@
+# DERIVED FROM yam_right_kitting_teleop.yaml, 2026-08-14, for the 200-grasp
+# recording session. THE ONLY DIFFERENCE: camera_top (D455) and camera_scan
+# (D435i) are gone, along with their two viser panels.
+#
+# WHY, and why this is not "hiding a fault": both RealSenses are down right now.
+# The D455 is not on the USB bus at all (lsusb does not list it); the D435i
+# enumerates but every pipe.start() ends in "no color/infrared frame during
+# startup warmup". Reviving them needs the controller rebind from ../CLAUDE.md,
+# which needs a real TTY for sudo.
+#
+# Left in the config they are not merely noise. Session._write_degraded_marker
+# stamps EVERY episode "degraded": true naming them — so the one signal that
+# would say "the wrist camera went unhealthy during this take" fires on all 200
+# episodes and means nothing. Over a session this long that signal is the point:
+# the previous right-wrist camera ran 3.5 h clean, then flapped 57 times and
+# died. With this config, "degraded" fires only for the ELE01 or camera_left.
+#
+# It also restores the record_kitting.sh preflight as a real gate — it refuses
+# to start on a missing camera, and with the dead pair listed it would have
+# needed FORCE_CAMERAS=1, which disables the check for the cameras that matter.
+#
+# PUT THEM BACK the moment the rebind works: this file is a copy, so the
+# original is untouched and is the one to launch from again.
+#
+version: "1"
+# Single-arm (RIGHT) kitting teleop — the SOURCE-BOX half of the bimanual plan.
+#
+# Left arm keeps its job (mat -> kitting box) and every bit of its calibration.
+# This config drives the NEW job: source box -> mat. See AUTOPILOT.md for why the
+# split is that way round — it confines every unvalidated thing to one arm.
+#
+# Modelled line-for-line on yam_left_kitting_teleop.yaml. Where it differs, the
+# difference is commented. THREE OF THOSE DIFFERENCES WILL STOP THIS CONFIG FROM
+# RUNNING TODAY AND ARE MEANT TO — read the four blockers below before launching.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# BLOCKER 1 — can_follow_r IS DOWN.
+#   robot_configs/yam/right.yaml drives channel "can_follow_r". As of 2026-08-08
+#   that interface exists but is DOWN (can_follow_l is UP). The RobotNode will
+#   fail to open the motor chain and the session will not start.
+#   Check, and only check:      ip -br link show can_follow_r
+#   Bringing it up is a physical/electrical act on a powered brakeless arm and is
+#   deliberately NOT scripted here. Do it with the arm supported.
+#
+# BLOCKER 2 — THERE IS NO RIGHT WRIST CAMERA CONFIGURED, AND THIS FILE DOES NOT
+#   PRETEND OTHERWISE. camera_top, camera_scan and camera_left are configured on
+#   this rig; camera_right is not. yam_bimanual_dynamixel_gello_teleop.yaml
+#   carries a candidate device_path (usb-0:1.2) but it is STALE and unverified:
+#   that same file lists camera_left on usb-0:1.4 while the live left kitting
+#   config uses usb-0:1.3, which is the by-path drift its own comment warns
+#   about. The two Innomaker cams share a serial, so the mapping is by USB port
+#   and can change across reboots and replugs.
+#   Consequences, stated rather than discovered:
+#     * The block below is COMMENTED OUT. An enabled node with a wrong path can
+#       claim the LEFT wrist camera and break the running left session.
+#     * `image_topics` below does NOT list a right panel. A configured-but-black
+#       panel reads as "camera present, scene dark", which is the same class of
+#       lie as a keep-out that is unmodelled and reported as clear.
+#     * Episodes recorded with this config have NO right wrist video. ACT for the
+#       left arm is wrist-conditioned; a right-arm policy trained without a wrist
+#       view is not the same experiment. Recording without it is still worth
+#       doing for joint trajectories and for the top/scan views — just do not
+#       later mistake the dataset for a wrist-camera dataset.
+#   To enable it: plug the camera, run
+#       scripts/check_setup.py configs/yam/yam_right_kitting_teleop.yaml
+#   confirm WHICH by-path node actually delivers frames, paste it below,
+#   uncomment the node, and add `right: camera_right/rgb` to image_topics.
+#
+# BLOCKER 3 — THE REALSENSE CAMERAS CANNOT BE OPENED TWICE.
+#   camera_top (D455 203522250539) and camera_scan (D435i 241222077246) are
+#   claimed by whichever session starts first. If a left kitting session is
+#   already up — and on this rig one has been up for days — starting this config
+#   as written will fail on the RealSense claim, or worse, steal the device from
+#   the running left session and take production down.
+#   For the operator's actual recording flow (AUTOPILOT.md: one continuous
+#   episode, one arm at a time) what is wanted is a COMBINED bimanual kitting
+#   config with one set of camera nodes and both arms, not two sessions. That
+#   file is not this file. Use this one only when the left session is stopped.
+#
+# BLOCKER 4 — NOTHING IN yam-pick-pipeline IS CALIBRATED FOR THIS ARM.
+#   results/calibration.json, keepout.json, tray_box.json and the 77 demos are
+#   all in the LEFT arm's base frame. This config is for TELEOP AND RECORDING
+#   ONLY. Do not point run_pick.py, sort_server.py or act_runner.py at this arm.
+#   bimanual/collision.py additionally has no measured base separation: the URDF
+#   says the second base is 0.570 m away in -y and every yam_bimanual_*.yaml
+#   viser extrinsic says 0.610 m. Until somebody measures it, that 40 mm is
+#   being carried as extra collision margin.
+#
+# Before running: verify camera device paths + CAN/leader ports with
+#   uv run python scripts/check_setup.py configs/yam/yam_right_kitting_teleop.yaml
+session:
+  save_root: recordings
+  record_topic: gello_right/record
+  # Number keys tag the saved episode. For the bimanual flow the RIGHT arm's
+  # episode is the fill half: box -> mat.
+  instructions:
+    1: "fill the mat from the source box: reach in, grasp a bag, place it flat on the mat"
+    0: "play data"
+
+nodes:
+  - type: AgentNode
+    name: gello_right
+    # cpu 8, not 6: 6 is the left leader's pin in yam_left_kitting_teleop.yaml and
+    # yam_bimanual_dynamixel_gello_teleop.yaml pins the right one to 8. Keeping
+    # the same assignment means a combined bimanual config is a concatenation of
+    # these two files rather than a re-pinning exercise.
+    pinned_cpu: 8
+    realtime_priority: 70
+    agent_class: robots_realtime.agents.teleoperation.dynamixel_gello_leader_agent:DynamixelGelloLeaderAgent
+    agent_kwargs:
+      # /dev/leader-right -> ttyUSB1, by udev rule 99-yam-ft232h-leaders.rules on
+      # FT232H serial FTA2U44N. Note 99-dynamixel-leaders.rules.disabled maps the
+      # SAME two serials the other way round; if the arms ever mirror each other,
+      # that file has been re-enabled.
+      port: /dev/leader-right
+      robot_name: right
+      # 8..14, not 1..7. Both leaders sit on their own port here, but the ids are
+      # kept distinct so a combined bimanual session needs no renumbering.
+      motor_ids: [8, 9, 10, 11, 12, 13, 14]
+      baudrate: 1000000
+      include_gripper: true
+      # PROVENANCE: copied verbatim from configs/yam/yam_bimanual_dynamixel_gello_teleop.yaml,
+      # which is the only file on this rig carrying a calibrated RIGHT leader.
+      # RE-DERIVED 2026-08-10 on this rig — the provenance note above no longer
+      # applies to joint_offsets_ticks, only to joint_scales/gripper ticks.
+      # Solved with tools/calibrate_gello_leader.py --solve against a zero
+      # reference pose, operator holding the leader; the read passed the tool's
+      # 1 deg stability gate, so it is a stationary pose rather than an average
+      # of a moving one. Previous values, for rollback:
+      #   [-394, -997, 688, 1008, 1005, -18]
+      # Correction applied (deg): [7.91, -0.79, -0.26, 0.53, -0.79, 2.29] — i.e.
+      # the old calibration was already close on five joints; joint 0 carried
+      # essentially all of the error.
+      # Note joint_scales differs from the left arm on joint 3 and joint 4:
+      #   left  [1, 1, -1,  1, 1, 1]
+      #   right [1, 1,  1, -1, 1, 1]
+      # That is a real difference between the two leaders, not a typo.
+      joint_offsets_ticks: [-484, -988, 691, 1014, 1014, -44]
+      joint_scales: [1, 1, 1, -1, 1, 1]
+      joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      gripper_open_ticks: 2280
+      gripper_closed_ticks: 2000
+      gripper_scale: 1.0
+      stale_timeout_s: 1.0
+      max_delta_rad: 3.14
+      gripper_spring: true
+      gripper_spring_current_limit: 100
+    arm_key: right
+    loop_mode: flat_out
+
+  - type: RobotNode
+    name: yam_right
+    pinned_cpu: 4          # 2 is the left follower's pin; 4 matches the bimanual config
+    realtime_priority: 85
+    # channel: can_follow_r  -- see BLOCKER 1. This file will not start until that
+    # interface is UP. That is the correct behaviour: a RobotNode that silently
+    # ran with no motor chain would report joint state that came from nowhere.
+    robot_config: robot_configs/yam/right.yaml
+    cmd_topic: gello_right/joint_pos
+    poll_freq: 200
+    startup_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    startup_duration_s: 2.0
+    shutdown_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    shutdown_duration_s: 2.0
+
+  # Live viser monitor — right arm URDF overlay + camera panels, no commands.
+  - type: ViserMonitorNode
+    name: viz
+    port: 8081             # 8080 is the left session's port; they collide otherwise
+    viz_freq: 20
+    auto_open_browser: true
+    fullscreen: true
+    up_axis: "+z"
+    initial_camera_position: [-0.7, -0.31, 0.3]
+    initial_camera_look_at:  [0.45, -0.31, 0.3]
+    urdfs:
+      yam_right:
+        path: urdf/yam.urdf
+        state_topic: yam_right/joint_state
+        flip_joints: true
+        gripper:
+          type: linear_4310
+          attach_link: link_6
+        extrinsic:
+          # 0.610 m is what every yam_bimanual_*.yaml uses, so the overlay stays
+          # consistent with the rest of the rig's visualisation. It DISAGREES
+          # with urdf/dual_yam.urdf, which says 0.570 m, and with
+          # urdf/dual_yam_generated.urdf, which says +0.500 m. Nobody has
+          # measured it. bimanual/collision.py takes the closest-together
+          # reading and carries the 40 mm spread as extra margin; when the
+          # operator measures the real number, write it to
+          # yam-pick-pipeline/results/dual_arm_bases.json AND fix it here.
+          position: [0.0, -0.61, 0.0]
+          rotation: [1.0, 0.0, 0.0, 0.0]   # wxyz identity
+    image_topics:
+      left: camera_left/rgb
+      # Added 2026-08-10 in the SAME edit that enabled the camera_right node below,
+      # which is the rule the original comment here laid down: never a panel
+      # without a publisher, because black reads as "dark scene", not "no camera".
+      right: camera_right/rgb
+
+  # ── RIGHT WRIST CAMERA: NOT CONFIGURED. See BLOCKER 2. ────────────────────
+  # This block is a TEMPLATE, not a setting. The device_path below is copied from
+  # yam_bimanual_dynamixel_gello_teleop.yaml and is known to be stale — that file
+  # also puts camera_left on usb-0:1.4 while the live left kitting config uses
+  # usb-0:1.3. Confirm which by-path node actually delivers frames FIRST; an
+  # enabled node with a wrong path can claim the left wrist camera out from under
+  # a running left session.
+  #
+  # Note the v4l2 block below follows the LEFT KITTING config, not the bimanual
+  # one: no `fourcc: MJPG`. The left config's comment explains why in detail —
+  # this cheap USB webcam ships truncated MJPEG frames under bandwidth pressure
+  # and libjpeg decodes them as a torn green-top/gray-bottom image. Raw YUYV at
+  # 640x480x2x30 (~18 MB/s) fits USB2 and cannot truncate that way. If fps has to
+  # drop for raw, lower fps rather than re-adding MJPG.
+  #
+  # ENABLED 2026-08-10. BLOCKER 2 is resolved: the path in the template above was
+  # indeed stale — usb-0:1.2 does not exist on this box at all. The two Innomakers
+  # actually present are usb-0:1.1 and usb-0:1.3.
+  #
+  # Evidence, gathered with every session stopped so nothing could be stolen:
+  #   usb-0:1.3 -> gripper jaws over the dark MAT           = camera_left  (matches
+  #                the live left kitting config, which uses usb-0:1.3)
+  #   usb-0:1.1 -> OPEN gripper jaws over the red SOURCE BIN = this camera
+  # Both delivered 640x480 YUYV frames on the first open.
+  #
+  # MOVED 2026-08-11 19:46: usb-0:1.1 -> usb-0:1.2. The operator replugged this
+  # camera into a different port, and since the two Innomakers share a serial the
+  # by-path port IS the identity — so the config had to follow it. Note the irony:
+  # usb-0:1.2 is the exact path the stale template above was rejected for naming.
+  # It was genuinely absent then and is genuinely correct now, which is the whole
+  # argument for verifying by FRAME CONTENT rather than by remembering a number.
+  #
+  # Re-verified the same way, at 19:52, with nothing else holding the device
+  # (the old node was already dead, so this stole nothing):
+  #   usb-0:1.2 -> OPEN gripper jaws over the red SOURCE BIN = this camera
+  # 640x480 on the first open.
+  #
+  # HOW THE OLD PATH FAILED, because the failure was quiet: the node did not
+  # error visibly. `camera_right/rgb` simply stopped publishing — 0 messages in
+  # 6 s on the bus — while the TUI's camera table still read "● live 29.5". The
+  # TUI line was stale text, not a live reading. Trust the bus, not the table:
+  #   .venv/bin/python -c "...subscribe camera_right/rgb, count msgs..."
+  #
+  # WHAT IS VERIFIED: it is a wrist camera, it delivers frames, and it is not the
+  # left one. WHAT IS NOT: that it is bolted to the RIGHT arm rather than held or
+  # mounted elsewhere. The definitive test is motion — move the right arm and watch
+  # this panel track. Do that on the first session before recording anything.
+  #
+  # MOVED BACK 2026-08-12 13:23: usb-0:1.2 -> usb-0:1.1, across a reboot.
+  # Sequence, because the cause matters: this camera flapped 57 times between
+  # 23:19 and 23:46 on 08-11 and then died on usb-0:1.2 —
+  #   usb 9-1-port2: Cannot enable. Maybe the USB cable is bad?
+  #   usb 9-1.2: device not accepting address 52, error -71
+  #   usb 9-1-port2: unable to enumerate USB device
+  # It came back on usb-0:1.1 after the reboot. usb-0:1.2 is now held by a
+  # RealSense (6 video nodes) — so the old path still RESOLVES, and opening it
+  # would have handed camera_right a depth camera rather than failing loudly.
+  # That is why this is verified by frame content every time and never by memory.
+  #
+  # Re-verified 13:37 with no session running (bus ports 5555/5556 unbound, so
+  # this stole nothing):
+  #   usb-0:1.1 -> OPEN gripper jaws over the red SOURCE BIN = this camera
+  #   usb-0:1.3 -> gripper jaws over the dark MAT            = camera_left
+  # Same discriminator as the 08-10 entry above, and it agrees with it.
+  # 640x480 on the first open; 30 s steady-state capture gave 29.4 fps, 0 read
+  # failures, worst inter-frame gap 37 ms.
+  #
+  # STILL OPEN: 29.4 fps for 30 s is not evidence the cable is repaired. On 08-11
+  # this camera ran 3.5 hours clean before it started flapping. Treat a recurrence
+  # as expected rather than surprising, and check session_meta.json degraded flags.
+  - type: CameraNode
+    name: camera_right
+    driver: OpenCVCamera
+    # REPLACED 2026-08-13: NEW camera (ELE01, idVendor 114d) after the Innomaker
+    # cable died. Chipset controller 0000:0d:00.0 rear port — off the saturated
+    # 74:00.0 hub entirely. Same edit as cameras_right_top.yaml (kept in sync).
+    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:1:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+    publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]   # bus copy only; disk keeps 640x480
+    # pad, NOT the center_crop DEFAULT: center_crop keeps only the largest
+    # SQUARE of the frame (720x720 out of 1280x720) and throws the left and
+    # right thirds away — the cockpit then shows a small centre crop instead
+    # of the scene. pad preserves the full field of view, and since these
+    # targets match each camera's aspect ratio exactly there is no letterbox.
+    publish_resize_mode: pad
+    v4l2_controls:
+      # 1 = 50 Hz. THE SENSOR POWERS UP AT 2 (60 Hz); the mains here is 50 Hz, so
+      # the anti-flicker filter beat against the lighting. Measured 2026-08-14 on a
+      # STATIC scene, off the bus: mean frame brightness swung 34.87 grey levels
+      # peak-to-peak with a 34.73 jump BETWEEN CONSECUTIVE FRAMES (std 14.97). The
+      # D455 beside it, same scene, same instant: std 0.01. Setting 50 Hz took the
+      # ELE01 to std 0.02 / p2p 0.10 — steadier than the RealSense.
+      #
+      # IT MUST LIVE HERE, not in a one-off `v4l2-ctl --set-ctrl`.
+      # OpenCVCamera._apply_v4l2_controls() runs on EVERY open, and SupervisedCamera
+      # reopens the camera on failure — so a runtime-only fix is undone by the first
+      # reopen, mid-recording, and the only trace is flashing training data.
+      power_line_frequency: 1
+    # Still no brightness/contrast/saturation: the old block (0 / 28 / 64) was tuned
+    # to the Innomaker's ranges; the ELE01 is 0-255 with 128 = neutral, so brightness
+    # 0 would render near-black. auto_exposure deliberately stays ON (3, aperture
+    # priority) — real exposure variation is robustness that dark_noise augmentation
+    # complements, and tools/exposure_wobble.py cycles it on purpose for the jaw data.
+  #     gain: 0
+  #     power_line_frequency: 1
+  #     sharpness: 3
+  #     auto_exposure: 1
+  #     exposure_time_absolute: 50
+  #   auto_exposure_enabled: true
+  #   auto_exposure_target: 120
+  #   auto_exposure_min: 20
+  #   auto_exposure_max: 130
+
+  # ── LEFT WRIST CAMERA ─────────────────────────────────────────────────────
+  # Added 2026-08-11. This is the LEFT arm's wrist camera, and it is present in a
+  # right-arm config on purpose: the operator wants all four cameras visible on
+  # the cockpit at once, and a CameraNode only opens a USB device — it commands
+  # no arm. The left follower is not in this config and is not energised by it.
+  #
+  # usb-0:1.3 is the LEFT wrist, verified by frame content (jaws over the dark
+  # mat) and by matching the live left kitting config. usb-0:1.1 is the right.
+  # The two Innomakers share a serial, so the by-path port IS the identity —
+  # re-verify after any replug or reboot, never assume.
+  #
+  # No fourcc: MJPG, matching the left kitting config: this webcam ships truncated
+  # MJPEG under bandwidth pressure and libjpeg renders that as a torn green/grey
+  # frame. Raw YUYV at 640x480x2x30 fits USB 2 and cannot truncate that way.
+  - type: CameraNode
+    name: camera_left
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.3:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+    publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]   # bus copy only; disk keeps 640x480
+    # pad, NOT the center_crop DEFAULT: center_crop keeps only the largest
+    # SQUARE of the frame (720x720 out of 1280x720) and throws the left and
+    # right thirds away — the cockpit then shows a small centre crop instead
+    # of the scene. pad preserves the full field of view, and since these
+    # targets match each camera's aspect ratio exactly there is no letterbox.
+    publish_resize_mode: pad
+    v4l2_controls:
+      brightness: 0
+      contrast: 28
+      saturation: 64

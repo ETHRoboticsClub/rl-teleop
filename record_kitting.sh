@@ -92,10 +92,22 @@ fi
 # failed to start within timeout", which reads like a hardware fault. It isn't
 # — it means the previous session is still up. Catch it here, before anything
 # else is spawned, and say so plainly.
-BUS_PIDS="$(ss -tlnpH 2>/dev/null | grep -E ':(5555|5556)\s' \
-            | grep -oP 'pid=\K[0-9]+' | sort -u | tr '\n' ' ')"
-if [ -n "${BUS_PIDS// /}" ]; then
-  cat >&2 <<EOF
+#
+# ATTACH_BUS=1 (2026-08-15, bimanual era): join a STANDING broker instead of
+# owning one. The bimanual rig keeps rr-bus + the right arm session up
+# permanently; a recording session then attaches (`rr-session --attach-bus`)
+# and must NOT treat the busy ports as a stale session. The operator still has
+# to stop any session that owns this config's CAMERAS or the recorded ARM's
+# motors first — attach shares the bus, never a device.
+if [ "${ATTACH_BUS:-0}" = "1" ]; then
+  ATTACH_FLAG="--attach-bus"
+  echo "ATTACH_BUS=1 — joining the standing broker on 5555/5556"
+else
+  ATTACH_FLAG=""
+  BUS_PIDS="$(ss -tlnpH 2>/dev/null | grep -E ':(5555|5556)\s' \
+              | grep -oP 'pid=\K[0-9]+' | sort -u | tr '\n' ' ')"
+  if [ -n "${BUS_PIDS// /}" ]; then
+    cat >&2 <<EOF
 
   ✗ A kitting session is ALREADY RUNNING (message bus ports 5555/5556 in use).
 
@@ -103,9 +115,11 @@ if [ -n "${BUS_PIDS// /}" ]; then
 
     Quit it with [q] in its TUI, or:  kill ${BUS_PIDS}
     Then re-run this script.
+    (Deliberately recording alongside a standing rig? ATTACH_BUS=1.)
 
 EOF
-  exit 1
+    exit 1
+  fi
 fi
 
 # Preflight: every camera in the config must actually be present.
@@ -218,10 +232,15 @@ if [ "$ARM" = right ]; then
   # disables the node. An alias with no publisher 503s, which is honest; an alias
   # pointed at the WRONG camera shows a plausible lie, which is how this cockpit
   # once displayed the top view in three panels at once.
-  BUS_CAMS="default=camera_top/rgb,egocentric=camera_top/rgb,top=camera_top/rgb,scan=camera_scan/rgb,wristL=camera_left/rgb,wristR=camera_right/rgb"
+  # Overridable because the alias map has to be edited in the SAME breath as the
+  # node list, and a config can legitimately carry fewer cameras than this default
+  # assumes — e.g. yam_right_kitting_record_2cam.yaml, which drops both dead
+  # RealSenses. An alias whose publisher does not exist 503s, which is honest but
+  # shows two dead panels; pointing it at ANOTHER camera would be the real sin.
+  BUS_CAMS="${BUS_CAMS:-default=camera_top/rgb,egocentric=camera_top/rgb,top=camera_top/rgb,scan=camera_scan/rgb,wristL=camera_left/rgb,wristR=camera_right/rgb}"
 else
   LABEL_FLAGS=(--detect --detect-period 2.0 --auto-label)
-  BUS_CAMS="default=camera_top/rgb,egocentric=camera_top/rgb,scan=camera_scan/rgb,wristL=camera_left/rgb,wristR=camera_left/rgb"
+  BUS_CAMS="${BUS_CAMS:-default=camera_top/rgb,egocentric=camera_top/rgb,scan=camera_scan/rgb,wristL=camera_left/rgb,wristR=camera_left/rgb}"
 fi
 
 uv run python -u -m robots_realtime.labeling.live_server --live --arm "$ARM" \
@@ -305,4 +324,4 @@ cat <<EOF
 EOF
 
 # 3) teleop session (TUI here; the cockpit is a peer on --control-port)
-RS2_USE_RSUSB_BACKEND=true exec uv run rr-session "$CONFIG" --control-port "$CONTROL_PORT"
+RS2_USE_RSUSB_BACKEND=true exec uv run rr-session "$CONFIG" --control-port "$CONTROL_PORT" $ATTACH_FLAG

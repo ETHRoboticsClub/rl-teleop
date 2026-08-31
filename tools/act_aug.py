@@ -69,10 +69,13 @@ class _SafeGaussianNoise(torch.nn.Module):
 
 
 # type name -> builder. Anything already handled by stock LeRobot is absent here.
+# Stock handles exactly: Identity, ColorJitter, SharpnessJitter, RandomAffine
+# (verified against the installed lerobot, not assumed).
 _EXTRA = {
     "GaussianNoise": lambda **kw: _SafeGaussianNoise(**kw),
     "RandomAutocontrast": lambda **kw: v2.RandomAutocontrast(**kw),
     "GaussianBlur": lambda **kw: v2.GaussianBlur(**kw),
+    "RandomErasing": lambda **kw: v2.RandomErasing(**kw),
 }
 
 _ORIGINAL = None
@@ -123,28 +126,104 @@ def dark_noise_config() -> ImageTransformsConfig:
     )
 
 
+# ── three further recipes, added 2026-08-14 ─────────────────────────────────
+# dark_noise is purely PHOTOMETRIC: every one of its seven transforms changes
+# pixel VALUES and none changes pixel POSITIONS or hides anything. So it cannot
+# teach robustness to the two things that actually keep breaking on this rig — a
+# camera that moved, and a view that got blocked. These add one family each, plus
+# the control that has never been run.
+#
+#   none       no augmentation at all — the missing baseline. Every claim about
+#              augmentation here rests on comparisons that were never made against
+#              an unaugmented run (AUDIT.md S2: the deployed dataset's parameters
+#              survive only in someone's shell history). One run settles it.
+#
+#   geometric  dark_noise + small affine jitter. The highest-value one for THIS
+#              rig: the wrist camera has been re-mounted or replaced three times
+#              in four days (Innomaker on 1.1 -> 1.2 -> 1.4 -> ELE01 on a different
+#              controller) and the D455 was re-plugged tonight. A policy that
+#              tolerates a few degrees and a couple of percent of translation
+#              survives the next remount instead of needing a re-record.
+#
+#              KEPT DELIBERATELY SMALL (2 deg, 2%). Translating a WRIST image
+#              implies an end-effector pose that the unchanged action label does
+#              not correspond to, so this is regularisation that must stay inside
+#              the noise floor of the real mounting tolerance. Large shifts would
+#              teach the policy a wrong visuomotor mapping, not a robust one.
+#
+#   occlusion  dark_noise + RandomErasing. The wrist view is routinely blocked by
+#              the jaws and by bags in the bin; the top view by the arm crossing
+#              it. Erasing patches forces the policy to use the whole frame rather
+#              than one convenient cue, and is the standard defence against a
+#              spurious feature that vanishes at deployment.
+#
+# All three keep dark_noise's terms so a difference is attributable to the ADDED
+# family, not to having removed the photometric one.
+GEOMETRIC_TFS = dict(DARK_NOISE_TFS, **{
+    "affine": (1.0, "RandomAffine", {"degrees": 2.0, "translate": (0.02, 0.02),
+                                     "scale": (0.98, 1.02)}),
+})
+
+OCCLUSION_TFS = dict(DARK_NOISE_TFS, **{
+    "erasing": (1.0, "RandomErasing", {"p": 0.5, "scale": (0.02, 0.15),
+                                       "ratio": (0.3, 3.3), "value": 0}),
+})
+
+AUG_RECIPES = {
+    "dark_noise": (DARK_NOISE_TFS, 3),
+    "geometric":  (GEOMETRIC_TFS, 4),   # +1 slot so affine can fire alongside 3 photometric
+    "occlusion":  (OCCLUSION_TFS, 4),
+    "none":       ({}, 0),
+}
+
+
+def aug_config(name: str = "dark_noise") -> ImageTransformsConfig:
+    """ImageTransformsConfig for a named recipe. Unknown name is a hard error."""
+    if name not in AUG_RECIPES:
+        raise ValueError(f"unknown augmentation {name!r}; "
+                         f"choose from {sorted(AUG_RECIPES)}")
+    tfs, max_n = AUG_RECIPES[name]
+    if not tfs:
+        return ImageTransformsConfig(enable=False, max_num_transforms=0,
+                                     random_order=False, tfs={})
+    return ImageTransformsConfig(
+        enable=True, max_num_transforms=max_n, random_order=True,
+        tfs={n: ImageTransformConfig(weight=w, type=t, kwargs=k)
+             for n, (w, t, k) in tfs.items()},
+    )
+
+
 def _selftest() -> int:
-    """Prove the recipe actually runs on both dtypes before a 50k-step run."""
+    """Prove every recipe runs on both dtypes before committing a long run."""
     register_transforms()
     register_transforms()                      # idempotent
-    tf = _lr.ImageTransforms(dark_noise_config())
     ok = True
-    for dtype, img in (("float32", torch.rand(3, 64, 64)),
-                       ("uint8", (torch.rand(3, 64, 64) * 255).to(torch.uint8))):
-        outs = {tuple(tf(img).shape) for _ in range(40)}
-        same = torch.equal(tf(img), tf(img))
-        print(f"  {dtype:8} shapes={outs}  varies={not same}")
-        if outs != {(3, 64, 64)}:
-            print(f"  FAIL: {dtype} changed shape"); ok = False
-        if tf(img).dtype != img.dtype:
-            print(f"  FAIL: {dtype} dtype not preserved"); ok = False
-    # every declared transform must build
-    for name, (w, t, k) in DARK_NOISE_TFS.items():
-        try:
-            _lr.make_transform_from_config(ImageTransformConfig(weight=w, type=t, kwargs=k))
-        except Exception as e:
-            print(f"  FAIL: {name} ({t}) -> {e}"); ok = False
-    print("  all 7 transforms build" if ok else "  BROKEN")
+    for recipe in sorted(AUG_RECIPES):
+        tf = _lr.ImageTransforms(aug_config(recipe))
+        n_tfs = len(AUG_RECIPES[recipe][0])
+        print(f"  {recipe:11} ({n_tfs} transforms)")
+        for dtype, img in (("float32", torch.rand(3, 64, 64)),
+                           ("uint8", (torch.rand(3, 64, 64) * 255).to(torch.uint8))):
+            outs = {tuple(tf(img).shape) for _ in range(40)}
+            varies = not torch.equal(tf(img), tf(img))
+            print(f"    {dtype:8} shapes={outs}  varies={varies}")
+            if outs != {(3, 64, 64)}:
+                print(f"    FAIL: {dtype} changed shape"); ok = False
+            if tf(img).dtype != img.dtype:
+                print(f"    FAIL: {dtype} dtype not preserved"); ok = False
+            # "none" must be a true no-op, or the control is not a control
+            if recipe == "none" and varies:
+                print("    FAIL: 'none' perturbed the image"); ok = False
+            if recipe != "none" and not varies:
+                print(f"    FAIL: {recipe} did not perturb anything"); ok = False
+        # every declared transform must build
+        for name, (w, t, k) in AUG_RECIPES[recipe][0].items():
+            try:
+                _lr.make_transform_from_config(
+                    ImageTransformConfig(weight=w, type=t, kwargs=k))
+            except Exception as e:
+                print(f"    FAIL: {name} ({t}) -> {e}"); ok = False
+    print("  ALL RECIPES OK" if ok else "  BROKEN")
     return 0 if ok else 1
 
 

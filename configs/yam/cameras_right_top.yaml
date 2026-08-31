@@ -63,9 +63,24 @@ nodes:
     name: camera_top
     driver: RealSenseCamera
     device_id: "203522250539"
+    # Fallback identity, added 2026-08-31. NOTE: the serial above is the
+    # LIBREALSENSE serial and does NOT match the USB string descriptor the
+    # kernel logs — this D455 reads 201523063286 in dmesg/lsusb. So you CANNOT
+    # check the line above against dmesg; only against `rs-enumerate-devices -s`.
+    # This fallback covers a unit swap: it substitutes ONLY when the pinned
+    # serial is absent AND exactly one D455 is present, so a D455 + D435i pair
+    # can never be confused. Anything ambiguous still fails as before.
+    device_model: "D455"
     resolution: [1280, 720]
     fps: 30
     enable_depth: false
+    # camera_top MUST stay 270x480 on the bus: the LEFT policy
+    # handoff_left_wristnative declares observation.images.top [3, 270, 480]
+    # and act_runner.build_observation REFUSES a scale mismatch. Both arms
+    # share this one topic, so this resolution is set by the LEFT arm.
+    # act_pickplace_right_night_20260814 (top 720x1280) can only run here
+    # via ACT_RESIZE_TO_DECLARED=1, which act_runner calls a DIAGNOSTIC.
+    # Native-scale right-arm options: matched_wristnative / graspmatched_wristnative.
     publish_resize: [270, 480]   # [HEIGHT, WIDTH] — NOT [W,H]
     publish_resize_mode: pad
 
@@ -103,17 +118,51 @@ nodes:
   - type: CameraNode
     name: camera_right
     driver: OpenCVCamera
-    # MOVED 2026-08-12 ~20:5x: operator swapped it into hub port 4 (the leader's
-    # old slot). Third hub port for this camera today (1.1 and 1.2 both failed
-    # under motion) — same hub though, so this tests the PORT hypothesis, not
-    # the controller. Verified by frame content: 1.4 sees the red source bin.
-    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.4:1.0-video-index0
+    # REPLACED 2026-08-13: the Innomaker (dying cable, 8/9 reopens under motion)
+    # was swapped for a NEW camera, product "ELE01" (idVendor 114d). It sits on
+    # the CHIPSET controller 0000:0d:00.0 (rear port, off the saturated 74:00.0
+    # hub entirely) — so this replacement changes both the camera AND the
+    # controller. Identity is still by-path; re-verify by frame content (sees
+    # the red source bin) after any physical change.
+    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:2:1.0-video-index0
     resolution: [640, 480]
     fps: 30
-    publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]
-    publish_resize_mode: pad     # NOT the center_crop default — it crops to a square
+    # ── BUS GEOMETRY — MUST MATCH THE CHECKPOINT ────────────────────────────
+    # This setting and the checkpoint in rightarm/run_act_right.py are ONE
+    # decision. Swap them together. If they disagree,
+    # act_runner.build_observation refuses to run — which is the point: a
+    # mismatched policy does not fail, it reaches ~65 mm to the side and closes
+    # on bare bin floor.
+    #
+    # ACTIVE: full 640x480 on the bus, for checkpoint (A) matched_wristnative.
+    # The camera still captures 640x480 either way and the mp4 on disk is
+    # unaffected — publish_resize only ever shrank the BUS copy. Cost of
+    # sending it full size: 6.9 -> 27.6 MB/s through the ZMQ proxy. That is
+    # loopback, not the USB hub, so it does not touch the bandwidth problem
+    # that plagues these cameras — but it is unmeasured, so run
+    # `tools/check_streams.py --watch 120` after restarting `cams` and confirm
+    # the wrist still holds 30 Hz before trusting a run.
+    #
+    # To go back to checkpoint (B) matched_bus, uncomment the two lines below
+    # and restart the `cams` session.
+    # publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]
+    # publish_resize_mode: pad     # NOT the center_crop default — it crops to a square
     v4l2_controls:
-      brightness: 0
-      contrast: 28
-      saturation: 64
+      # 1 = 50 Hz. THE SENSOR POWERS UP AT 2 (60 Hz); the mains here is 50 Hz, so
+      # the anti-flicker filter beat against the lighting. Measured 2026-08-14 on a
+      # STATIC scene, off the bus: mean frame brightness swung 34.87 grey levels
+      # peak-to-peak with a 34.73 jump BETWEEN CONSECUTIVE FRAMES (std 14.97). The
+      # D455 beside it, same scene, same instant: std 0.01. Setting 50 Hz took the
+      # ELE01 to std 0.02 / p2p 0.10 — steadier than the RealSense.
+      #
+      # IT MUST LIVE HERE, not in a one-off `v4l2-ctl --set-ctrl`.
+      # OpenCVCamera._apply_v4l2_controls() runs on EVERY open, and SupervisedCamera
+      # reopens the camera on failure — so a runtime-only fix is undone by the first
+      # reopen, mid-recording, and the only trace is flashing training data.
+      power_line_frequency: 1
+    # Still no brightness/contrast/saturation: the old block (0 / 28 / 64) was tuned
+    # to the Innomaker's ranges; the ELE01 is 0-255 with 128 = neutral, so brightness
+    # 0 would render near-black. auto_exposure deliberately stays ON (3, aperture
+    # priority) — real exposure variation is robustness that dark_noise augmentation
+    # complements, and tools/exposure_wobble.py cycles it on purpose for the jaw data.
 

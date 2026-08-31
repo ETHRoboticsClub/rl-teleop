@@ -133,8 +133,33 @@ nodes:
     name: camera_top
     driver: RealSenseCamera
     device_id: "203522250539"
+    # Fallback identity, added 2026-08-31. NOTE: the serial above is the
+    # LIBREALSENSE serial and does NOT match the USB string descriptor the
+    # kernel logs — this D455 reads 201523063286 in dmesg/lsusb. So you CANNOT
+    # check the line above against dmesg; only against `rs-enumerate-devices -s`.
+    # This fallback covers a unit swap: it substitutes ONLY when the pinned
+    # serial is absent AND exactly one D455 is present, so a D455 + D435i pair
+    # can never be confused. Anything ambiguous still fails as before.
+    device_model: "D455"
     resolution: [1280, 720]
-    fps: 30
+    # 15, NOT 30 — DELIBERATE, set 2026-08-29 at Tommaso's explicit request.
+    #
+    # WHY: this camera is on the TOP CASE USB-C (0000:0d:00.0 usb1-port1), which
+    # never trains SuperSpeed — it links at 480M / USB 2.1. At that link speed
+    # librealsense does not OFFER 1280x720@30 at all; asking for it fails with
+    # "Couldn't resolve requests", an error that never mentions USB. Measured
+    # menu at 480M: 720p@15 / 720p@10 / 640x480@30.
+    #
+    # The rear USB-C is not an alternative: its controller (0000:71:00.0,
+    # ASMedia ASM4242) died for the THIRD time on 2026-08-29 and now fails to
+    # probe with -110; usb3/usb4 are deregistered until a reboot.
+    #
+    # THIS IS A WORKAROUND FOR A LINK FAULT, NOT A SETTING. Normally the rule is
+    # never to lower fps to fit a degraded link, because it buries a hardware
+    # problem inside a number that stays wrong long after the cable is fixed.
+    # PUT THIS BACK TO 30 the moment this camera moves to a rear Type-A
+    # SuperSpeed port (0000:73:00.3 usb6 is empty and fault-free).
+    fps: 15
     enable_depth: false
     extrinsics:
       position: [0.0, 0.0, 0.4]
@@ -143,7 +168,17 @@ nodes:
   - type: CameraNode
     name: camera_left
     driver: OpenCVCamera
-    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.4:1.0-video-index0
+    # REMAPPED 2026-08-29 after the full re-cabling. The old 74:00.0 hub paths
+    # (usb-0:1.4 / usb-0:1.2) no longer exist — nothing is on 0000:74:00.0 now
+    # except the Genesys hub and an FT232H. This is the surviving Innomaker
+    # (the two no longer share a bus, so it has all of usb1 to itself).
+    # Verified by frame content 2026-08-29: jaws over the dark mat.
+    # REMAPPED AGAIN 2026-08-29 19:1x. The two wrist cams swapped port numbers
+    # when both were moved to USB-C: the Innomaker is now usb-0:3 and the ELE01
+    # took usb-0:2. Pointing camera_left at usb-0:2 would open the ELE01 and
+    # apply this Innomaker control block to it — brightness 0 on the ELE01's
+    # 0-255 range renders near-black. Verified by frame content, not by number.
+    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:3:1.0-video-index0
     resolution: [640, 480]
     fps: 30
     fourcc: MJPG
@@ -169,25 +204,26 @@ nodes:
   - type: CameraNode
     name: camera_right
     driver: OpenCVCamera
-    device_path: /dev/v4l/by-path/pci-0000:74:00.0-usb-0:1.2:1.0-video-index0
+    # REMAPPED 2026-08-29 after the full re-cabling. This is the ELE01
+    # (idVendor 114d) that replaced the right-wrist Innomaker on 2026-08-13 when
+    # its cable died — the same camera the ACT grasp policy consumes. It is now
+    # on 0000:73:00.4 usb8-port2, linked at SuperSpeed 5000M, its own bus.
+    # MOVED 2026-08-29 19:11: the ELE01 came back on 0000:0d:00.0 usb1-port2
+    # after its cable was replaced. NOTE it linked at 480M / bcdUSB 2.10 here,
+    # not the 5000M / 3.10 it had on 73:00.4 — SuperSpeed did not train, so it
+    # now shares one 480 Mbit High-Speed bus with the Innomaker. See the fps
+    # note in the run log; do NOT lower resolution to make this fit.
+    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:2:1.0-video-index0
     resolution: [640, 480]
     fps: 30
-    fourcc: MJPG
     v4l2_controls:
-      brightness: 0
-      contrast: 28
-      saturation: 64
-      hue: 0
-      white_balance_automatic: 1
-      gamma: 100
-      gain: 0
+      # 1 = 50 Hz. THE SENSOR POWERS UP AT 2 (60 Hz) and the mains here is 50 Hz,
+      # so the anti-flicker filter beats against the lighting: 34.87 grey levels
+      # peak-to-peak on a static scene. It MUST live here, not in a one-off
+      # `v4l2-ctl --set-ctrl` — _apply_v4l2_controls() runs on every open and
+      # SupervisedCamera reopens on failure, so a runtime fix is undone mid-run.
       power_line_frequency: 1
-      sharpness: 3
-      backlight_compensation: 0
-      auto_exposure: 1
-      exposure_dynamic_framerate: 1
-      exposure_time_absolute: 50
-    auto_exposure_enabled: true
-    auto_exposure_target: 120
-    auto_exposure_min: 20
-    auto_exposure_max: 130
+    # No brightness/contrast/saturation and no fourcc: the old block (0 / 28 / 64
+    # + MJPG) was tuned to the Innomaker. The ELE01 is 0-255 with 128 = neutral,
+    # so brightness 0 renders near-black. Matches the verified block in
+    # yam_right_kitting_teleop.yaml — keep the two in sync.
