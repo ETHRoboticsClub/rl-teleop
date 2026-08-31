@@ -1,3 +1,5 @@
 work/
 mapping.json
 labels.json
+mapping-*.json
+labels-*.json
