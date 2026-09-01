@@ -26,6 +26,8 @@
 # motor ids 8-14) exactly as the calibrated right-arm configs have it. If the
 # bench handles turn out to be swapped relative to the udev labels, swap the
 # port here and in the left config together -- never one alone.
+version: "1"
+
 session:
   save_root: recordings
 
