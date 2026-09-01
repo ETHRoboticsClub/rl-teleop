@@ -18,7 +18,11 @@
 #   ATTACH_BUS=1 CONTROL_PORT=8794 ./.venv/bin/rr-session \
 #       configs/yam/yam_right_teleop_only.yaml --attach-bus --no-tui
 #
-# LEADER PORT: the block below keeps /dev/leader-right (FT232H serial FTA2U44N,
+# LEADER HANDLE SWAPPED 2026-09-01: this opens /dev/leader-left (FT94EW3S,
+# ids 1-7), the handle physically on the OPERATOR'S RIGHT. Port + ids +
+# calibration moved together; see the left config for the full reasoning.
+#
+# ORIGINAL NOTE: the block below keeps /dev/leader-right (FT232H serial FTA2U44N,
 # motor ids 8-14) exactly as the calibrated right-arm configs have it. If the
 # bench handles turn out to be swapped relative to the udev labels, swap the
 # port here and in the left config together -- never one alone.
@@ -40,11 +44,11 @@ nodes:
       # FT232H serial FTA2U44N. Note 99-dynamixel-leaders.rules.disabled maps the
       # SAME two serials the other way round; if the arms ever mirror each other,
       # that file has been re-enabled.
-      port: /dev/leader-right
+      port: /dev/leader-left
       robot_name: right
       # 8..14, not 1..7. Both leaders sit on their own port here, but the ids are
       # kept distinct so a combined bimanual session needs no renumbering.
-      motor_ids: [8, 9, 10, 11, 12, 13, 14]
+      motor_ids: [1, 2, 3, 4, 5, 6, 7]
       baudrate: 1000000
       include_gripper: true
       # PROVENANCE: copied verbatim from configs/yam/yam_bimanual_dynamixel_gello_teleop.yaml,
@@ -63,11 +67,11 @@ nodes:
       #   left  [1, 1, -1,  1, 1, 1]
       #   right [1, 1,  1, -1, 1, 1]
       # That is a real difference between the two leaders, not a typo.
-      joint_offsets_ticks: [-484, -988, 691, 1014, 1014, -44]
-      joint_scales: [1, 1, 1, -1, 1, 1]
+      joint_offsets_ticks: [4, -1934, -502, -976, 2091, -32]
+      joint_scales: [1, 1, -1, 1, 1, 1]
       joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-      gripper_open_ticks: 2280
-      gripper_closed_ticks: 2000
+      gripper_open_ticks: 1730
+      gripper_closed_ticks: 2100
       gripper_scale: 1.0
       stale_timeout_s: 1.0
       max_delta_rad: 3.14

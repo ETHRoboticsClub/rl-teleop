@@ -8,6 +8,23 @@
 # for the deployed handoff_left model) are untouched, so data recorded here
 # stays in the yam_handoff_left_20260815 lineage.
 #
+# LEADER HANDLE SWAPPED 2026-09-01. This config now opens /dev/leader-right
+# (FT232H serial FTA2U44N, Dynamixel ids 8-14) -- the handle that physically
+# sits on the OPERATOR'S LEFT -- and not /dev/leader-left, which despite its
+# name is the handle on his RIGHT.
+#
+# WHY THE WHOLE BLOCK MOVED, not just the port: a handle's identity is its
+# motor ids AND its calibration. ids are burned into its servos (1-7 vs 8-14),
+# and joint_offsets_ticks / joint_scales / gripper ticks were measured on that
+# specific handle. Change the port alone and the agent asks for motors that do
+# not exist on the other handle. Relabelling the udev rule alone fails the same
+# way. Port + ids + calibration travel together or not at all.
+#
+# It is safe to drive the LEFT arm with the block that was calibrated against
+# the right one: robot_configs/yam/left.yaml and right.yaml are identical apart
+# from `channel` and `motor_chain_name`, so the arms share joint conventions.
+# The differing joint_scales (3 and 4) describe the mirrored HANDLES, not the
+# arms -- which is exactly why the calibration must follow the handle.
 version: "1"
 # LEFT-arm HANDOFF-GRASP teleop — records demonstrations for the bimanual
 # handoff: ONE packet on an empty mat at the right arm's drop zone
@@ -39,16 +56,16 @@ nodes:
     realtime_priority: 70
     agent_class: robots_realtime.agents.teleoperation.dynamixel_gello_leader_agent:DynamixelGelloLeaderAgent
     agent_kwargs:
-      port: /dev/leader-left
+      port: /dev/leader-right
       robot_name: left
-      motor_ids: [1, 2, 3, 4, 5, 6, 7]
+      motor_ids: [8, 9, 10, 11, 12, 13, 14]
       baudrate: 1000000
       include_gripper: true
-      joint_offsets_ticks: [4, -1934, -502, -976, 2091, -32]
-      joint_scales: [1, 1, -1, 1, 1, 1]
+      joint_offsets_ticks: [-484, -988, 691, 1014, 1014, -44]
+      joint_scales: [1, 1, 1, -1, 1, 1]
       joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-      gripper_open_ticks: 1730
-      gripper_closed_ticks: 2100
+      gripper_open_ticks: 2280
+      gripper_closed_ticks: 2000
       gripper_scale: 1.0
       stale_timeout_s: 1.0
       max_delta_rad: 3.14
