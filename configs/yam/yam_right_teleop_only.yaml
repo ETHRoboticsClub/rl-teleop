@@ -1,0 +1,94 @@
+# RIGHT ARM, TELEOP ONLY -- no cameras, no recording. Created 2026-09-01.
+#
+# WHY THIS EXISTS. During a LEFT-arm recording shift the operator wants his right
+# hand on the right arm to reposition packets. The right arm's other configs are
+# either policy sessions (it takes ik_cmd, no leader) or recording configs that
+# open camera_top -- which the left recording session already holds, so starting
+# one would fight it for the device.
+#
+# So: the leader and the follower, nothing else.
+#   - NO CameraNode. Nothing here is recorded, so no view is needed, and it
+#     cannot contend for camera_top/camera_left with the recording session.
+#   - NO record_topic. This session cannot record even if something asks it to,
+#     which is the point: only the LEFT session produces dataset episodes.
+#   - Attach to the running broker with ATTACH_BUS=1 and give it its own
+#     control port; 8790 belongs to the left recording session.
+#
+# Launch:
+#   ATTACH_BUS=1 CONTROL_PORT=8794 ./.venv/bin/rr-session \
+#       configs/yam/yam_right_teleop_only.yaml --attach-bus --no-tui
+#
+# LEADER PORT: the block below keeps /dev/leader-right (FT232H serial FTA2U44N,
+# motor ids 8-14) exactly as the calibrated right-arm configs have it. If the
+# bench handles turn out to be swapped relative to the udev labels, swap the
+# port here and in the left config together -- never one alone.
+session:
+  save_root: recordings
+
+nodes:
+  - type: AgentNode
+    name: gello_right
+    # cpu 8, not 6: 6 is the left leader's pin in yam_left_kitting_teleop.yaml and
+    # yam_bimanual_dynamixel_gello_teleop.yaml pins the right one to 8. Keeping
+    # the same assignment means a combined bimanual config is a concatenation of
+    # these two files rather than a re-pinning exercise.
+    pinned_cpu: 8
+    realtime_priority: 70
+    agent_class: robots_realtime.agents.teleoperation.dynamixel_gello_leader_agent:DynamixelGelloLeaderAgent
+    agent_kwargs:
+      # /dev/leader-right -> ttyUSB1, by udev rule 99-yam-ft232h-leaders.rules on
+      # FT232H serial FTA2U44N. Note 99-dynamixel-leaders.rules.disabled maps the
+      # SAME two serials the other way round; if the arms ever mirror each other,
+      # that file has been re-enabled.
+      port: /dev/leader-right
+      robot_name: right
+      # 8..14, not 1..7. Both leaders sit on their own port here, but the ids are
+      # kept distinct so a combined bimanual session needs no renumbering.
+      motor_ids: [8, 9, 10, 11, 12, 13, 14]
+      baudrate: 1000000
+      include_gripper: true
+      # PROVENANCE: copied verbatim from configs/yam/yam_bimanual_dynamixel_gello_teleop.yaml,
+      # which is the only file on this rig carrying a calibrated RIGHT leader.
+      # RE-DERIVED 2026-08-10 on this rig — the provenance note above no longer
+      # applies to joint_offsets_ticks, only to joint_scales/gripper ticks.
+      # Solved with tools/calibrate_gello_leader.py --solve against a zero
+      # reference pose, operator holding the leader; the read passed the tool's
+      # 1 deg stability gate, so it is a stationary pose rather than an average
+      # of a moving one. Previous values, for rollback:
+      #   [-394, -997, 688, 1008, 1005, -18]
+      # Correction applied (deg): [7.91, -0.79, -0.26, 0.53, -0.79, 2.29] — i.e.
+      # the old calibration was already close on five joints; joint 0 carried
+      # essentially all of the error.
+      # Note joint_scales differs from the left arm on joint 3 and joint 4:
+      #   left  [1, 1, -1,  1, 1, 1]
+      #   right [1, 1,  1, -1, 1, 1]
+      # That is a real difference between the two leaders, not a typo.
+      joint_offsets_ticks: [-484, -988, 691, 1014, 1014, -44]
+      joint_scales: [1, 1, 1, -1, 1, 1]
+      joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      gripper_open_ticks: 2280
+      gripper_closed_ticks: 2000
+      gripper_scale: 1.0
+      stale_timeout_s: 1.0
+      max_delta_rad: 3.14
+      gripper_spring: true
+      gripper_spring_current_limit: 100
+    arm_key: right
+    loop_mode: flat_out
+
+  - type: RobotNode
+    name: yam_right
+    pinned_cpu: 4          # 2 is the left follower's pin; 4 matches the bimanual config
+    realtime_priority: 85
+    # channel: can_follow_r  -- see BLOCKER 1. This file will not start until that
+    # interface is UP. That is the correct behaviour: a RobotNode that silently
+    # ran with no motor chain would report joint state that came from nowhere.
+    robot_config: robot_configs/yam/right.yaml
+    cmd_topic: gello_right/joint_pos
+    poll_freq: 200
+    startup_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    startup_duration_s: 2.0
+    shutdown_joint_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    shutdown_duration_s: 2.0
+
+  # Live viser monitor — right arm URDF overlay + camera panels, no commands.
