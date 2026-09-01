@@ -17,7 +17,17 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-CONFIG="${1:-configs/yam/yam_left_kitting_teleop.yaml}"
+# DEFAULT CHANGED 2026-09-01 to the no-scan handoff config. The previous
+# default (yam_left_kitting_teleop.yaml) cannot record on this rig any more:
+#   - it declares camera_scan, the D435i physically removed on 2026-08-31,
+#     so it fails the camera preflight outright;
+#   - its camera_left device_path points at USB controller 74:00.0, which no
+#     longer exists (the topology moved; the wrist is on 0d:00.0-usb-0:3);
+#   - its leader block opens /dev/leader-left, the handle that physically
+#     sits on the operator's RIGHT -- measured on the rig, it drove the LEFT
+#     arm and cost a debugging session.
+# The no-scan config fixes all three. Pass a config explicitly to override.
+CONFIG="${1:-configs/yam/yam_left_handoff_teleop_noscan.yaml}"
 
 # Which arm this config drives. Until 2026-08-10 this script passed `--arm left`
 # to BOTH label backends unconditionally, so handing it the right-arm config
