@@ -45,6 +45,23 @@ GRIPPER_SLIP_DROP = 0.15
 # healthy episode. Pass open_ref/closed_ref and none of this applies.
 GRIPPER_MIN_RANGE_FRAC = 0.05
 
+# --- gripper physical limits (THIS rig, raw joint units) ----------------------
+# ONE SOURCE OF TRUTH for the refs every labelling entry point must pass. They
+# were duplicated: qa_label.py hardcoded 1.0/0.0 and live_server.py's
+# --open-ref/--closed-ref defaulted to 1.0/0.0 independently, so a rig
+# recalibration would have had to be found and changed in two places — and the
+# labeller that missed the change would silently fall back to the percentile
+# guess (DATA-PIPELINE.md 2.3, the bug that wrote one set of labels live and a
+# different set into annotations.json).
+#
+# Anything that labels an episode should pass these explicitly. They are NOT
+# defaulted inside normalize_width: a rig with a different calibration must fail
+# loudly at the call site, not inherit this rig's numbers.
+# tools/tests/test_grasp_mode.py pins live_server.py's argparse defaults to
+# these values, so the two cannot drift apart again.
+GRIPPER_OPEN_REF = 1.0
+GRIPPER_CLOSED_REF = 0.0
+
 # --- operator flags -----------------------------------------------------------
 # The tag written into operator_flags.json when the operator rejects a take
 # live. It is "bad": tui.py:259 maps the KEY "x" to the TAG "bad",
@@ -94,6 +111,25 @@ MIN_LIFT_M = 0.03
 # 0.0 disables the gate (library default, back-compat); the real kitting pipeline
 # passes ~0.10 (box1→box2 is always >=~0.15m apart).
 MIN_TRANSPORT_M = 0.10
+
+# --- labelling task ----------------------------------------------------------
+# Which TASK an episode demonstrates. It changes what counts as a completed
+# demonstration, and nothing else:
+#
+#   "kitting" — approach, grasp, TRANSPORT, place. A grasp only counts once the
+#               EE has carried the bag MIN_TRANSPORT_M and released it. This is
+#               the historical (and default) behaviour.
+#   "grasp"   — approach, grasp, LIFT. There is no transport and no placement,
+#               so the transport gate is not merely unnecessary here, it deletes
+#               the data: on 2026-09-02 episode_143533's four real grasps were
+#               reduced to eight flags and zero grasp_attempts by it.
+#
+# The mode is always explicit — there is no auto-detection. A misdetected task
+# silently changes what the corpus contains, which is exactly the failure this
+# vocabulary exists to make impossible.
+TASK_KITTING = "kitting"
+TASK_GRASP = "grasp"
+LABEL_TASKS = (TASK_KITTING, TASK_GRASP)
 
 # --- placement ---------------------------------------------------------------
 # A release counts as "in" a compartment if the end-effector's XY at release is
