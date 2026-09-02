@@ -1,3 +1,6 @@
+# WARNING 2026-09-02: comments in this file about leader ports/ids contradicted the
+# declared values and caused a 2 h wrong-handle incident. The DECLARED yaml values are
+# authoritative; treat any prose about ports/sides/ids below as UNVERIFIED.
 # RIGHT ARM, TELEOP ONLY -- no cameras, no recording. Created 2026-09-01.
 #
 # WHY THIS EXISTS. During a LEFT-arm recording shift the operator wants his right
