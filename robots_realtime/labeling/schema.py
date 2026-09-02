@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 # Bump the MINOR on additive fields, MAJOR when a re-label of old episodes is
 # required. Stamped into every annotations.json so consumers can gate on it.
-LABELER_VERSION = "0.1.0"
+LABELER_VERSION = "0.2.0"   # 0.2.0: additive GraspAttempt hold fields, "no_lift"
 
 # Phase segmentation vocabulary. The two "align" phases from the plan are
 # disambiguated into align_grasp / align_place (eng-review finding).
@@ -30,7 +32,16 @@ PHASES = (
     "transport", "align_place", "place", "retract",
 )
 # Per-grasp-attempt outcomes. "empty" = closed on nothing.
-GRASP_OUTCOMES = ("success", "slip", "drop", "empty")
+#
+# "no_lift" is emitted by the GRASP task only (constants.TASK_GRASP): the jaws
+# closed on something wide enough not to read as empty, but the end-effector
+# never rose MIN_LIFT_M within LIFT_WINDOW_S, so nothing was picked up. The
+# kitting task expresses the same fact through the placement chain (no lift =>
+# no terminal grasp => no place event), which a grasp-only demo does not have.
+# It is deliberately NOT "success": every consumer filters on outcome ==
+# "success", so a new non-success value is excluded by every existing filter
+# without any of them being changed.
+GRASP_OUTCOMES = ("success", "slip", "drop", "empty", "no_lift")
 # Whole-episode outcomes.
 EPISODE_OUTCOMES = ("success", "partial", "aborted", "unknown")
 
@@ -104,6 +115,16 @@ class GraspAttempt:
     close_width_norm: float | None = None   # normalized [0,1], 0=closed
     outcome: str = "success"                 # one of GRASP_OUTCOMES
     regrasp_of: int | None = None            # attempt # this re-grasps, if any
+    # --- hold, added 0.2.0 -------------------------------------------------
+    # HOW LONG THE JAWS STAYED SHUT is a first-class quality signal for a
+    # grasp-only policy: together with the FK lift it is what separates a real
+    # pick from a brush-and-release. Transport distance cannot play that role
+    # here because a grasp demo never transports anything.
+    # None on annotations written before 0.2.0 — consumers must treat missing
+    # as unknown, never as zero.
+    t_open: float | None = None              # release time; None = still shut at episode end
+    hold_s: float | None = None              # t_open - t (episode end if never released)
+    lifted: bool | None = None               # FK lift within LIFT_WINDOW_S; None = not evaluable
 
 
 @dataclass
@@ -170,7 +191,33 @@ class Annotations:
         )
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.to_dict(), indent=2) + "\n")
+        """Write annotations.json ATOMICALLY (temp file in the same dir + rename).
+
+        The previous implementation was ``write_text``, which truncates the file
+        first and then writes. A reader that opens it in that gap — the cockpit,
+        review_corpus.py, the exporter, or a second labelling run — gets an empty
+        or half-written file and reports the episode as having no grasps, which
+        is indistinguishable from a genuinely empty label set. os.replace is
+        atomic on POSIX within one filesystem, so a reader sees either the whole
+        old file or the whole new one, never a torn one. The temp file is created
+        in the SAME directory for exactly that reason (a cross-device rename is
+        not atomic and would fall back to a copy).
+
+        A crash mid-write now leaves the previous annotations.json intact plus a
+        stray .annotations.json.* temp file, instead of a truncated one.
+        """
+        path = Path(path)
+        payload = json.dumps(self.to_dict(), indent=2) + "\n"
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
 
 def merge_corrections(ann: Annotations, corrections: dict) -> Annotations:
