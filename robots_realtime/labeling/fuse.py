@@ -8,11 +8,19 @@ Cockpit events (optional) supply intent — which bag, part, and target compartm
 and are matched to the placing grasp by time. Without them, bags are numbered
 sequentially and compartments come from the kitting list if present.
 
+TWO TASKS, TWO PATHS. ``build_annotations(task=...)`` dispatches on
+constants.LABEL_TASKS: "kitting" is everything described above; "grasp" is
+``_build_grasp_annotations`` at the bottom of this file — approach, close, lift,
+no transport and no placement. They do not share a code path, so a grasp-mode
+run cannot perturb the kitting labels every existing dataset was built from.
+
 Guards (all produce a loud Flag, never a silent drop):
   * clock_out_of_window — a cockpit event outside the episode window (clock desync)
   * overlapping_grasp   — two intervals overlap in time (invariant violation)
   * ocr_null            — a kit item whose part could not be read
-  * unplaced_grasp      — a grasp that never resolved to a place
+  * unplaced_grasp      — a grasp that never resolved to a place   (kitting)
+  * no_transport        — a grasp that re-opened where it closed   (kitting)
+  * no_lift             — a close the end-effector never lifted    (grasp)
 """
 from __future__ import annotations
 
@@ -45,6 +53,12 @@ class GraspCandidate:
     lifted: bool | None
     grasp_pose: list | None = None    # EE pose at t_close
     release_pose: list | None = None  # EE pose at t_open
+    hold_norm: float | None = None    # median normalized width while shut (0=closed)
+
+    def hold_s(self, t_end: float) -> float:
+        """How long the jaws stayed shut. A grasp still shut at the episode end
+        is measured to the end — the hold is at least that long, never zero."""
+        return float((self.t_open if self.t_open is not None else t_end) - self.t_close)
 
 
 def _in_window(t: float, t_start: float, t_end: float) -> bool:
@@ -82,7 +96,23 @@ def build_annotations(
     outcome: str = "unknown",
     min_transport_m: float = 0.0,
     geometric_targets: bool = False,
+    task: str = C.TASK_KITTING,
 ) -> Annotations:
+    """Grasp candidates → Annotations, per ``task`` (constants.LABEL_TASKS).
+
+    ``task="grasp"`` takes a SEPARATE code path (``_build_grasp_annotations``)
+    rather than a flag threaded through this one. That is deliberate: the
+    kitting path below is the one every existing dataset was built with, and the
+    cheapest way to guarantee a grasp-mode flag cannot perturb it is for grasp
+    mode never to enter it. Pinned by tools/tests/test_grasp_mode.py.
+    """
+    if task not in C.LABEL_TASKS:
+        raise ValueError(f"task must be one of {C.LABEL_TASKS}, got {task!r}")
+    if task == C.TASK_GRASP:
+        return _build_grasp_annotations(
+            episode_id, arm, t_start, t_end, candidates,
+            clock_offset_s=clock_offset_s, outcome=outcome)
+
     flags: list[Flag] = []
     kit = list(kitting_list or [])
 
@@ -134,6 +164,10 @@ def build_annotations(
                 bag_id=bag_id, attempt=i, arm=arm, t=c.t_close,
                 ee_pose=c.grasp_pose, outcome=c.outcome,
                 regrasp_of=(i - 1) if i > 1 else None,   # 2nd+ attempt re-grasps prior
+                # Additive metadata (schema 0.2.0). Recorded for the kitting task
+                # too so hold duration is available corpus-wide; it gates
+                # nothing here — every kitting classification above is unchanged.
+                t_open=c.t_open, hold_s=c.hold_s(t_end), lifted=c.lifted,
             ))
         # Retargeting: the operator let it slip and re-grasped. Flag loudly so these
         # demos can be filtered out of (or studied separately from) the clean set.
@@ -199,6 +233,91 @@ def build_annotations(
                        t_start=t_start, t_end=t_end, clock_offset_s=clock_offset_s)
     return Annotations(episode_meta=meta, segments=segments, grasp_attempts=grasp_attempts,
                        place_events=place_events, flags=flags)
+
+
+def _build_grasp_annotations(
+    episode_id: str,
+    arm: str,
+    t_start: float,
+    t_end: float,
+    candidates: list[GraspCandidate],
+    clock_offset_s: float = 0.0,
+    outcome: str = "unknown",
+) -> Annotations:
+    """The GRASP task: approach → close → lift. No transport, no placement.
+
+    WHY THIS EXISTS. The kitting path above only ever emits a GraspAttempt from
+    ``close_bag``, i.e. once a grasp has been carried MIN_TRANSPORT_M and
+    released. A demo that grasps and lifts but never carries therefore produced
+    ZERO grasp_attempts and a pile of no_transport/unplaced_grasp flags —
+    measured 2026-09-02 on episode_143533_ee94747f: four real grasps, eight
+    flags, nothing exportable. For an approach+grasp+lift policy the transport
+    gate is not a filter, it is a delete.
+
+    What counts as a real grasp here is HOLD + LIFT, the two things a grasp-only
+    demo actually shows:
+
+      * hold  — how long the jaws stayed shut (already debounced by
+                MIN_HOLD_S in segmentation.detect_grip_intervals) and how wide
+                they were while shut (GRIPPER_EMPTY_CLOSE ⇒ "empty").
+      * lift  — the FK end-effector rose MIN_LIFT_M within LIFT_WINDOW_S.
+                A close with no lift is an adjustment, not a pick, so it is
+                recorded with outcome "no_lift" — never dropped, and never
+                promoted to "success" where the exporter would train on it.
+
+    Every candidate becomes exactly one attempt, in time order, with its own
+    ``bag_id`` (a grasp task has no bags; the id is just the grasp's ordinal so
+    corrections.json can key on it the same way). No place_events: there is no
+    placement to record and inventing one would put a release pose into a field
+    the kitting consumers read as "where the bag was put".
+    """
+    flags: list[Flag] = []
+    cand = sorted(candidates, key=lambda c: c.t_close)
+
+    # Same single-close-in-flight invariant as kitting: overlapping intervals
+    # mean the segmenter disagreed with itself, whatever the task.
+    for a, b in zip(cand, cand[1:]):
+        if a.t_open is not None and b.t_close < a.t_open:
+            flags.append(Flag("overlapping_grasp",
+                              f"grasp @ {b.t_close:.3f} starts before prior released @ {a.t_open:.3f}",
+                              t=b.t_close))
+
+    grasp_attempts: list[GraspAttempt] = []
+    segments: list[Segment] = []
+    for i, c in enumerate(cand, start=1):
+        hold_s = c.hold_s(t_end)
+        oc = c.outcome
+        if oc == "success" and c.lifted is False:
+            oc = "no_lift"
+            flags.append(Flag(
+                "no_lift",
+                f"grasp @ {c.t_close:.3f} held {hold_s:.2f}s but the end-effector never "
+                f"rose {C.MIN_LIFT_M * 100:.0f} mm within {C.LIFT_WINDOW_S}s — "
+                "an adjustment, not a pick",
+                t=c.t_close, bag_id=i))
+        grasp_attempts.append(GraspAttempt(
+            bag_id=i, attempt=1, arm=arm, t=c.t_close,
+            ee_pose=c.grasp_pose, close_width_norm=c.hold_norm, outcome=oc,
+            t_open=c.t_open, hold_s=hold_s, lifted=c.lifted,
+        ))
+        segments.append(Segment(i, arm, "grasp", c.t_close, c.t_close))
+        # The lift is the only phase with duration in a grasp demo. Clipped to
+        # the episode so a grasp near the end does not claim time that was never
+        # recorded.
+        segments.append(Segment(i, arm, "lift", c.t_close,
+                                min(t_end, c.t_close + C.LIFT_WINDOW_S)))
+
+    # An episode whose every close was empty / no-lift demonstrated no grasp,
+    # whatever the gripper did. Say so: the exporter's `outcome == "aborted"`
+    # veto is the cheapest way to keep it out of the corpus, and the flags above
+    # say why it was aborted.
+    if not any(g.outcome == "success" for g in grasp_attempts):
+        outcome = "aborted"
+
+    meta = EpisodeMeta(episode_id=episode_id, arm=arm, kitting_list=[], outcome=outcome,
+                       t_start=t_start, t_end=t_end, clock_offset_s=clock_offset_s)
+    return Annotations(episode_meta=meta, segments=segments,
+                       grasp_attempts=grasp_attempts, place_events=[], flags=flags)
 
 
 def _match_place_event(terminal: GraspCandidate, place_events_c: list[dict]) -> dict | None:

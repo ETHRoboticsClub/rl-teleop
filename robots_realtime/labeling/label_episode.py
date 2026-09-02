@@ -66,7 +66,21 @@ def label_from_arrays(
     clock_offset_s: float = 0.0,
     min_transport_m: float = 0.0,
     geometric_targets: bool = False,
+    task: str = C.TASK_KITTING,
 ) -> Annotations:
+    """Joint timeline → Annotations.
+
+    ``task`` is the demonstrated task (constants.LABEL_TASKS), and it is the one
+    thing here that changes what survives labelling:
+
+      "kitting" (default) — unchanged behaviour, transport gate applies.
+      "grasp"            — approach+grasp+lift demos; ``min_transport_m`` is
+                           IGNORED (a grasp demo transports nothing, so the gate
+                           would delete every grasp) and the outcome comes from
+                           hold + FK lift.
+    """
+    if task not in C.LABEL_TASKS:
+        raise ValueError(f"task must be one of {C.LABEL_TASKS}, got {task!r}")
     times = np.asarray(times, float)
     positions = np.asarray(positions, float)
     arm_joints = positions[:, : C.N_ARM_JOINTS]
@@ -95,7 +109,8 @@ def label_from_arrays(
         release_pose = (fk.ee_pose(_joints_at(times, arm_joints, iv.t_open))
                         if iv.t_open is not None else None)
         candidates.append(GraspCandidate(
-            iv.t_close, iv.t_open, iv.outcome, iv.lifted, grasp_pose, release_pose))
+            iv.t_close, iv.t_open, iv.outcome, iv.lifted, grasp_pose, release_pose,
+            hold_norm=iv.hold_norm))
 
     t_start = float(times[0]) if times.size else 0.0
     t_end = float(times[-1]) if times.size else 0.0
@@ -106,6 +121,7 @@ def label_from_arrays(
         kitting_list=kitting_list, cockpit_events=cockpit_events,
         compartments=compartments, clock_offset_s=clock_offset_s, outcome=outcome,
         min_transport_m=min_transport_m, geometric_targets=geometric_targets,
+        task=task,
     )
 
     # The guard that could not fire (AUDIT.md S1.4). It used to read
@@ -161,6 +177,7 @@ def label_episode_dir(episode_dir: str | Path, arm: str = "left",
                       gripper_closed_ref: float | None = None,
                       min_transport_m: float = 0.0,
                       geometric_targets: bool = False,
+                      task: str = C.TASK_KITTING,
                       write: bool = True) -> Annotations:
     episode_dir = Path(episode_dir)
     fk = ForwardKinematics(urdf_path)
@@ -190,7 +207,7 @@ def label_episode_dir(episode_dir: str | Path, arm: str = "left",
         cockpit_events=read_jsonl(episode_dir / "cockpit_events.jsonl") or None,
         compartments=comps, kitting_list=_load_kit(episode_dir),
         commanded_positions=commanded, min_transport_m=min_transport_m,
-        geometric_targets=geometric_targets,
+        geometric_targets=geometric_targets, task=task,
     )
     if write:
         ann.save(annotations_path(episode_dir, arm))
@@ -207,6 +224,12 @@ def main(argv=None):
     ap.add_argument("--min-transport", type=float, default=0.0,
                     help="min EE XY travel (m) grasp→release to count as a placement "
                          "(kitting: ~0.10; 0 disables — drops 'released-at-pick' false placements)")
+    ap.add_argument("--task", choices=list(C.LABEL_TASKS), default=C.TASK_KITTING,
+                    help="what the episode demonstrates. 'kitting' (default, unchanged) "
+                         "= approach/grasp/transport/place, --min-transport applies. "
+                         "'grasp' = approach/grasp/lift only: the transport gate is "
+                         "IGNORED (it deletes grasp-only demos) and each grasp is kept "
+                         "with its hold duration and FK-lift verdict.")
     ap.add_argument("--geometric-targets", action="store_true",
                     help="reassign each place target to the nearest distinct compartment by "
                          "geometry (use when the operator picks out of kit order)")
@@ -215,13 +238,21 @@ def main(argv=None):
         ann = label_episode_dir(args.episode_dir, arm=args.arm,
                                 gripper_open_ref=args.open_ref, gripper_closed_ref=args.closed_ref,
                                 min_transport_m=args.min_transport,
-                                geometric_targets=args.geometric_targets)
+                                geometric_targets=args.geometric_targets,
+                                task=args.task)
     except (FileNotFoundError, RuntimeError) as e:
         print(f"⏭  skipped {Path(args.episode_dir).name}: {e}")  # clean skip, not a traceback
         return 0
     print(f"wrote {annotations_path(args.episode_dir, args.arm)}")
     print(f"  bags placed: {len(ann.place_events)}  grasp attempts: {len(ann.grasp_attempts)}"
           f"  flags: {len(ann.flags)}")
+    if args.task == C.TASK_GRASP:
+        holds = sorted(g.hold_s for g in ann.grasp_attempts
+                       if g.outcome == "success" and g.hold_s is not None)
+        n_ok = len(holds)
+        print(f"  task=grasp: {n_ok} success / {len(ann.grasp_attempts)} attempts"
+              + (f"   hold s: min {holds[0]:.2f}  median {holds[n_ok // 2]:.2f}  "
+                 f"max {holds[-1]:.2f}" if n_ok else ""))
     for f in ann.flags:
         print(f"  ⚠ {f.kind}: {f.detail}")
     return 0
