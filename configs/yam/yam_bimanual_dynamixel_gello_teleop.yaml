@@ -1,3 +1,11 @@
+# STALE — DO NOT LAUNCH ON THE KITTING RIG (audit 2026-09-05). Four things are
+# wrong for the rig as wired today: the leader→arm mapping is CROSSED relative to
+# docs/reference/RIG-ADDRESS-MAP.md (left arm must read /dev/leader-right ids
+# 8-14, right arm /dev/leader-left ids 1-7), the ids 8-14 calibration is older
+# than the one in yam_left_handoff_teleop_noscan.yaml, camera_left forces MJPG
+# (torn frames), and both followers sweep to all-zeros at startup. The live
+# bimanual teleop config is yam_bimanual_teleop_noscan.yaml, launched by
+# `rig.sh teleop both`. Kept for its history only.
 version: "1"
 session:
   save_root: recordings
