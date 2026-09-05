@@ -52,18 +52,29 @@ def usb_speed(device_path: str) -> str | None:
     return None
 
 
-def realsense_serials() -> tuple[list[str], str | None]:
-    """Enumerate connected RealSense serials without opening any of them."""
+def realsense_serials() -> tuple[dict[str, str], str | None]:
+    """Enumerate connected RealSense serials without opening any of them.
+
+    Returns {serial: usb_type} — usb_type is the descriptor string librealsense
+    reports ("2.1" = linked at USB 2, "3.2" = SuperSpeed trained). A descriptor
+    read only; it does not claim the sensor, so it is safe with a session live.
+    """
     try:
         import pyrealsense2 as rs
     except ImportError:
-        return [], "pyrealsense2 is not installed in this venv"
+        return {}, "pyrealsense2 is not installed in this venv"
     try:
-        return [
-            d.get_info(rs.camera_info.serial_number) for d in rs.context().query_devices()
-        ], None
+        out = {}
+        for d in rs.context().query_devices():
+            serial = d.get_info(rs.camera_info.serial_number)
+            try:
+                usb = d.get_info(rs.camera_info.usb_type_descriptor)
+            except Exception:                                      # noqa: BLE001
+                usb = "?"
+            out[serial] = usb
+        return out, None
     except Exception as exc:                                       # noqa: BLE001
-        return [], f"{type(exc).__name__}: {exc}"
+        return {}, f"{type(exc).__name__}: {exc}"
 
 
 def main(argv=None) -> int:
@@ -129,14 +140,32 @@ def main(argv=None) -> int:
             elif str(dev_id) not in serials:
                 problems.append(
                     f"{name}: RealSense serial {dev_id} is NOT connected.\n"
-                    f"      Connected serials: {serials or 'NONE'}\n"
+                    f"      Connected serials: {list(serials) or 'NONE'}\n"
                     f"      If lsusb and rs-enumerate-devices both show nothing and a replug "
                     f"produces no dmesg event at all, the USB CONTROLLER is dead, not the "
                     f"camera — see CLAUDE.md for the one command that fixes it (needs a real "
                     f"terminal for sudo)."
                 )
             else:
-                lines.append(f"  ok  {name:14s} RealSense {dev_id}")
+                usb = serials[str(dev_id)]
+                lines.append(f"  ok  {name:14s} RealSense {dev_id}  usb {usb}")
+                # Same rule as the by-path branch. A D455 that negotiated USB 2
+                # (usb_type "2.x") offers 720p at 15 fps at most: 720p30 dies at
+                # startup with 'Couldn't resolve requests'. Seen 2026-08-12 (top
+                # USB-C never trains SuperSpeed) and 2026-09-05 (D455 plugged
+                # into the USB-2 hub with the CAN adapters). This is a CABLE or
+                # PORT fault — never lower fps to make it pass.
+                res = cam.get("resolution") or []
+                fps = cam.get("fps") or 0
+                if usb.startswith("2") and len(res) == 2 and int(res[0]) >= 1280 and int(fps) > 15:
+                    problems.append(
+                        f"{name}: RealSense {dev_id} negotiated USB {usb} but the config asks "
+                        f"for {res[0]}x{res[1]}@{fps}. That profile does not exist on a USB 2 "
+                        f"link; the node will die at startup with 'Couldn't resolve requests'. "
+                        f"Move the camera to a SuperSpeed port (last known good: "
+                        f"pci-0000:73:00.4 port 2, usb 8-2 — RIG-ADDRESS-MAP.md) or replace "
+                        f"the cable. Do NOT lower fps (runbook/camera-usb2-link.md)."
+                    )
         else:
             lines.append(f"  --  {name:14s} no device_path or device_id (synthetic?)")
 
