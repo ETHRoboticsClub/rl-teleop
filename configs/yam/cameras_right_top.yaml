@@ -124,7 +124,13 @@ nodes:
     # hub entirely) — so this replacement changes both the camera AND the
     # controller. Identity is still by-path; re-verify by frame content (sees
     # the red source bin) after any physical change.
-    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:2:1.0-video-index0
+    # REPLACED AGAIN 2026-09-07: the ELE01 was swapped for an Innomaker U20CAM-1080p
+    # (0c45:6366 -- the same silicon as the LEFT wrist) on port usb-0:3 of the same
+    # chipset controller 0000:0d:00.0. Port + controls below MIRROR the live teleop
+    # config (yam_bimanual_teleop_noscan.yaml) and docs/reference/RIG-ADDRESS-MAP.md.
+    # Every right-arm checkpoint up to night05 was trained on ELE01 frames: expect a
+    # domain shift on the wrist view. Re-verify by frame content (sees the red bin).
+    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:3:1.0-video-index0
     resolution: [640, 480]
     fps: 30
     # ── BUS GEOMETRY — MUST MATCH THE CHECKPOINT ────────────────────────────
@@ -148,21 +154,24 @@ nodes:
     # publish_resize: [240, 320]   # [HEIGHT, WIDTH] — NOT [W,H]
     # publish_resize_mode: pad     # NOT the center_crop default — it crops to a square
     v4l2_controls:
-      # 1 = 50 Hz. THE SENSOR POWERS UP AT 2 (60 Hz); the mains here is 50 Hz, so
-      # the anti-flicker filter beat against the lighting. Measured 2026-08-14 on a
-      # STATIC scene, off the bus: mean frame brightness swung 34.87 grey levels
-      # peak-to-peak with a 34.73 jump BETWEEN CONSECUTIVE FRAMES (std 14.97). The
-      # D455 beside it, same scene, same instant: std 0.01. Setting 50 Hz took the
-      # ELE01 to std 0.02 / p2p 0.10 — steadier than the RealSense.
-      #
-      # IT MUST LIVE HERE, not in a one-off `v4l2-ctl --set-ctrl`.
-      # OpenCVCamera._apply_v4l2_controls() runs on EVERY open, and SupervisedCamera
-      # reopens the camera on failure — so a runtime-only fix is undone by the first
-      # reopen, mid-recording, and the only trace is flashing training data.
+      # Innomaker block, byte-identical to yam_bimanual_teleop_noscan.yaml camera_right
+      # (2026-09-07). These ranges are the Innomaker's (brightness 0 is neutral here);
+      # they would render the ELE01 near-black -- do not reuse this block for one.
+      brightness: 0
+      contrast: 28
+      saturation: 64
+      white_balance_automatic: 1
+      gamma: 100
+      gain: 0
+      # 1 = 50 Hz mains. The sensor powers up at 60 Hz and beats against the lighting
+      # (measured 2026-08-14: 34.87 grey levels p2p on a static scene). It MUST live
+      # here: OpenCVCamera._apply_v4l2_controls() runs on every (re)open.
       power_line_frequency: 1
-    # Still no brightness/contrast/saturation: the old block (0 / 28 / 64) was tuned
-    # to the Innomaker's ranges; the ELE01 is 0-255 with 128 = neutral, so brightness
-    # 0 would render near-black. auto_exposure deliberately stays ON (3, aperture
-    # priority) — real exposure variation is robustness that dark_noise augmentation
-    # complements, and tools/exposure_wobble.py cycles it on purpose for the jaw data.
+      sharpness: 3
+      auto_exposure: 1
+      exposure_time_absolute: 50
+    auto_exposure_enabled: true
+    auto_exposure_target: 120
+    auto_exposure_min: 20
+    auto_exposure_max: 130
 

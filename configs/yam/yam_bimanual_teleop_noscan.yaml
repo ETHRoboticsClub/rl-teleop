@@ -1,0 +1,238 @@
+# BIMANUAL TELEOP, no-scan rig — both gello leaders, both followers, all three
+# cameras (top-down D455 + both wrists), one session. Created 2026-09-05.
+#
+# Launch ONLY through the launcher (it carries the gates):
+#     cd ~/Desktop/kitting-v2/yam-pick-pipeline && ./rig/rig.sh teleop both
+# Direct form, for reference (what the launcher runs, cwd MUST be rl-teleop):
+#     ./.venv/bin/rr-session configs/yam/yam_bimanual_teleop_noscan.yaml --attach-bus --no-tui
+#
+# WHY THIS FILE EXISTS. Two-arm teleop with every camera visible cannot be
+# built from the per-arm recording sessions: both open the same D455 (a
+# RealSense cannot be opened twice) and both bind control port :8792. And the
+# older configs/yam/yam_bimanual_dynamixel_gello_teleop.yaml is STALE on four
+# counts (2026-09-05 audit): its leader→arm mapping is crossed relative to the
+# 2026-09-02 rig address map, its left wrist forces MJPG (torn frames), its
+# D455 is pinned to 15 fps for a USB-2 port it no longer sits on, and it sweeps
+# both brakeless arms to all-zeros at startup.
+#
+# ASSEMBLY RULE — nothing here is new. Every block is copied VERBATIM from the
+# config that already proved it on this rig, and the source is named per node:
+#   gello_left  + yam_left   ← yam_left_handoff_teleop_noscan.yaml  (recorded 2026-09-02 corpus)
+#   gello_right + yam_right  ← yam_right_grasp_teleop_noscan.yaml   (recorded 2026-09-04 corpus)
+#   camera_top + camera_right← cameras_right_top.yaml               (inference camera session)
+#   camera_left              ← yam_left_handoff_teleop_noscan.yaml
+# If a source config changes, re-copy; do not let the two drift apart.
+#
+# LEADER IDENTITY (docs/reference/RIG-ADDRESS-MAP.md, verified 2026-09-02 by
+# servo-wiggle — the udev names are CROSSED relative to bench position):
+#   LEFT  arm ← /dev/leader-right, motor ids 8-14, the physically-LEFT handle
+#   RIGHT arm ← /dev/leader-left,  motor ids 1-7,  the physically-RIGHT handle
+# Port + ids + calibration travel TOGETHER: the offsets/scales/gripper ticks
+# were measured on that specific handle. tests/test_rig.sh pins this mapping.
+#
+# STARTUP IS ZERO-MOTION. startup_hold latches each arm where it is; the FIRST
+# leader reading then becomes the target and RobotNode ramps to it over
+# ramp_duration_s. Hold each leader where its follower is BEFORE the session
+# starts, or that ramp is a 3 s sweep to wherever the handle happens to lie.
+# shutdown_joint_pos is null: stopping this session must not move the arms.
+# Drive both arms to a resting pose with the leaders before you stop.
+version: "1"
+session:
+  save_root: recordings
+  # The REC button on the cockpit posts to the :8792 control server, which
+  # records EVERY node in the session (both arms, all cameras). record_topic
+  # is the keyboard/bus fallback only.
+  record_topic: gello_left/record
+  instructions:
+    1: "bimanual: right arm fills the mat from the source bin, left arm sorts mat -> box"
+    0: "play data"
+
+nodes:
+  # ── LEFT leader: physically-LEFT handle on /dev/leader-right, ids 8-14 ──────
+  # Source: yam_left_handoff_teleop_noscan.yaml (verbatim).
+  - type: AgentNode
+    name: gello_left
+    pinned_cpu: 6
+    realtime_priority: 70
+    agent_class: robots_realtime.agents.teleoperation.dynamixel_gello_leader_agent:DynamixelGelloLeaderAgent
+    agent_kwargs:
+      port: /dev/leader-right
+      robot_name: left
+      motor_ids: [8, 9, 10, 11, 12, 13, 14]
+      baudrate: 1000000
+      include_gripper: true
+      joint_offsets_ticks: [-484, -988, 691, 1014, 1014, -44]
+      joint_scales: [1, 1, 1, -1, 1, 1]
+      joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      gripper_open_ticks: 2280
+      gripper_closed_ticks: 2000
+      gripper_scale: 1.0
+      stale_timeout_s: 1.0
+      max_delta_rad: 3.14
+      gripper_spring: true
+      gripper_spring_current_limit: 100
+    arm_key: left
+    loop_mode: flat_out
+
+  # ── RIGHT leader: physically-RIGHT handle on /dev/leader-left, ids 1-7 ──────
+  # Source: yam_right_grasp_teleop_noscan.yaml (verbatim; cal re-derived 2026-08-10).
+  - type: AgentNode
+    name: gello_right
+    pinned_cpu: 8
+    realtime_priority: 70
+    agent_class: robots_realtime.agents.teleoperation.dynamixel_gello_leader_agent:DynamixelGelloLeaderAgent
+    agent_kwargs:
+      port: /dev/leader-left
+      robot_name: right
+      motor_ids: [1, 2, 3, 4, 5, 6, 7]
+      baudrate: 1000000
+      include_gripper: true
+      joint_offsets_ticks: [4, -1934, -502, -976, 2091, -32]
+      # joint_scales differ from the left leader on joints 3 and 4. That is a
+      # real difference between the two handles, not a typo. Do not harmonise.
+      joint_scales: [1, 1, -1, 1, 1, 1]
+      joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      gripper_open_ticks: 1730
+      gripper_closed_ticks: 2100
+      gripper_scale: 1.0
+      stale_timeout_s: 1.0
+      max_delta_rad: 3.14
+      gripper_spring: true
+      gripper_spring_current_limit: 100
+    arm_key: right
+    loop_mode: flat_out
+
+  # ── followers ────────────────────────────────────────────────────────────────
+  # No startup_joint_pos (it would override startup_hold and sweep the arm).
+  - type: RobotNode
+    name: yam_left
+    pinned_cpu: 2
+    realtime_priority: 85
+    robot_config: robot_configs/yam/left.yaml
+    cmd_topic: gello_left/joint_pos
+    poll_freq: 200
+    startup_hold: true
+    ramp_duration_s: 3.0
+    shutdown_joint_pos: null
+    shutdown_duration_s: 0.0
+
+  - type: RobotNode
+    name: yam_right
+    pinned_cpu: 4
+    realtime_priority: 85
+    robot_config: robot_configs/yam/right.yaml
+    cmd_topic: gello_right/joint_pos
+    poll_freq: 200
+    startup_hold: true
+    ramp_duration_s: 3.0
+    shutdown_joint_pos: null
+    shutdown_duration_s: 0.0
+
+  # ── live 3-D monitor: both arm URDFs + the three camera panels, no commands ──
+  # http://localhost:8080 (forward it over SSH). auto_open_browser is off: the
+  # launcher opens the cockpit; two windows fighting for the display is noise.
+  - type: ViserMonitorNode
+    name: viz
+    port: 8080
+    viz_freq: 20
+    auto_open_browser: false
+    fullscreen: true
+    up_axis: "+z"
+    initial_camera_position: [-0.7, -0.31, 0.3]
+    initial_camera_look_at:  [0.45, -0.31, 0.3]
+    urdfs:
+      yam_left:
+        path: urdf/yam.urdf
+        state_topic: yam_left/joint_state
+        flip_joints: true
+        gripper:
+          type: linear_4310
+          attach_link: link_6
+      yam_right:
+        path: urdf/yam.urdf
+        state_topic: yam_right/joint_state
+        flip_joints: true
+        gripper:
+          type: linear_4310
+          attach_link: link_6
+        extrinsic:
+          # 0.610 m matches every other yam_bimanual_*.yaml overlay. The real
+          # base separation is still unmeasured (URDF says 0.570); display only.
+          position: [0.0, -0.61, 0.0]
+          rotation: [1.0, 0.0, 0.0, 0.0]
+    image_topics:
+      top:   camera_top/rgb
+      left:  camera_left/rgb
+      right: camera_right/rgb
+
+  # ── top-down D455 ── Source: cameras_right_top.yaml (verbatim). ─────────────
+  # 30 fps: the D455 sits on 0000:73:00.4 usb8-port2 at 5000 Mbit
+  # (RIG-ADDRESS-MAP.md); the 15 fps in the stale bimanual config was a USB-2
+  # workaround for a port it left on 2026-08-29.
+  - type: CameraNode
+    name: camera_top
+    driver: RealSenseCamera
+    device_id: "203522250539"
+    # librealsense serial; the USB descriptor reads 201523063286 — same camera,
+    # two serial namespaces. Verify only against `rs-enumerate-devices -s`.
+    device_model: "D455"
+    resolution: [1280, 720]
+    fps: 30
+    enable_depth: false
+    publish_resize: [270, 480]   # [HEIGHT, WIDTH] — bus copy only; disk keeps 1280x720
+    publish_resize_mode: pad
+
+  # ── LEFT wrist: Innomaker over the dark MAT ── Source: yam_left_handoff_teleop_noscan.yaml
+  # NO MJPG: this webcam ships truncated MJPEG frames under bandwidth pressure
+  # (torn green-top/gray-bottom panels). Raw YUYV at 640x480x30 fits USB2.
+  - type: CameraNode
+    name: camera_left
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:73:00.4-usb-0:1:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+    v4l2_controls:
+      brightness: 0
+      contrast: 28
+      saturation: 64
+      white_balance_automatic: 1
+      gamma: 100
+      gain: 0
+      power_line_frequency: 1
+      sharpness: 3
+      auto_exposure: 1
+      exposure_time_absolute: 50
+    auto_exposure_enabled: true
+    auto_exposure_target: 120
+    auto_exposure_min: 20
+    auto_exposure_max: 130
+
+  # ── RIGHT wrist: Innomaker over the RED SOURCE BIN ──────────────────────────
+  # 2026-09-07: the right wrist is an Innomaker U20CAM (0c45:6366) again — the
+  # camera Tommaso mounted after the port remap; it enumerated on 0d:00.0 port 3
+  # (the port the LEFT Innomaker used before the remap — by-path is the identity,
+  # re-verify by frame content). Controls are the Innomaker block, identical to
+  # camera_left; the ELE01-only block (power_line_frequency alone, because the
+  # Innomaker's brightness/contrast values render an ELE01 near-black) applies
+  # only if the ELE01 comes back. NO MJPG, same as the left one.
+  - type: CameraNode
+    name: camera_right
+    driver: OpenCVCamera
+    device_path: /dev/v4l/by-path/pci-0000:0d:00.0-usb-0:3:1.0-video-index0
+    resolution: [640, 480]
+    fps: 30
+    v4l2_controls:
+      brightness: 0
+      contrast: 28
+      saturation: 64
+      white_balance_automatic: 1
+      gamma: 100
+      gain: 0
+      power_line_frequency: 1
+      sharpness: 3
+      auto_exposure: 1
+      exposure_time_absolute: 50
+    auto_exposure_enabled: true
+    auto_exposure_target: 120
+    auto_exposure_min: 20
+    auto_exposure_max: 130
