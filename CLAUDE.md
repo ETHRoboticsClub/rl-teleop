@@ -65,6 +65,12 @@ bash tools/red_rounds.sh
 
 Three rules that came out of the hardening run:
 
+- **Every `<node>/health` record carries a frame-drop tier** (2026-09-07,
+  `docs/plans/PLAN-FRAME-DROP-WATCHDOG.md`): `alert ∈ {quiet, warn, loud}` with
+  `alert_reason`, `drops_total`, `frames_lost_total`, `worst_gap_ms`, `loss_pct` (60 s
+  window), `incidents`. The node decides; the label server, cockpit and Step Monitor
+  only relay it. A missing or stale record is `loud` everywhere, never quiet.
+  Pose-correlated diagnosis: `rig.sh watch camera_right`.
 - **`check_streams.py` must never read the health topic.** Its whole value is that it can
   catch the health topic lying. There is a test that fails if anyone changes this.
 - **An episode recorded while a camera was unhealthy is stamped `"degraded": true` in
