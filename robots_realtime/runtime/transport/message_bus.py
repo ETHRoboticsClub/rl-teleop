@@ -17,8 +17,15 @@ import multiprocessing as mp
 import time
 
 
-DEFAULT_PUB_PORT = 5555   # nodes publish  → connect here
-DEFAULT_SUB_PORT = 5556   # nodes subscribe → connect here
+import os
+
+# 2026-09-07: the ports are overridable so a SIMULATED rig (loops/simtwin) can run
+# its own bus beside the real one. The real rig always uses 5555/5556; a sim
+# stack exports RR_BUS_PUB_PORT/RR_BUS_SUB_PORT and every Publisher/Subscriber
+# built from these constants (act_runner, sort_right_checked, ...) follows it
+# with no code change. Unset -> identical to before.
+DEFAULT_PUB_PORT = int(os.environ.get("RR_BUS_PUB_PORT", "5555"))   # nodes publish  → connect here
+DEFAULT_SUB_PORT = int(os.environ.get("RR_BUS_SUB_PORT", "5556"))   # nodes subscribe → connect here
 
 
 def _broker_worker(pub_port: int, sub_port: int, ready_event: mp.Event,

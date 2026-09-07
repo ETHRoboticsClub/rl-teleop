@@ -152,3 +152,53 @@ def test_normal_jitter_does_not_blank_a_working_panel(age: float) -> None:
     sub.latest["camera_top/rgb"] = _frame_env(age_s=age)
     assert b.state("top")["state"] == "ok"
     assert b.frame("top") is not None
+
+
+# ── frame-drop tier relay (PLAN-FRAME-DROP-WATCHDOG.md, 2026-09-07) ─────────
+# The camera node decides quiet/warn/loud. The bridge RELAYS it, and turns every
+# "I cannot tell" into loud: a missing or stale record must never read as quiet.
+
+
+def _drop_health_env(alert: str, reason: str = "", age_s: float = 0.0) -> dict:
+    return {"ts": time.time() - age_s,
+            "data": {"state": "ok", "healthy": True, "alert": alert, "alert_reason": reason,
+                     "drops_total": 3, "loss_pct": 2.4}}
+
+
+def test_the_nodes_alert_tier_is_relayed_verbatim() -> None:
+    b, sub = _bridge()
+    sub.latest["camera_top/rgb"] = _frame_env()
+    sub.latest["camera_top/health"] = _drop_health_env("warn", "2.4% frames lost in 60s")
+    st = b.state("top")
+    assert st["state"] == "ok"
+    assert st["alert"] == "warn"
+    assert st["alert_reason"] == "2.4% frames lost in 60s"
+
+
+def test_a_missing_health_record_is_loud_not_quiet() -> None:
+    b, sub = _bridge()
+    sub.latest["camera_top/rgb"] = _frame_env()
+    st = b.state("top")
+    assert st["alert"] == "loud"
+    assert "no health record" in st["alert_reason"]
+
+
+def test_a_stale_stream_is_loud_whatever_the_record_says() -> None:
+    b, sub = _bridge(stale_after_s=1.0)
+    sub.latest["camera_top/rgb"] = _frame_env(age_s=5.0)
+    sub.latest["camera_top/health"] = _drop_health_env("quiet", age_s=5.0)
+    st = b.state("top")
+    assert st["state"] == "stale"
+    assert st["alert"] == "loud"
+
+
+def test_all_states_reports_the_worst_alert_for_the_page_banner() -> None:
+    b, sub = _bridge()
+    sub.latest["camera_top/rgb"] = _frame_env()
+    sub.latest["camera_top/health"] = _drop_health_env("quiet")
+    sub.latest["camera_right/rgb"] = _frame_env()
+    sub.latest["camera_right/health"] = _drop_health_env("warn", "1.2% frames lost in 60s")
+    allst = b.all_states()
+    assert allst["worst_alert"] == "warn"
+    assert allst["cams"]["wristR"]["alert"] == "warn"
+    assert allst["cams"]["top"]["alert"] == "quiet"
