@@ -190,9 +190,21 @@ class CameraNode(Node):
         read_deadline_s: float = 1.0,
         freeze_timeout_s: float = 3.0,
         driver_factory=None,
+        # Frame-drop watchdog tiers (PLAN-FRAME-DROP-WATCHDOG.md). YAML keys on
+        # the CameraNode block; defaults live in SupervisedCamera and are the
+        # numbers every dashboard explains, so override them only for a reason.
+        drop_gap_x: float | None = None,
+        alert_window_s: float | None = None,
+        alert_warn_pct: float | None = None,
+        alert_loud_pct: float | None = None,
+        ledger_slack_pct: float | None = None,
         **kwargs,
     ) -> None:
         super().__init__(name=name, writer=writer, **kwargs)
+        self._alert_kwargs = {k: float(v) for k, v in (
+            ("drop_gap_x", drop_gap_x), ("alert_window_s", alert_window_s),
+            ("alert_warn_pct", alert_warn_pct), ("alert_loud_pct", alert_loud_pct),
+            ("ledger_slack_pct", ledger_slack_pct)) if v is not None}
         self._driver = driver
         self._driver_spec = _driver_spec
         self._driver_factory = driver_factory
@@ -322,6 +334,7 @@ class CameraNode(Node):
             identity_fn=self._identity_fn(),
             presence_check=self._presence_check(),
             device_path=str(spec.get("device_path") or spec.get("device_id") or ""),
+            **self._alert_kwargs,
         )
         self._supervised = supervised
         self._driver = supervised

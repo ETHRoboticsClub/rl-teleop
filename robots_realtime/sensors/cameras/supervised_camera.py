@@ -185,6 +185,19 @@ class CameraHealth:
     target_fps: float = 0.0
     terminal: bool = False
     since: float = 0.0          # wall-clock time the current state was entered
+    #: FRAME-DROP WATCHDOG (2026-09-07, PLAN-FRAME-DROP-WATCHDOG.md). Counted on
+    #: the supervisor's monotonic read clock, never on driver timestamps (which
+    #: go backwards on some devices). Telemetry only: a drop never changes
+    #: `state` and never asks for a reopen.
+    drops_total: int = 0        # gaps longer than drop_gap_x nominal intervals, ever
+    frames_lost_total: int = 0  # frames those gaps swallowed, ever
+    worst_gap_ms: float = 0.0   # longest gap ever seen (a 20 s stall reads 20000)
+    loss_pct: float = 0.0       # frames lost in the last alert_window_s, percent
+    incidents: int = 0          # freezes/stalls/reopens/read failures in the window
+    freeze_incidents: int = 0   # total freeze/ring incidents, ever
+    alert: str = "quiet"        # quiet | warn | loud — the ONE tier every dashboard shows
+    alert_reason: str = ""
+    alert_window_s: float = 60.0
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -209,6 +222,15 @@ class CameraHealth:
             "terminal": self.terminal,
             "since": self.since,
             "healthy": self.state == STATE_OK,
+            "drops_total": self.drops_total,
+            "frames_lost_total": self.frames_lost_total,
+            "worst_gap_ms": round(self.worst_gap_ms, 1),
+            "loss_pct": round(self.loss_pct, 2),
+            "incidents": self.incidents,
+            "freeze_incidents": self.freeze_incidents,
+            "alert": self.alert,
+            "alert_reason": self.alert_reason,
+            "alert_window_s": self.alert_window_s,
         }
 
 
@@ -286,6 +308,11 @@ class SupervisedCamera(CameraDriver):
         device_path: str = "",
         max_orphans: int = 4,
         autostart: bool = True,
+        drop_gap_x: float = 2.5,
+        alert_window_s: float = 60.0,
+        alert_warn_pct: float = 1.0,
+        alert_loud_pct: float = 5.0,
+        ledger_slack_pct: float = 2.5,
     ) -> None:
         self._factory = factory
         self.name = name
@@ -331,6 +358,37 @@ class SupervisedCamera(CameraDriver):
         self._identity_fn = identity_fn
         self._presence_check = presence_check
         self._max_orphans = int(max_orphans)
+
+        # FRAME-DROP WATCHDOG (PLAN-FRAME-DROP-WATCHDOG.md, 2026-09-07). Two
+        # counters because the two real failure shapes look different:
+        #   * a flexing cable / a device that stalls gives BURSTS — a gap longer
+        #     than drop_gap_x nominal intervals; the gap's length says how many
+        #     frames it swallowed (gap events, worst_gap_ms);
+        #   * a USB-2 link or CPU starvation gives a STEADY shortfall with no
+        #     single gap over the threshold — only a ledger of delivered vs
+        #     promised frames over the window sees it.
+        # The tier reads the worse of the two. Freeze/stall/reopen incidents in
+        # the window are `loud` outright: a frozen camera feeds the policy a
+        # stale image, which is worse than a missing one.
+        self._drop_gap_x = float(drop_gap_x)
+        self._alert_window_s = float(alert_window_s)
+        self._alert_warn_pct = float(alert_warn_pct)
+        self._alert_loud_pct = float(alert_loud_pct)
+        # The ledger view below compares delivered frames against target_fps. A
+        # UVC webcam asked for 30 fps steadily delivers 29.5 (the two Innomakers on
+        # this rig, every session since 2026-08), which is 1.6% short of the promise
+        # with ZERO gaps -- and 1.6% is above the 1% warn tier, so both wrist panels
+        # read "warn 1.6% frames lost" on a perfectly healthy day (2026-09-11).
+        # The hardware's steady rate is not loss. The ledger only counts what
+        # exceeds this slack; the gap view is untouched, so real holes still show.
+        self._ledger_slack_pct = float(ledger_slack_pct)
+        # (mono, frames_lost) per gap event; (mono,) per delivered frame; (mono,)
+        # per incident. Bounded by the window in _prune(), and by maxlen as a
+        # backstop so a runaway camera cannot grow them without bound.
+        self._gap_events: deque[Tuple[float, int]] = deque(maxlen=20000)
+        self._delivered: deque[float] = deque(maxlen=20000)
+        self._incidents: deque[float] = deque(maxlen=2000)
+        self._last_alert = "quiet"
 
         self._driver: Optional[CameraDriver] = None
         self._generation = 0
@@ -481,12 +539,73 @@ class SupervisedCamera(CameraDriver):
     def health(self) -> Dict[str, Any]:
         with self._lock:
             h = self._health
+            now = time.monotonic()
             if self._last_frame_mono is None:
                 h.last_frame_age_s = float("inf")
             else:
-                h.last_frame_age_s = time.monotonic() - self._last_frame_mono
+                h.last_frame_age_s = now - self._last_frame_mono
             h.orphaned_readers = sum(1 for t in self._orphans if t.is_alive())
+            self._update_alert(now)
             return h.as_dict()
+
+    # ── frame-drop watchdog ──────────────────────────────────────────────────
+
+    def _track_delivery(self, mono: float) -> None:
+        """Called under the lock for every ACCEPTED frame. Counts gaps and delivery."""
+        prev = self._last_frame_mono
+        if prev is not None and self._min_period_s > 0:
+            gap = mono - prev
+            if gap > self._drop_gap_x * self._min_period_s:
+                lost = max(1, int(round(gap / self._min_period_s)) - 1)
+                self._gap_events.append((mono, lost))
+                self._health.drops_total += 1
+                self._health.frames_lost_total += lost
+                self._health.worst_gap_ms = max(self._health.worst_gap_ms, gap * 1000.0)
+        self._delivered.append(mono)
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self._alert_window_s
+        for dq in (self._gap_events, self._delivered, self._incidents):
+            while dq and (dq[0][0] if isinstance(dq[0], tuple) else dq[0]) < cutoff:
+                dq.popleft()
+
+    def _update_alert(self, now: float) -> None:
+        """Recompute loss_pct / incidents / alert over the window. Under the lock."""
+        h = self._health
+        self._prune(now)
+        h.alert_window_s = self._alert_window_s
+        delivered = len(self._delivered)
+        lost_gaps = sum(n for _, n in self._gap_events)
+        # Gap view: what the holes swallowed, against what arrived plus them.
+        gap_pct = 100.0 * lost_gaps / (delivered + lost_gaps) if (delivered + lost_gaps) else 0.0
+        # Ledger view: what the configured rate promised over the span we have
+        # actually been watching (never more than the window). Only meaningful
+        # once a few seconds have accumulated, so a cold start is not "100% lost".
+        ledger_pct = 0.0
+        if self._target_fps and self._delivered:
+            span = min(self._alert_window_s, now - self._delivered[0])
+            if span >= 5.0:
+                promised = span * self._target_fps
+                ledger_pct = max(0.0, 100.0 * (1.0 - delivered / promised)) if promised > 0 else 0.0
+                ledger_pct = max(0.0, ledger_pct - self._ledger_slack_pct)
+        h.loss_pct = max(gap_pct, ledger_pct)
+        h.incidents = len(self._incidents)
+        if h.incidents:
+            alert, why = "loud", f"{h.incidents} incident(s) in {int(self._alert_window_s)}s (freeze/stall/reopen)"
+        elif h.loss_pct >= self._alert_loud_pct:
+            alert, why = "loud", f"{h.loss_pct:.1f}% frames lost in {int(self._alert_window_s)}s"
+        elif h.loss_pct >= self._alert_warn_pct:
+            alert, why = "warn", f"{h.loss_pct:.1f}% frames lost in {int(self._alert_window_s)}s"
+        else:
+            alert, why = "quiet", ""
+        if lost_gaps and alert != "quiet":
+            why += f"; {len(self._gap_events)} gap(s), worst {h.worst_gap_ms:.0f} ms"
+        h.alert, h.alert_reason = alert, why
+        if alert != self._last_alert:
+            # Logged once per transition. NEVER a state change, never a reopen.
+            (logger.warning if alert == "loud" else logger.info)(
+                "[%s] frame-drop alert %s → %s: %s", self.name, self._last_alert, alert, why or "clear")
+            self._last_alert = alert
 
     @property
     def state(self) -> str:
@@ -632,6 +751,7 @@ class SupervisedCamera(CameraDriver):
         self._last_fingerprint = fp
 
         with self._lock:
+            self._track_delivery(mono)
             self._last_frame_mono = mono
             self._health.frames += 1
             self._health.consecutive_failures = 0
@@ -744,6 +864,9 @@ class SupervisedCamera(CameraDriver):
             self._health.consecutive_failures += 1
             self._healthy_streak = 0
             n = self._health.consecutive_failures
+            self._incidents.append(time.monotonic())
+            if reason in ("frozen", "stalled"):
+                self._health.freeze_incidents += 1
         logger.warning("[%s] camera read failure #%d (%s): %s", self.name, n, reason, detail)
         self._set_state(STATE_REOPENING, reason, detail)
         self._reopen_request.set()
@@ -930,6 +1053,7 @@ class SupervisedCamera(CameraDriver):
                 self._health.consecutive_failures = 0
                 if gen > 1:
                     self._health.reopens += 1
+                    self._incidents.append(time.monotonic())
                 path = getattr(driver, "device_path", None) or getattr(driver, "device_id", None)
                 if path:
                     self._health.device_path = str(path)
