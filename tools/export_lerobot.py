@@ -79,6 +79,63 @@ MAX_CAM_STALENESS_S = 2.0 / DEFAULT_FPS
 # A window needs at least this many frames to be worth training on.
 MIN_WINDOW_FRAMES = 10
 
+# ── W2: pose-predicate windows and the close-index gate ─────────────────────
+# OPT-IN (--window-mode grasp-pose). Nothing below is reachable from the default
+# "grasp" mode; existing exports are byte-identical.
+#
+# THE PROPERTY THAT PREDICTED THE ONE WORKING POLICY (check_handover_pose.py:
+# 17-31): the FRAME INDEX of the first jaw close inside the training window,
+# measured against the policy's chunk. A correctly-trained checkpoint scored 0/5
+# on hardware because 46% of its windows closed after frame 100 — one committed
+# chunk physically could not reach the close. Loss cannot see this.
+#
+# The fixed [t_close-3s, t_close+2s] window puts the close at frame 90 BY
+# CONSTRUCTION, whatever the operator did. That is 90% of the chunk, so the
+# close sits in the thin tail of the horizon where the policy has the least
+# supervision left. The pose predicate replaces the fixed 3 s lead with the
+# moment the end-effector actually began its final descent, so the window opens
+# on the approach the policy has to reproduce rather than on whatever the arm
+# happened to be doing three seconds earlier.
+#
+# The plane. Measured on the 2026-09-02 left-arm grasp demos, FK z at the close
+# is ~0.10 m and the arm approaches from ~0.20-0.30 m, so a plane 5 cm above the
+# grasp is inside every descent and above every close. It is a PRE-GRASP plane,
+# not a table height: it is defined relative to THIS grasp's own z, so it
+# survives grasps at different heights and a re-levelled table.
+PREGRASP_PLANE_M = 0.05
+# Frames of lead kept before the crossing, so the window contains the decision to
+# descend and not only the descent. The plan's range is 10-20 frames; 15 at 30 Hz
+# = 0.5 s.
+PREGRASP_MARGIN_FRAMES = 15
+# Set by --pregrasp-margin-s / --pregrasp-plane-m (None = the constants above
+# apply, byte-identical to every export before 2026-09-05). Global-set-by-main,
+# same pattern as KEEP. Raising the margin opens every window earlier (pair it
+# with a larger --chunk-frames so the close stays inside the chunk); raising the
+# plane starts windows nearer the top of the approach. Window-length experiment
+# lineage: night of 2026-09-05.
+PREGRASP_MARGIN_S_CLI: float | None = None
+PREGRASP_PLANE_M_CLI: float | None = None
+# The LEFT policy's TRAINING chunk, in frames of the exporter's 30 Hz grid.
+# act_runner.py:129-131 executes n_action_steps=16 ("16 of 100"), so the runtime
+# re-observes every 0.53 s and the executed horizon is NOT the binding
+# constraint — chunk_size is: the model only ever plans chunk_size frames ahead,
+# so a close beyond it was never demonstrated inside a single plan.
+LEFT_CHUNK_FRAMES = 100
+# The gate: the close must land within this fraction of the chunk.
+#
+# TUNABLE ON PURPOSE — the plan (PLAN-ACT-READINESS.md, UNRESOLVED DECISIONS)
+# marks 0.8 as a starting point, not a measured threshold. Measured against the
+# known-good corpus at implementation time: in the default fixed-window mode
+# every window closes at frame 90 (0.90 of the chunk) by construction, so 0.8
+# would reject the entire corpus — which is exactly why the gate ships only with
+# the pose-predicate mode that makes the index a measurement instead of a
+# constant. Override with --close-idx-frac; the distribution is always reported.
+CLOSE_IDX_CHUNK_FRAC = 0.8
+# FK for the pose predicate. Explicit, repo-relative: fk.py's own default is
+# "urdf/yam.urdf", which is cwd-relative and silently wrong from anywhere but
+# the repo root.
+DEFAULT_URDF = str(Path(__file__).resolve().parents[1] / "urdf" / "yam.urdf")
+
 # recorded camera name -> LeRobot feature suffix. The scan camera is deliberately
 # absent: it looks at the packet mat, not the workspace, contributes nothing to a
 # grasp policy, and is ~49% of every episode's bytes.
@@ -191,6 +248,14 @@ class Report:
     # episode -> arm -> {"moving", "ptp_rad", "divergence_rad"}, one entry per
     # written window. Bimanual only in practice; harmless for one arm.
     activity: list[tuple[str, dict]] = field(default_factory=list)
+    # W2 (grasp-pose mode only): one row per candidate window —
+    # (episode, close frame index, start mode, kept). REPORTED, and the gate
+    # decision is already in `kept`, so a corpus can be inspected before the
+    # threshold is trusted.
+    close_idx: list[tuple[str, int, str, bool]] = field(default_factory=list)
+
+    def note_close_idx(self, ep: str, idx: int, mode: str, kept: bool) -> None:
+        self.close_idx.append((ep, int(idx), mode, bool(kept)))
 
     def reject(self, ep: str, reason: str) -> None:
         self.rejected.append(Rejection(ep, reason))
@@ -355,6 +420,61 @@ def usable_grasps(ep: Path, workspace_gate: bool = True,
 # one: None exports everything usable_grasps returns, {} exports nothing.
 KEEP: dict[str, list[float]] | None = None
 
+# --windows: {episode_name: [[t_abs_start, t_abs_end], ...]} — explicit training
+# windows for "full" mode, written by tools/segment_home_episodes.py (one window
+# per home→home stretch). Episodes absent from the list are REJECTED loudly, so
+# a windows file that was built for a different night cannot silently export a
+# whole take as one episode.
+WINDOWS: dict[str, list[tuple[float, float]]] | None = None
+
+
+WINDOW_TASKS: dict[str, list[str | None]] | None = None
+
+
+def load_windows(path) -> dict[str, list[tuple[float, float]]]:
+    """Read a segment file → {episode: [(t0, t1), ...]} (absolute seconds).
+
+    2026-09-16: the file may also carry ``"tasks": {episode: [str, ...]}`` aligned
+    one-to-one with ``windows[episode]`` (before sorting). When present, each window
+    is exported with ITS OWN task string instead of the episode-wide one, which is
+    how a phase-conditioned policy ("isolate" vs "pick and place") gets its labels
+    without touching the recordings. Filled into the module global WINDOW_TASKS
+    (sorted in step with the windows); absent or null entries fall back to the
+    episode task. Written by training_experiment/tools/phase_split.py.
+    """
+    global WINDOW_TASKS
+    data = load_json(Path(path))
+    if data is None:
+        raise SystemExit(f"--windows: cannot read {path}")
+    wins = data.get("windows") if isinstance(data, dict) else None
+    if not isinstance(wins, dict) or not wins:
+        raise SystemExit(f"--windows: {path} has no non-empty 'windows' dict")
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if tasks is not None and not isinstance(tasks, dict):
+        raise SystemExit(f"--windows: 'tasks' must be a dict {{episode: [str, ...]}}")
+    out: dict[str, list[tuple[float, float]]] = {}
+    task_out: dict[str, list[str | None]] = {}
+    for ep, lst in wins.items():
+        tl = (tasks or {}).get(ep)
+        if tl is not None and len(tl) != len(lst):
+            raise SystemExit(f"--windows: {ep} has {len(lst)} windows but {len(tl)} tasks")
+        rows = []
+        for k, w in enumerate(lst):
+            if not (isinstance(w, (list, tuple)) and len(w) == 2 and w[1] > w[0]):
+                raise SystemExit(f"--windows: bad window for {ep}: {w!r}")
+            rows.append((float(w[0]), float(w[1]), (tl[k] if tl is not None else None)))
+        rows.sort(key=lambda r: (r[0], r[1]))
+        out[str(ep)] = [(r[0], r[1]) for r in rows]
+        task_out[str(ep)] = [r[2] for r in rows]
+    for ep, lst in out.items():
+        for (a0, a1), (b0, b1) in zip(lst, lst[1:]):
+            if b0 < a1:
+                raise SystemExit(f"--windows: {ep} has overlapping windows "
+                                 f"[{a0:.2f},{a1:.2f}] and [{b0:.2f},{b1:.2f}] — "
+                                 "re-run tools/segment_home_episodes.py (pads are clamped there)")
+    WINDOW_TASKS = task_out if tasks else None
+    return out
+
 # t_close comes back through JSON, so allow for float round-trip only — not for
 # "near enough". Two grasps in these takes are never closer than ~1.5 s, so a
 # tolerance this tight cannot match the wrong grasp.
@@ -425,6 +545,96 @@ def grasp_windows_indexed(grasps: list[dict], t0: float, t1: float,
         if hi > lo:
             out.append((i, lo, hi))
     return out
+
+
+def pregrasp_start(t_close: float, times: np.ndarray, z: np.ndarray, *,
+                   plane_m: float, margin_s: float,
+                   floor_t: float) -> tuple[float, str]:
+    """When did the final descent to THIS grasp begin? → (start_time, mode).
+
+    The predicate: the LAST time before the close at which the end-effector was
+    still above a plane ``plane_m`` above its own height at the close, minus a
+    margin. "Last" and not "first" on purpose — an operator who hovers, lifts
+    away and comes back down crosses the plane several times, and only the final
+    crossing belongs to the grasp being windowed.
+
+    ``mode`` is how the start was decided, and it is reported, never inferred:
+        "pose"    — a crossing was found and used
+        "clamp"   — no crossing inside the search span (the arm was already below
+                    the plane, e.g. a re-grasp from a low hover) → the historical
+                    ``t_close - pre_s`` clamp, i.e. exactly the old behaviour
+        "clamped" — a crossing was found but sits earlier than the clamp → clamp
+
+    FAILS TO THE OLD BEHAVIOUR, never to something new: every branch that cannot
+    measure a descent returns ``floor_t``. A pose predicate that misfires
+    therefore produces the window this exporter has always produced, and the
+    close-index gate then catches a late close rather than exporting it silently.
+    """
+    t = np.asarray(times, float)
+    zz = np.asarray(z, float)
+    m = (t >= floor_t) & (t <= t_close)
+    if not m.any() or zz.size != t.size:
+        return floor_t, "clamp"
+    tt, zs = t[m], zz[m]
+    plane = float(zs[-1]) + plane_m          # relative to the grasp's own height
+    above = np.nonzero(zs >= plane)[0]
+    if above.size == 0:
+        return floor_t, "clamp"
+    lo = float(tt[above[-1]]) - margin_s
+    if lo <= floor_t:
+        return floor_t, "clamped"
+    return lo, "pose"
+
+
+def grasp_windows_pose_indexed(
+    grasps: list[dict], t0: float, t1: float, pre_s: float, post_s: float,
+    ee_z, *, plane_m: float = PREGRASP_PLANE_M,
+    margin_s: float = PREGRASP_MARGIN_FRAMES / DEFAULT_FPS,
+) -> list[tuple[int, float, float, float, str]]:
+    """``grasp_windows_indexed`` with a pose-predicate start.
+
+    → (index into the time-sorted grasps, lo, hi, t_close, start mode).
+
+    ``ee_z(grasp)`` returns ``(times, z)`` for the arm that made that grasp, or
+    None when no FK is available — in which case that window falls back to the
+    fixed clamp. The non-overlap clipping is IDENTICAL to
+    ``grasp_windows_indexed`` (same rule, applied after the start is chosen):
+    two windows sharing frames teach contradictory actions for one image.
+    """
+    order = sorted(range(len(grasps)), key=lambda i: float(grasps[i]["t"]))
+    ts = [float(grasps[i]["t"]) for i in order]
+    out: list[tuple[int, float, float, float, str]] = []
+    for k, gi in enumerate(order):
+        t = ts[k]
+        floor_t = max(t0, t - pre_s)
+        tz = ee_z(grasps[gi])
+        if tz is None:
+            lo, mode = floor_t, "clamp"
+        else:
+            lo, mode = pregrasp_start(t, tz[0], tz[1], plane_m=plane_m,
+                                      margin_s=margin_s, floor_t=floor_t)
+        hi = min(t1, t + post_s)
+        if k > 0:                       # never reach back past the previous grasp
+            lo = max(lo, (ts[k - 1] + t) / 2.0)
+        if k + 1 < len(ts):             # never reach forward past the next one
+            hi = min(hi, (t + ts[k + 1]) / 2.0)
+        if hi > lo:
+            out.append((k, lo, hi, t, mode))
+    return out
+
+
+def close_frame_index(t_close: float, lo: float, fps: int) -> int:
+    """Frame index of the jaw close inside a window that starts at ``lo``.
+
+    The same quantity check_handover_pose.py measures on an exported corpus —
+    computed here BEFORE the export instead of after the training run.
+    """
+    return int(round((t_close - lo) * fps))
+
+
+def close_idx_gate(chunk_frames: int, frac: float) -> int:
+    """Highest close frame index a window may have. See CLOSE_IDX_CHUNK_FRAC."""
+    return int(chunk_frames * frac)
 
 
 def grasp_windows(grasps: list[dict], t0: float, t1: float,
@@ -619,13 +829,51 @@ def read_arm(ep: Path, arm: str,
     return t_yam, state, t_gel, action
 
 
+def ee_z_lookup(streams: dict, arms: tuple[str, ...], urdf_path: str,
+                fps: int, pre_s: float):
+    """Build ``ee_z(grasp) -> (times, z)`` over the approach to each grasp.
+
+    FK is run ONLY on the ``pre_s`` seconds before each close, resampled to the
+    export grid (≈90 samples per grasp at 30 Hz) — not on the whole 200 Hz joint
+    stream, which would be ~20k FK calls per episode for a number that is only
+    needed near the close. No video is touched.
+
+    The URDF path is passed in explicitly: ``fk.ForwardKinematics``'s default is
+    the cwd-relative "urdf/yam.urdf", which resolves to nothing from anywhere but
+    the repo root and would silently produce no windows.
+    """
+    from robots_realtime.labeling.fk import ForwardKinematics
+
+    fk = ForwardKinematics(urdf_path)
+
+    def lookup(g: dict):
+        arm = g.get("arm") or arms[0]
+        if arm not in streams:
+            return None
+        t_s, state, _, _ = streams[arm]
+        t = float(g["t"])
+        n = max(2, int(pre_s * fps) + 1)
+        grid = t - np.arange(n - 1, -1, -1) / fps          # [t-pre_s .. t]
+        grid = grid[(grid >= float(t_s[0])) & (grid <= float(t_s[-1]))]
+        if grid.size < 2:
+            return None
+        idx = nearest_index(t_s, grid)
+        z = fk.ee_positions(state[idx, : C.N_ARM_JOINTS])[:, 2]
+        return grid, z
+
+    return lookup
+
+
 def plan_episode(ep: Path, pre_s: float, post_s: float, fps: int, report: Report,
                  x_min: float | None = None, y_max: float | None = None,
                  cameras: dict | None = None,
                  arms: tuple[str, ...] | None = None,
                  window_mode: str = "grasp",
                  open_ref: float | None = None,
-                 closed_ref: float | None = None):
+                 closed_ref: float | None = None,
+                 urdf_path: str = DEFAULT_URDF,
+                 chunk_frames: int = LEFT_CHUNK_FRAMES,
+                 close_idx_frac: float = CLOSE_IDX_CHUNK_FRAC):
     """Everything needed to write this episode's windows, or None if unusable.
 
     ``arms`` is one or more physical arms; with more than one the per-arm state
@@ -640,6 +888,14 @@ def plan_episode(ep: Path, pre_s: float, post_s: float, fps: int, report: Report
                 for the bimanual handoff take: the thing to be learned is the
                 SEQUENCE (right arm box→mat, then left arm mat→kit box) and
                 cutting it into grasp windows deletes exactly that.
+      "grasp-pose" — W2. Same one-window-per-grasp rule as "grasp", but the
+                window OPENS when the end-effector actually began its final
+                descent (pregrasp_start) instead of a fixed pre_s earlier, and
+                every window must then close within
+                ``close_idx_frac × chunk_frames`` of the LEFT policy's chunk or
+                it is rejected with its measured index. OPT-IN: "grasp" is
+                untouched, and the same episode exports the same windows there
+                as it did before this mode existed.
     """
     arms = resolve_arms(arms)
 
@@ -647,7 +903,7 @@ def plan_episode(ep: Path, pre_s: float, post_s: float, fps: int, report: Report
     for arm in arms:
         g, why = usable_grasps(ep, x_min=x_min, y_max=y_max, arm=arm)
         if why:
-            if window_mode == "grasp":
+            if window_mode in ("grasp", "grasp-pose"):
                 report.reject(ep.name, why if len(arms) == 1 else f"[{arm}] {why}")
                 return None
             continue
@@ -705,10 +961,61 @@ def plan_episode(ep: Path, pre_s: float, post_s: float, fps: int, report: Report
     t1 = min(float(s[0][-1]) for s in streams.values())
     t1 = min(t1, min(float(s[2][-1]) for s in streams.values()))
 
+    window_meta: list[dict] = []
     if window_mode == "full":
-        windows = [(t0, t1)] if t1 > t0 else []
-        if not windows:
+        if t1 <= t0:
             report.reject(ep.name, "arms' recorded spans do not overlap")
+            return None
+        if WINDOWS is None:
+            windows = [(t0, t1)]
+        else:
+            wanted = WINDOWS.get(ep.name)
+            if not wanted:
+                report.reject(ep.name, "not in --windows list")
+                return None
+            windows = []
+            for k, (lo, hi) in enumerate(wanted):
+                clo, chi = max(lo, t0), min(hi, t1)
+                if chi - clo < (hi - lo) * 0.9:
+                    # A window that mostly falls outside the recorded span was
+                    # cut against a different take; say so instead of trimming.
+                    report.reject(ep.name, f"--windows #{k + 1} [{lo:.1f},{hi:.1f}] "
+                                  f"lies outside the recorded span [{t0:.1f},{t1:.1f}]")
+                    continue
+                windows.append((clo, chi))
+                wtask = ((WINDOW_TASKS or {}).get(ep.name) or [None] * len(wanted))[k]
+                window_meta.append({"window": k + 1, "t0": clo, "t1": chi, "task": wtask})
+            if not windows:
+                report.reject(ep.name, "no --windows entry inside the recorded span")
+                return None
+    elif window_mode == "grasp-pose":
+        max_idx = close_idx_gate(chunk_frames, close_idx_frac)
+        cand = grasp_windows_pose_indexed(
+            grasps, t0, t1, pre_s, post_s,
+            ee_z_lookup(streams, arms, urdf_path, fps, pre_s),
+            plane_m=(PREGRASP_PLANE_M if PREGRASP_PLANE_M_CLI is None
+                     else PREGRASP_PLANE_M_CLI),
+            margin_s=(PREGRASP_MARGIN_FRAMES / DEFAULT_FPS
+                      if PREGRASP_MARGIN_S_CLI is None
+                      else PREGRASP_MARGIN_S_CLI))
+        windows = []
+        for _k, lo, hi, t_close, mode in cand:
+            idx = close_frame_index(t_close, lo, fps)
+            keep = idx <= max_idx
+            report.note_close_idx(ep.name, idx, mode, keep)
+            if not keep:
+                # A LOUD per-window rejection with the measured number, not a
+                # silent skip: this is the property that decided whether the one
+                # working checkpoint worked, so a dropped window has to say why.
+                report.reject(ep.name,
+                              f"grasp @ {t_close:.3f} closes at frame {idx} > "
+                              f"{max_idx} ({close_idx_frac:g} x {chunk_frames}-frame "
+                              f"chunk, start={mode}) — one chunk cannot reach it")
+                continue
+            windows.append((lo, hi))
+            window_meta.append({"t_close": t_close, "close_idx": idx, "start": mode})
+        if not windows:
+            report.reject(ep.name, "no grasp window passed the close-index gate")
             return None
     else:
         windows = grasp_windows(grasps, t0, t1, pre_s, post_s)
@@ -721,7 +1028,7 @@ def plan_episode(ep: Path, pre_s: float, post_s: float, fps: int, report: Report
     task = (ann.get("episode_meta") or {}).get("instruction") or default_task
 
     plan = {"ep": ep, "windows": windows, "task": task, "cams": cams,
-            "arms": arms, "streams": streams}
+            "arms": arms, "streams": streams, "window_meta": window_meta}
     # Back-compat keys for the single-arm callers and tests that read the plan.
     t_yam, state, t_gel, action = streams[arms[0]]
     plan.update({"t_yam": t_yam, "state": state, "t_gel": t_gel, "action": action})
@@ -797,7 +1104,10 @@ def export(root: Path, repo_id: str, out: Path | None, fps: int,
            window_mode: str = "grasp",
            max_idle_divergence: float = IDLE_ARM_DIVERGENCE_MAX_RAD,
            open_ref: float | None = None,
-           closed_ref: float | None = None) -> Report:
+           closed_ref: float | None = None,
+           urdf_path: str = DEFAULT_URDF,
+           chunk_frames: int = LEFT_CHUNK_FRAMES,
+           close_idx_frac: float = CLOSE_IDX_CHUNK_FRAC) -> Report:
     cameras = resolve_cameras(cameras)
     arms = resolve_arms(arms)
     report = Report()
@@ -809,7 +1119,8 @@ def export(root: Path, repo_id: str, out: Path | None, fps: int,
     plans = []
     for ep in eps:
         plan = plan_episode(ep, pre_s, post_s, fps, report, x_min, y_max, cameras,
-                            arms, window_mode, open_ref, closed_ref)
+                            arms, window_mode, open_ref, closed_ref,
+                            urdf_path, chunk_frames, close_idx_frac)
         if plan:
             plans.append(plan)
             report.kept.append(ep.name)
@@ -842,12 +1153,15 @@ def export(root: Path, repo_id: str, out: Path | None, fps: int,
 
         streams = {c: CameraStream(*plan["cams"][c]) for c in cameras}
         try:
-            for (lo, hi) in plan["windows"]:
+            for wi, (lo, hi) in enumerate(plan["windows"]):
                 n = int((hi - lo) * fps)
                 if n < MIN_WINDOW_FRAMES:
                     report.reject(plan["ep"].name, f"window only {n} frames")
                     continue
                 grid = lo + np.arange(n) / fps
+                # per-window task (phase-conditioned exports), else the episode task
+                _wm = plan.get("window_meta") or []
+                window_task = (_wm[wi].get("task") if wi < len(_wm) and isinstance(_wm[wi], dict) else None) or plan["task"]
 
                 w_state, w_action, activity = window_rows(plan, grid)
                 veto = idle_arm_veto(activity, max_idle_divergence)
@@ -857,6 +1171,14 @@ def export(root: Path, repo_id: str, out: Path | None, fps: int,
                 report.note_activity(plan["ep"].name, activity)
 
                 ci = {c: nearest_index(streams[c].t, grid) for c in cameras}
+                # The reader is forward-only. Windows are sorted, but nearest-
+                # index rounding at a shared boundary can still ask for the
+                # frame before the last one served; reopen rather than abort
+                # a 40-minute export on a one-frame step back.
+                for c in cameras:
+                    if int(ci[c][0]) < streams[c]._pos:
+                        streams[c].close()
+                        streams[c] = CameraStream(*plan["cams"][c])
                 stale = {c: np.abs(streams[c].t[ci[c]] - grid) > MAX_CAM_STALENESS_S
                          for c in cameras}
 
@@ -867,7 +1189,7 @@ def export(root: Path, repo_id: str, out: Path | None, fps: int,
                     frame = {
                         "observation.state": w_state[k],
                         "action": w_action[k],
-                        "task": plan["task"],
+                        "task": window_task,
                     }
                     bad = False
                     for cam, suffix in cameras.items():
@@ -916,10 +1238,27 @@ def main(argv=None) -> int:
                          "concatenates left then right into a 14-DoF state and "
                          "action (default: left, which reproduces every dataset "
                          "exported before 2026-08-08)")
-    ap.add_argument("--window-mode", choices=("grasp", "full"), default="grasp",
+    ap.add_argument("--window-mode", choices=("grasp", "full", "grasp-pose"),
+                    default="grasp",
                     help="grasp = one training episode per successful grasp "
                          "(default); full = one training episode per recorded "
-                         "take, which is what a bimanual handoff needs")
+                         "take, which is what a bimanual handoff needs; "
+                         "grasp-pose = grasp windows that OPEN at the start of the "
+                         "measured final descent instead of a fixed --pre-s, and "
+                         "that must close within --close-idx-frac of the chunk")
+    ap.add_argument("--urdf", default=DEFAULT_URDF,
+                    help="URDF for the pose predicate's FK (grasp-pose mode only). "
+                         "Explicit because fk.py's own default is cwd-relative.")
+    ap.add_argument("--chunk-frames", type=int, default=LEFT_CHUNK_FRAMES,
+                    help=f"the TRAINING chunk_size in frames of the {DEFAULT_FPS} Hz "
+                         f"grid (default {LEFT_CHUNK_FRAMES}, the left policy's). "
+                         "NOT n_action_steps: the runtime re-queries every 16 steps, "
+                         "so chunk_size is what bounds a single plan.")
+    ap.add_argument("--close-idx-frac", type=float, default=CLOSE_IDX_CHUNK_FRAC,
+                    help=f"grasp-pose gate: drop a window whose jaw close lands past "
+                         f"this fraction of the chunk (default {CLOSE_IDX_CHUNK_FRAC}). "
+                         "A starting point, not a measured threshold — the full "
+                         "distribution is printed either way.")
     ap.add_argument("--max-idle-divergence", type=float,
                     default=IDLE_ARM_DIVERGENCE_MAX_RAD,
                     help="drop a window if an arm that never moved was commanded "
@@ -936,9 +1275,35 @@ def main(argv=None) -> int:
                          "valid when it spans the full open->closed range.")
     ap.add_argument("--gripper-closed-ref", type=float, default=None,
                     help="gripper's PHYSICAL closed value (this rig: 0.0)")
+    ap.add_argument("--pregrasp-margin-s", type=float, default=None,
+                    help="grasp-pose only: seconds of lead kept before the descent-"
+                         f"plane crossing (default {PREGRASP_MARGIN_FRAMES / DEFAULT_FPS:g}). "
+                         "Raising it opens every window earlier — raise --chunk-frames "
+                         "with it so the close stays inside the chunk, and --pre-s so "
+                         "the FK search span covers the longer lead.")
+    ap.add_argument("--pregrasp-plane-m", type=float, default=None,
+                    help="grasp-pose only: metres above the grasp's own close height "
+                         f"for the descent-start plane (default {PREGRASP_PLANE_M:g}). "
+                         "Raising it starts windows nearer the top of the approach; "
+                         "a window with no crossing falls back to the clamp, loudly.")
+    ap.add_argument("--windows", default=None,
+                    help="full mode only: JSON from tools/segment_home_episodes.py "
+                         "with {'windows': {episode: [[t0, t1], ...]}} (absolute "
+                         "seconds). Each window becomes one training episode; an "
+                         "episode missing from the file is rejected, not exported whole.")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would be exported, write nothing")
     a = ap.parse_args(argv)
+    if a.windows:
+        if a.window_mode != "full":
+            ap.error("--windows only applies to --window-mode full")
+        global WINDOWS
+        WINDOWS = load_windows(a.windows)
+        print(f"windows         : {sum(len(v) for v in WINDOWS.values())} windows "
+              f"across {len(WINDOWS)} episodes from {a.windows}")
+    global PREGRASP_MARGIN_S_CLI, PREGRASP_PLANE_M_CLI
+    PREGRASP_MARGIN_S_CLI = a.pregrasp_margin_s
+    PREGRASP_PLANE_M_CLI = a.pregrasp_plane_m
     if a.keep:
         global KEEP
         KEEP = load_keep_list(a.keep)
@@ -964,10 +1329,17 @@ def main(argv=None) -> int:
     else:
         print("gripper         : per-episode percentile scale (no refs given)")
 
+    if a.window_mode == "grasp-pose":
+        print(f"close-index gate: <= {close_idx_gate(a.chunk_frames, a.close_idx_frac)} "
+              f"of {a.chunk_frames} frames ({a.close_idx_frac:g} x chunk), "
+              f"pre-grasp plane +{(PREGRASP_PLANE_M if PREGRASP_PLANE_M_CLI is None else PREGRASP_PLANE_M_CLI) * 1000:.0f} mm, "
+              f"margin {(PREGRASP_MARGIN_FRAMES / DEFAULT_FPS if PREGRASP_MARGIN_S_CLI is None else PREGRASP_MARGIN_S_CLI) * DEFAULT_FPS:.0f} frames")
+
     rep = export(Path(a.root), a.repo_id, Path(a.out) if a.out else None,
                  a.fps, a.pre_s, a.post_s, a.dry_run, a.zone_x_min, a.zone_y_max,
                  cams, arms, a.window_mode, a.max_idle_divergence,
-                 a.gripper_open_ref, a.gripper_closed_ref)
+                 a.gripper_open_ref, a.gripper_closed_ref,
+                 a.urdf, a.chunk_frames, a.close_idx_frac)
 
     print(f"\nepisodes kept   : {len(rep.kept)}")
     print(f"grasp windows   : {rep.windows}")
@@ -978,6 +1350,21 @@ def main(argv=None) -> int:
     # corpus that exports 3 of 100 episodes is obvious instead of looking fine.
     for r in rep.rejected:
         print(f"   {r.episode:<34} {r.reason}")
+    # The close-index distribution — the decisive property, reported whether or
+    # not anything failed the gate (check_handover_pose.py:17-31).
+    if rep.close_idx:
+        idxs = np.array([i for _, i, _, _ in rep.close_idx])
+        kept = np.array([k for _, _, _, k in rep.close_idx])
+        modes = {}
+        for _, _, m, _ in rep.close_idx:
+            modes[m] = modes.get(m, 0) + 1
+        print(f"\nclose frame index over {len(idxs)} candidate windows: "
+              f"min {idxs.min()}  median {int(np.median(idxs))}  "
+              f"p90 {int(np.percentile(idxs, 90))}  max {idxs.max()}")
+        print("  window starts   : "
+              + "  ".join(f"{m}={n}" for m, n in sorted(modes.items())))
+        print(f"  passed the gate : {int(kept.sum())} / {len(idxs)}")
+
     # Which arm was actually driven in each written window. Nothing gates on it,
     # but a bimanual corpus where one arm never moves in ANY window is a
     # recording mistake worth seeing before a training run, not after.

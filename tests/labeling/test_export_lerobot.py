@@ -575,3 +575,34 @@ def test_build_features_names_the_mismatch_not_the_missing_key():
     from export_lerobot import CAMERA_SETS
     with pytest.raises(KeyError, match="pass the same .cameras."):
         build_features({"camera_left": (480, 640)}, CAMERA_SETS["both"])
+
+
+# ── --windows (full mode, 2026-09-14) ───────────────────────────────────────
+# The camera reader is forward-only, so the windows of one episode must be
+# sorted and disjoint. Overlapping pads (0.5 s over a 0.5 s home dwell) killed
+# an export mid-run on 2026-09-14; the loader now rejects them up front.
+
+def _write_windows(tmp_path, wins):
+    p = tmp_path / "w.json"
+    p.write_text(json.dumps({"windows": wins}))
+    return p
+
+
+def test_load_windows_sorts_and_keeps_disjoint(tmp_path):
+    from export_lerobot import load_windows
+    got = load_windows(_write_windows(tmp_path, {"ep": [[20.0, 30.0], [5.0, 10.0]]}))
+    assert got == {"ep": [(5.0, 10.0), (20.0, 30.0)]}
+
+
+def test_load_windows_rejects_overlap(tmp_path):
+    from export_lerobot import load_windows
+    with pytest.raises(SystemExit, match="overlapping"):
+        load_windows(_write_windows(tmp_path, {"ep": [[5.0, 10.2], [10.0, 20.0]]}))
+
+
+def test_load_windows_rejects_empty_or_backward(tmp_path):
+    from export_lerobot import load_windows
+    with pytest.raises(SystemExit):
+        load_windows(_write_windows(tmp_path, {}))
+    with pytest.raises(SystemExit, match="bad window"):
+        load_windows(_write_windows(tmp_path, {"ep": [[10.0, 5.0]]}))
