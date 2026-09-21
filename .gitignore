@@ -47,3 +47,14 @@ sweeps/*-driver.log
 # unpushed commit blocked pushing main entirely (GitHub 100MB limit) and had
 # to be filter-branched out on 2026-08-12. Keep them out of git.
 sweeps/**/*.safetensors
+.gstack/
+jaw_dataset_redbin/
+
+# --- added 2026-09-21, committing five weeks of work in one pass ---
+# Grasp-review sheets from the 2026-09-02 corpus audit: 1,900 extracted frames and
+# a 400 KB index.html per arm. Dot-prefixed because they were always scratch —
+# qa_label.py rebuilds them from the episodes, and the labels they produced live
+# in the corpus, not here.
+.review-grasps-*/
+# Claude Code session bookkeeping.
+.claude/
