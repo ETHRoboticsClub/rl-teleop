@@ -48,11 +48,20 @@ DEFAULT_KIT = [
 # known_source turns on catalog-snapping (kills UNN→DNN / -009→-000 misreads); using it
 # as comp_of routes every read to its real compartment instead of first-seen order.
 KIT_CATALOG = {
-    "UNN-16022-009": 7,   # Blindniet D4.0x12.5 Al
-    "UNN-10015-007": 6,   # Sechskantschraube M6x10
-    "MDDY-11065-001": 5,  # Kappe
-    "UNN-10015-231": 4,   # Sechskantflanschschraube M6
-    "UNN-10126-151": 1,   # Flügelmutter M8 nichtrostend
+    # The compartment column is GONE (2026-09-21). It was the old seven-cell
+    # cockpit box and this cell has five bays; five SKUs carried a number that
+    # would have put the packet in a bay that no longer exists. Identity lives
+    # here, the BAY lives in kitbox/layout.json :: sku_map, exported to
+    # yam-pick-pipeline/results/kitbox_<date>.json (docs/reference/SKU-TO-BAY.md).
+
+    "UNN-16022-009": None,   # Blindniet D4.0x12.5 Al
+    "UNN-10015-007": None,   # Sechskantschraube M6x10
+    "MDDY-11065-001": None,  # Kappe
+    "UNN-10015-231": None,   # Sechskantflanschschraube M6
+    "UNN-10126-151": None,   # Flügelmutter M8 nichtrostend
+    "MDDY-10266-001": None,   # 8x seen in the 2026-09-14/15 takes
+    "UXN-14009-121": None,   # 7x seen in the 2026-09-14/15 takes
+    "MDDT-12400-001": None,   # 3x seen in the 2026-09-14/15 takes
 }
 KNOWN_SKUS = list(KIT_CATALOG)
 KIT_NAMES = {
@@ -61,6 +70,9 @@ KIT_NAMES = {
     "MDDY-11065-001": "Kappe",
     "UNN-10015-231": "Sechskantflanschschraube M6",
     "UNN-10126-151": "Flügelmutter M8 nichtrostend",
+    "MDDY-10266-001": "",
+    "UXN-14009-121": "",
+    "MDDT-12400-001": "",
 }
 
 
@@ -219,19 +231,39 @@ class CameraBridge:
         # buffer is not a healthy panel.
         if state == "ok" and health is not None and not health.get("healthy", True):
             state = "unhealthy"
+        # FRAME-DROP TIER (PLAN-FRAME-DROP-WATCHDOG.md). The camera node decides
+        # quiet/warn/loud; this only relays it. A panel with no record, a stale
+        # record, or a dead stream is `loud`: "I cannot tell" must never render
+        # as "no drops".
+        if health is None or health.get("stale") or state in ("stale", "no_data", "unhealthy"):
+            alert = "loud"
+            alert_reason = {"stale": "no frame for >%.0fs" % self._stale_after_s,
+                            "no_data": "no frames ever",
+                            "unhealthy": (health or {}).get("reason") or "camera node unhealthy"}.get(
+                                state, "no health record from the camera node")
+        else:
+            alert = str(health.get("alert") or "quiet")
+            alert_reason = str(health.get("alert_reason") or "")
         return {
             "id": cam_id,
             "state": state,
             "age_s": None if age is None else round(age, 3),
             "topic": self._id_to_topic.get(cam_id),
             "camera": health,
+            "alert": alert,
+            "alert_reason": alert_reason,
         }
 
     def all_states(self) -> dict:
+        cams = {cid: self.state(cid) for cid in sorted(self._id_to_topic)}
+        rank = {"quiet": 0, "warn": 1, "loud": 2}
+        worst = max(cams.values(), key=lambda c: rank.get(c.get("alert"), 2), default=None)
         return {
             "t": time.time(),
             "stale_after_s": self._stale_after_s,
-            "cams": {cid: self.state(cid) for cid in sorted(self._id_to_topic)},
+            "cams": cams,
+            # The page banner reads this one word; the per-panel chips read cams[*].alert.
+            "worst_alert": (worst or {}).get("alert", "quiet") if cams else "quiet",
         }
 
     def frame(self, cam_id: str):
